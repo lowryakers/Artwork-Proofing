@@ -1,3 +1,4 @@
+from typing import Optional
 """
 ProDough Artwork Proofing Engine
 Processes packaging PDFs through 5 checks:
@@ -45,7 +46,7 @@ def create_job(filenames: list) -> str:
     return job_id
 
 
-def get_job(job_id: str) -> dict | None:
+def get_job(job_id: str):
     with _jobs_lock:
         return dict(_jobs[job_id]) if job_id in _jobs else None
 
