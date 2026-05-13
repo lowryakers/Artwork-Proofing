@@ -7,7 +7,7 @@ from flask import (Flask, render_template, request, redirect,
 import proof_engine
 
 app = Flask(__name__)
-app.secret_key = 'prodough-proof-site-2024'
+app.secret_key = os.environ.get('SECRET_KEY', 'prodough-proof-site-2024-local')
 
 BASE_DIR  = os.path.dirname(os.path.abspath(__file__))
 UPLOAD_DIR = os.path.join(BASE_DIR, 'uploads')
@@ -37,13 +37,19 @@ def upload():
         flash('Please select at least one artwork file.', 'danger')
         return redirect(url_for('index'))
 
-    # Parse optional GTIN reference list
-    gtin_rows = []
-    if gtin_file and gtin_file.filename:
-        try:
-            gtin_rows = _parse_gtin_list(gtin_file.read(), gtin_file.filename)
-        except Exception as exc:
-            flash(f'Could not read GTIN list ({exc}) — proceeding without GTIN cross-check.', 'warning')
+    if not gtin_file or not gtin_file.filename:
+        flash('Please upload the Master ProDough SKU & GTIN List — it is required for the GTIN/barcode check.', 'danger')
+        return redirect(url_for('index'))
+
+    # Parse required GTIN reference list
+    try:
+        gtin_rows = _parse_gtin_list(gtin_file.read(), gtin_file.filename)
+        if not gtin_rows:
+            flash('The GTIN list uploaded appears to be empty or unreadable. Check that it is the correct file.', 'danger')
+            return redirect(url_for('index'))
+    except Exception as exc:
+        flash(f'Could not read the GTIN list: {exc}. Upload a valid .xlsx or .csv file.', 'danger')
+        return redirect(url_for('index'))
 
     job_id  = proof_engine.create_job([f.filename for f in artwork_files if f.filename])
     job_dir = os.path.join(UPLOAD_DIR, job_id)
@@ -79,6 +85,17 @@ def result(job_id):
         flash('Job not found.', 'danger')
         return redirect(url_for('index'))
     return render_template('result.html', job=job, job_id=job_id)
+
+
+@app.route('/summary/<job_id>')
+def summary(job_id):
+    job = proof_engine.get_job(job_id)
+    if not job:
+        flash('Job not found.', 'danger')
+        return redirect(url_for('index'))
+    if job['status'] != 'done':
+        return redirect(url_for('result', job_id=job_id))
+    return render_template('summary.html', job=job, job_id=job_id)
 
 
 # ── API ───────────────────────────────────────────────────────────────────────
