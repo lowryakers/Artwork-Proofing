@@ -1,4 +1,3 @@
-from typing import Optional
 """
 ProDough Artwork Proofing Engine
 Processes packaging PDFs through 5 checks:
@@ -16,6 +15,7 @@ import threading
 import uuid
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 try:
     from PIL import Image
@@ -42,11 +42,12 @@ def create_job(filenames: list) -> str:
             'results': [],
             'summary': {},
             'error': None,
+            'dismissals': {},
         }
     return job_id
 
 
-def get_job(job_id: str):
+def get_job(job_id: str) -> Optional[dict]:
     with _jobs_lock:
         return dict(_jobs[job_id]) if job_id in _jobs else None
 
@@ -60,6 +61,19 @@ def _update_job(job_id: str, **kwargs):
     with _jobs_lock:
         if job_id in _jobs:
             _jobs[job_id].update(kwargs)
+
+
+def set_dismissal(job_id: str, filename: str, check_name: str,
+                  issue_index: int, dismissed: bool) -> bool:
+    with _jobs_lock:
+        if job_id not in _jobs:
+            return False
+        key = f"{filename}|{check_name}|{issue_index}"
+        if dismissed:
+            _jobs[job_id]['dismissals'][key] = True
+        else:
+            _jobs[job_id]['dismissals'].pop(key, None)
+        return True
 
 
 def start_job(job_id: str, pdf_paths: list, gtin_rows: list, work_dir: str):
@@ -104,6 +118,46 @@ def _process_job(job_id: str, pdf_paths: list, gtin_rows: list, work_dir: str):
         _update_job(job_id, status='error', error=str(exc), progress=0)
 
 
+# ── Film vs pouch detection ───────────────────────────────────────────────────
+
+# Eyemark checks only apply to film/rollstock (stick packs, sachets, flow wrap).
+# Pouches, bags, canisters, and jars use a different registration method.
+
+_FILM_KEYWORDS  = {'stick', 'sachet', 'flow', 'rollstock', 'film', 'sleeve',
+                   'wrapper', 'wrap', 'stickpack', 'stick_pack', 'stick-pack'}
+_POUCH_KEYWORDS = {'pouch', 'bag', 'zip', 'mylar', 'doypack', 'doypak',
+                   'standup', 'stand_up', 'stand-up', 'canister', 'jar',
+                   'bottle', 'tub', 'container'}
+
+
+def _is_film_rollstock(fname: str, ocr_text: str = '') -> bool:
+    """Return True if the design is film/rollstock (eyemark check applies).
+    Returns False for pouches, bags, and rigid packaging.
+    Defaults to True (apply the check) when the format cannot be determined.
+    """
+    name = fname.lower()
+    text = ocr_text.lower()
+
+    # Explicit pouch/bag indicators in filename → skip eyemark
+    for kw in _POUCH_KEYWORDS:
+        if kw in name:
+            return False
+
+    # Explicit film/stick-pack indicators → apply eyemark
+    for kw in _FILM_KEYWORDS:
+        if kw in name:
+            return True
+
+    # Fall back to OCR text hints
+    if any(kw in text for kw in _POUCH_KEYWORDS):
+        return False
+    if any(kw in text for kw in _FILM_KEYWORDS):
+        return True
+
+    # Cannot determine — default to applying the check so nothing is silently skipped
+    return True
+
+
 # ── Single-file proofing ──────────────────────────────────────────────────────
 
 def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str) -> dict:
@@ -146,10 +200,12 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str) -> dict:
         except Exception:
             pass
 
+    is_film = _is_film_rollstock(fname, ocr_text)
+
     checks = {
         'gtin':     _check_gtin(ocr_text, fname, gtin_rows),
         'nfp':      _check_nfp(ocr_text),
-        'eyemark':  _check_eyemark(img),
+        'eyemark':  _check_eyemark(img, is_film, fname),
         'spelling': _check_spelling(ocr_text, fname),
         'fda':      _check_fda(ocr_text, fname),
     }
@@ -299,8 +355,17 @@ def _check_nfp(ocr_text: str) -> dict:
 
 # ── Check 3: Eyemark contrast ─────────────────────────────────────────────────
 
-def _check_eyemark(img) -> dict:
+def _check_eyemark(img, is_film: bool = True, fname: str = '') -> dict:
     issues, notes = [], []
+
+    if not is_film:
+        notes.append(
+            'Eyemark check not applicable — this appears to be a pouch or rigid packaging design. '
+            'Eyemark registration marks are only required for film/rollstock (stick packs, sachets, flow wrap). '
+            'If this file is actually a film design, rename it to include "stick", "sachet", or "film" '
+            'and re-run the proof.'
+        )
+        return {'issues': issues, 'notes': notes, 'contrast': None, 'skipped': True}
 
     if img is None:
         notes.append('Image unavailable — eyemark contrast check skipped.')
@@ -358,7 +423,7 @@ def _check_eyemark(img) -> dict:
 
 _MISSPELLINGS = {
     r'pro\s+dough':      'ProDough (no space)',
-    r'prodough(?!®)':    'ProDough (verify capital D and ® symbol)',
+    r'(?<!@)prodough(?!®|shop|\.)': 'ProDough (verify capital D and ® symbol)',
     r'\bcheescake\b':    'cheesecake',
     r'\bbanna\b':        'banana',
     r'\bchoclate\b':     'chocolate',
@@ -427,32 +492,55 @@ _SF_CLAIM_PATTERNS = [
 ]
 
 
+def _ocr_is_sparse(ocr_text: str) -> bool:
+    """Return True when OCR yield is so low that absence-based checks are unreliable.
+    Typical print-ready PDFs with outlined text produce < 80 meaningful words.
+    """
+    words = [w for w in ocr_text.split() if len(w) > 2]
+    return len(words) < 80
+
+
 def _check_fda(ocr_text: str, fname: str) -> dict:
     issues, notes = [], []
     tl = ocr_text.lower()
 
     is_supplement = 'supplement facts' in tl
+    sparse = _ocr_is_sparse(ocr_text)
+
+    # ── OCR quality warning ───────────────────────────────────────────────────
+    # Absence-based checks (missing NFP, ingredients, allergens, manufacturer)
+    # are unreliable when OCR text is sparse due to outlined/path text in PDFs.
+    if sparse:
+        notes.append(
+            'Low OCR yield detected — this PDF likely uses text converted to outlines '
+            '(standard for print-ready files). Absence-based checks below (NFP, ingredients, '
+            'allergens, manufacturer info) are flagged as warnings rather than critical issues '
+            'and should all be verified manually against the actual artwork.'
+        )
 
     # ── Required elements ─────────────────────────────────────────────────────
+    # Severity is "warning" (not "critical") for absence-based checks because
+    # outlined text PDFs will not OCR — a missing detection is not proof of absence.
 
     if 'nutrition facts' not in tl and 'supplement facts' not in tl:
         issues.append({
-            'severity': 'critical',
+            'severity': 'warning',
             'message': (
-                'No Nutrition Facts or Supplement Facts panel detected. '
+                'Nutrition Facts (or Supplement Facts) panel not detected via OCR. '
                 'One is required on all packaged food and dietary supplement labels '
                 '(21 CFR 101.9 / 21 CFR 101.36). '
-                'Note: text-as-outlines PDFs will not OCR — verify manually.'
+                'Print-ready PDFs with outlined text will not OCR — verify the panel is present '
+                'and correctly formatted on the actual artwork.'
             ),
         })
 
     if 'ingredient' not in tl:
         issues.append({
-            'severity': 'critical',
+            'severity': 'warning',
             'message': (
-                'No "Ingredients:" list detected. '
+                'Ingredient list not detected via OCR. '
                 'An ingredient declaration is required on virtually all packaged food labels '
-                '(21 CFR 101.4). Verify manually.'
+                '(21 CFR 101.4). Verify manually on the actual artwork.'
             ),
         })
 
@@ -467,43 +555,57 @@ def _check_fda(ocr_text: str, fname: str) -> dict:
 
     if is_whey_product and 'milk' not in tl:
         issues.append({
-            'severity': 'critical',
+            'severity': 'warning',
             'message': (
-                'Whey protein product — "milk" allergen declaration not detected. '
-                'FDA FALCPA (21 USC 343(w)) requires milk to be declared as a major food allergen, '
-                'either in the ingredient list (bolded or in a "contains" statement) or separately. '
-                'An FDA auditor would flag this immediately.'
+                'Whey protein product — "milk" allergen declaration not detected via OCR. '
+                'FDA FALCPA (21 USC 343(w)) requires milk to be declared as a major food allergen '
+                '(in the ingredient list bolded/highlighted, or in a separate "Contains:" statement). '
+                'Verify the allergen statement is present on the actual artwork.'
             ),
         })
     elif is_wheat_product and 'wheat' not in tl:
         issues.append({
             'severity': 'warning',
             'message': (
-                'Wheat-containing product type detected but "wheat" allergen not found in OCR text. '
+                'Wheat-containing product type — "wheat" allergen not detected via OCR. '
                 'FALCPA requires wheat to be declared as a major food allergen (21 USC 343(w)). '
-                'Verify the allergen statement appears on the artwork.'
+                'Verify the allergen statement appears on the actual artwork.'
             ),
         })
     elif not has_allergen_stmt:
         issues.append({
             'severity': 'warning',
             'message': (
-                'No allergen declaration (e.g., "Contains: Milk") detected. '
+                'No allergen declaration (e.g., "Contains: Milk") detected via OCR. '
                 'FALCPA requires declaration of the 9 major allergens: milk, eggs, fish, shellfish, '
                 'tree nuts, peanuts, wheat, soybeans, and sesame (since Jan 2023). '
-                'Verify manually — OCR may have missed it.'
+                'Verify manually on the actual artwork.'
             ),
         })
 
     # Manufacturer / distributor info
-    if not any(ind in tl for ind in ['manufactured by', 'distributed by', 'produced by',
-                                     'manufactured for', 'distributed for', 'llc', 'inc.', 'corp.']):
+    # Expanded detection: company name suffixes, address keywords, ZIP codes,
+    # and explicit "manufactured/distributed by" phrases.
+    _mfr_indicators = [
+        'manufactured by', 'distributed by', 'produced by',
+        'manufactured for', 'distributed for', 'packed by', 'bottled by',
+        'llc', 'inc.', 'corp.', 'company', 'co.', 'group', 'enterprises',
+        'nutrition', 'foods', 'labs', 'ops', 'industries', 'international',
+    ]
+    has_mfr_text = any(ind in tl for ind in _mfr_indicators)
+    has_zip = bool(re.search(r'\b\d{5}\b', ocr_text))  # US ZIP code
+    has_street = bool(re.search(
+        r'\b\d+\s+[NSEW]\.?\s+\d+|\b\d+\s+\w+\s+(st|ave|blvd|dr|rd|ln|way|pkwy|court|ct)\b',
+        tl
+    ))
+
+    if not (has_mfr_text or has_zip or has_street):
         issues.append({
             'severity': 'warning',
             'message': (
-                'No manufacturer or distributor name/address detected. '
+                'Manufacturer or distributor name/address not detected via OCR. '
                 '21 CFR 101.5 requires the name and place of business of the manufacturer, packer, '
-                'or distributor. Verify manually.'
+                'or distributor. Verify it appears on the actual artwork.'
             ),
         })
 
