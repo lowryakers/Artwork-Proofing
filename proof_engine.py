@@ -23,9 +23,15 @@ try:
 except ImportError:
     PIL_AVAILABLE = False
 
+try:
+    from pyzbar.pyzbar import decode as _pyzbar_decode
+    PYZBAR_AVAILABLE = True
+except ImportError:
+    PYZBAR_AVAILABLE = False
+
 _UPLOAD_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'uploads')
 
-# ── In-memory job store ───────────────────────────────────────────────────────
+# ── In-memory job store ────────────────────────────────────────────────
 
 _jobs: dict = {}
 _jobs_lock = threading.Lock()
@@ -88,7 +94,7 @@ def start_job(job_id: str, pdf_paths: list, gtin_rows: list, work_dir: str):
     t.start()
 
 
-# ── Disk persistence ──────────────────────────────────────────────────────────
+# ── Disk persistence ──────────────────────────────────────────────────────
 
 def _save_job_to_disk(job_id: str):
     with _jobs_lock:
@@ -125,7 +131,7 @@ def load_jobs_from_disk():
 load_jobs_from_disk()
 
 
-# ── Main processing loop ──────────────────────────────────────────────────────
+# ── Main processing loop ──────────────────────────────────────────────────
 
 def _process_job(job_id: str, pdf_paths: list, gtin_rows: list, work_dir: str):
     _update_job(job_id, status='running')
@@ -160,7 +166,7 @@ def _process_job(job_id: str, pdf_paths: list, gtin_rows: list, work_dir: str):
     _save_job_to_disk(job_id)
 
 
-# ── Film vs pouch detection ───────────────────────────────────────────────────
+# ── Film vs pouch detection ───────────────────────────────────────────────
 
 _FILM_KEYWORDS  = {'stick', 'sachet', 'flow', 'rollstock', 'film', 'sleeve',
                    'wrapper', 'wrap', 'stickpack', 'stick_pack', 'stick-pack'}
@@ -198,13 +204,13 @@ def _is_film_rollstock(fname: str, ocr_text: str = '') -> bool:
     return False
 
 
-# ── Single-file proofing ──────────────────────────────────────────────────────
+# ── Single-file proofing ────────────────────────────────────────────────
 
 def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str) -> dict:
     fname = os.path.basename(pdf_path)
     stem = Path(pdf_path).stem
 
-    # ── Convert PDF → PNG ────────────────────────────────────────────────────
+    # ── Convert PDF → PNG ────────────────────────────────────────────────
     img_prefix = os.path.join(work_dir, stem)
     subprocess.run(
         ['pdftoppm', '-r', '250', '-png', '-singlefile', pdf_path, img_prefix],
@@ -220,7 +226,7 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str) -> dict:
             raise FileNotFoundError(f'pdftoppm produced no PNG for {fname}')
         img_path = os.path.join(work_dir, candidates[0])
 
-    # ── OCR ──────────────────────────────────────────────────────────────────
+    # ── OCR ────────────────────────────────────────────────────────────────────
     ocr_text = ''
     try:
         r = subprocess.run(
@@ -231,7 +237,7 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str) -> dict:
     except Exception:
         pass
 
-    # ── Load image for visual checks ─────────────────────────────────────────
+    # ── Load image for visual checks ───────────────────────────────────────────
     img = None
     if PIL_AVAILABLE:
         try:
@@ -241,8 +247,11 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str) -> dict:
 
     is_film = _is_film_rollstock(fname, ocr_text)
 
+    # Scan barcode stripes directly from rendered image (primary GTIN source)
+    barcode_gtins = _scan_barcodes(img_path)
+
     checks = {
-        'gtin':     _check_gtin(ocr_text, fname, gtin_rows),
+        'gtin':     _check_gtin(ocr_text, fname, gtin_rows, barcode_gtins),
         'nfp':      _check_nfp(ocr_text),
         'eyemark':  _check_eyemark(img, is_film, fname),
         'spelling': _check_spelling(ocr_text, fname),
@@ -277,26 +286,75 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str) -> dict:
     }
 
 
-# ── Check 1: GTIN / barcode ───────────────────────────────────────────────────
+# ── Barcode scanning ──────────────────────────────────────────────────────────────
 
-def _check_gtin(ocr_text: str, fname: str, gtin_rows: list) -> dict:
+def _scan_barcodes(img_path: str) -> list:
+    """Decode UPC-A / EAN-13 barcode stripes directly from the rendered PNG.
+    Works on print-ready PDFs where text is outlined — reads the bar pattern,
+    not OCR text.  Returns a list of 12-digit GTIN strings.
+    """
+    if not PYZBAR_AVAILABLE or not PIL_AVAILABLE:
+        return []
+    try:
+        img = Image.open(img_path).convert('RGB')
+        decoded = _pyzbar_decode(img)
+        gtins = []
+        for d in decoded:
+            raw = d.data.decode('utf-8', errors='replace').strip()
+            if not raw.isdigit():
+                continue
+            if len(raw) == 13 and raw.startswith('0'):
+                raw = raw[1:]   # EAN-13 with leading zero → UPC-A 12-digit
+            if len(raw) == 12:
+                gtins.append(raw)
+        return list(dict.fromkeys(gtins))  # deduplicate, preserve order
+    except Exception:
+        return []
+
+
+# ── Check 1: GTIN / barcode ─────────────────────────────────────────────────────────
+
+def _check_gtin(ocr_text: str, fname: str, gtin_rows: list,
+                scanned_gtins: list = None) -> dict:
     issues, notes = [], []
+    scanned_gtins = scanned_gtins or []
 
-    raw12 = re.findall(r'\b(\d{12})\b', ocr_text)
-    partial = re.findall(r'\b(\d{5,7})\s+(\d{4,7})\b', ocr_text)
-    for a, b in partial:
-        combined = a + b
-        if len(combined) in (11, 12):
-            raw12.append(combined)
-
-    found = list({g for g in raw12 if g[:3] in ('850', '840', '860', '870', '880', '890', '012', '075', '049')})
-    if not found:
-        found = list(set(raw12))
-
-    if found:
-        notes.append(f'Detected GTIN(s) via OCR: {", ".join(found)}')
+    # Primary: direct barcode-stripe decode (works on all PDFs, outlined or not)
+    if scanned_gtins:
+        found = scanned_gtins
+        notes.append(
+            f'Barcode decoded directly from artwork image: {", ".join(found)}. '
+            'This reads the actual barcode stripes, not OCR text.'
+        )
     else:
-        notes.append('No 12-digit GTIN detected via OCR. Barcodes set as paths/outlines may not OCR. Verify the barcode number manually.')
+        # Fallback: OCR text search for human-readable digits below barcode
+        raw12 = re.findall(r'\b(\d{12})\b', ocr_text)
+        partial = re.findall(r'\b(\d{5,7})\s+(\d{4,7})\b', ocr_text)
+        for a, b in partial:
+            combined = a + b
+            if len(combined) in (11, 12):
+                raw12.append(combined)
+
+        found = list({g for g in raw12 if g[:3] in ('850', '840', '860', '870', '880', '890', '012', '075', '049')})
+        if not found:
+            found = list(set(raw12))
+
+        if found:
+            notes.append(
+                f'GTIN(s) found via OCR of human-readable digits: {", ".join(found)}. '
+                'Barcode stripe scanning was unavailable or did not detect a barcode — '
+                'verify this number matches the actual barcode on the artwork.'
+            )
+        else:
+            issues.append({
+                'severity': 'warning',
+                'message': (
+                    'No barcode detected on this artwork. The barcode scanner could not read the stripes '
+                    'and no 12-digit number was found via OCR. Possible causes: barcode is very small, '
+                    'heavily styled, cropped to the edge, or missing entirely. '
+                    'Verify the barcode is present and correct on the actual artwork file.'
+                ),
+            })
 
     if gtin_rows and found:
         gtin_lookup = {str(r.get('gtin', '')).strip(): str(r.get('flavor', '')).strip().lower()
@@ -323,7 +381,7 @@ def _check_gtin(ocr_text: str, fname: str, gtin_rows: list) -> dict:
     return {'found_gtins': found, 'issues': issues, 'notes': notes}
 
 
-# ── Check 2: Front call-outs vs NFP ──────────────────────────────────────────
+# ── Check 2: Front call-outs vs NFP ───────────────────────────────────────────────
 
 def _check_nfp(ocr_text: str) -> dict:
     issues, notes = [], []
@@ -383,72 +441,91 @@ def _check_nfp(ocr_text: str) -> dict:
     }
 
 
-# ── Check 3: Eyemark contrast ─────────────────────────────────────────────────
+# ── Check 3: Eyemark color ──────────────────────────────────────────────────────────────
+# Rule: eyemark MUST be solid black (#000000) or solid white (#FFFFFF).
+# Any other color will cause unreliable photo-eye detection on the production line.
 
 def _check_eyemark(img, is_film: bool = False, fname: str = '') -> dict:
     issues, notes = [], []
 
     if not is_film:
         notes.append(
-            'Eyemark check skipped — this design does not appear to be film/rollstock. '
-            'Eyemark registration marks are only required for film/rollstock (stick packs, sachets, flow wrap). '
-            'To enable this check, include "stick", "sachet", "film", or "rollstock" in the filename.'
+            'Eyemark check skipped — not identified as film/rollstock. '
+            'Include "stick", "sachet", "film", or "rollstock" in the filename to enable.'
         )
-        return {'issues': issues, 'notes': notes, 'contrast': None, 'skipped': True}
+        return {'issues': issues, 'notes': notes, 'eyemark_color': None, 'skipped': True}
 
     if img is None:
-        notes.append('Image unavailable — eyemark contrast check skipped.')
-        return {'issues': issues, 'notes': notes, 'contrast': None}
+        issues.append({
+            'severity': 'warning',
+            'message': 'Image unavailable — eyemark color check could not be performed.',
+        })
+        return {'issues': issues, 'notes': notes, 'eyemark_color': None}
 
     w, h = img.size
     mw = max(1, int(w * 0.10))
     mh = max(1, int(h * 0.08))
 
-    def luma(region):
-        pixels = list(region.getdata())
-        if not pixels:
-            return 128
-        return sum(0.299 * r + 0.587 * g + 0.114 * b for r, g, b in pixels) / len(pixels)
+    mark_region = img.crop((w - mw, h - mh, w, h))
+    pixels = list(mark_region.getdata())
+    if not pixels:
+        return {'issues': issues, 'notes': notes, 'eyemark_color': None}
 
-    mark_region    = img.crop((w - mw, h - mh, w, h))
-    surround_region = img.crop((w - mw * 3, h - mh * 3, w - mw, h - mh))
+    lumas = [0.299 * r + 0.587 * g + 0.114 * b for r, g, b in pixels]
+    min_luma = min(lumas)
+    max_luma = max(lumas)
+    avg_luma = sum(lumas) / len(lumas)
 
-    mark_luma = luma(mark_region)
-    surr_luma = luma(surround_region)
-    contrast  = abs(mark_luma - surr_luma)
+    # A black eyemark leaves very dark pixels (<25); a white eyemark leaves very light pixels (>230).
+    has_black = min_luma < 25
+    has_white = max_luma > 230
 
-    mark_desc = 'dark' if mark_luma < 80 else ('light' if mark_luma > 175 else 'medium')
-    surr_desc = 'dark' if surr_luma < 80 else ('light' if surr_luma > 175 else 'medium')
-
-    notes.append(
-        f'Bottom-right region — eyemark brightness: {mark_luma:.0f} ({mark_desc}), '
-        f'surrounding brightness: {surr_luma:.0f} ({surr_desc}), contrast delta: {contrast:.0f}.'
-    )
-
-    if contrast < 55:
-        issues.append({
-            'severity': 'warning',
-            'message': (
-                f'Low eyemark contrast ({mark_desc} mark on {mark_desc} background, delta {contrast:.0f}). '
-                'The bagger photo-eye may not reliably detect the film position. '
-                'Confirm eyemark color with the print supplier before going to press.'
-            ),
-        })
-    elif contrast < 100:
-        issues.append({
-            'severity': 'info',
-            'message': (
-                f'Borderline eyemark contrast (delta {contrast:.0f}). '
-                'Verify with print supplier that the eyemark is detectable under production conditions.'
-            ),
-        })
+    if has_black and has_white:
+        # Both extremes present — determine which is the eyemark (the minority element)
+        black_count = sum(1 for l in lumas if l < 25)
+        white_count = sum(1 for l in lumas if l > 230)
+        eyemark_color = 'black' if black_count <= white_count else 'white'
+    elif has_black:
+        eyemark_color = 'black'
+    elif has_white:
+        eyemark_color = 'white'
     else:
-        notes.append(f'Eyemark contrast appears adequate (delta {contrast:.0f}).')
+        eyemark_color = 'none'
 
-    return {'issues': issues, 'notes': notes, 'contrast': round(contrast)}
+    if eyemark_color == 'black':
+        notes.append(
+            f'✔ BLACK eyemark detected (darkest pixel: {min_luma:.0f}/255) — OK. '
+            'Solid black eyemark provides reliable photo-eye detection.'
+        )
+    elif eyemark_color == 'white':
+        notes.append(
+            f'✔ WHITE eyemark detected (lightest pixel: {max_luma:.0f}/255) — OK. '
+            'Solid white eyemark provides reliable photo-eye detection.'
+        )
+    else:
+        # Describe the actual color so the designer knows exactly what to fix
+        if avg_luma < 85:
+            color_desc = f'dark grey or a dark color (avg brightness {avg_luma:.0f}/255)'
+        elif avg_luma < 170:
+            color_desc = f'medium grey or a spot color (avg brightness {avg_luma:.0f}/255)'
+        else:
+            color_desc = f'light grey or a light color (avg brightness {avg_luma:.0f}/255)'
+
+        issues.append({
+            'severity': 'critical',
+            'message': (
+                f'Eyemark is not solid black or solid white — detected as {color_desc}. '
+                'The production line photo-eye sensor requires a solid BLACK (#000000) '
+                'or solid WHITE (#FFFFFF) eyemark. A colored or grey eyemark WILL cause '
+                'missed or false triggers on the bagger/sealer. '
+                'Change the eyemark to pure black or pure white before going to press.'
+            ),
+        })
+
+    return {'issues': issues, 'notes': notes, 'eyemark_color': eyemark_color}
 
 
-# ── Check 4: Spelling / brand name ───────────────────────────────────────────
+# ── Check 4: Spelling / brand name ───────────────────────────────────────────────
 
 _MISSPELLINGS = {
     # Use word boundaries so "prodoughshop" and "@prodoughshop" are never matched.
@@ -497,7 +574,7 @@ def _check_spelling(ocr_text: str, fname: str) -> dict:
     return {'issues': issues, 'notes': notes}
 
 
-# ── Check 5: FDA compliance ───────────────────────────────────────────────────
+# ── Check 5: FDA compliance ───────────────────────────────────────────────────────────
 
 _DISEASE_CLAIM_PATTERNS = [
     (r'\btreat[s]?\b.{0,40}(disease|disorder|condition|syndrome)',
@@ -575,7 +652,7 @@ def _check_fda(ocr_text: str, fname: str) -> dict:
             'Verify each of these is present and correctly formatted directly on the artwork file.'
         )
 
-    # ── Allergen declaration ───────────────────────────────────────────────────
+    # ── Allergen declaration ───────────────────────────────────────────────────────────
     has_allergen_stmt = any(re.search(p, tl) for p in
                             [r'contains?:', r'\ballergen\b', r'allergy\s+info', r'may\s+contain'])
 
@@ -609,7 +686,7 @@ def _check_fda(ocr_text: str, fname: str) -> dict:
             ),
         })
 
-    # ── Manufacturer / distributor info ───────────────────────────────────────
+    # ── Manufacturer / distributor info ──────────────────────────────────────────────
     if not sparse:
         _mfr_indicators = [
             'manufactured by', 'distributed by', 'produced by', 'manufactured for',
@@ -633,7 +710,7 @@ def _check_fda(ocr_text: str, fname: str) -> dict:
                 ),
             })
 
-    # ── Net weight ────────────────────────────────────────────────────────────
+    # ── Net weight ─────────────────────────────────────────────────────────────────────
     if not sparse and not re.search(r'net\s*wt|net\s*weight', tl):
         issues.append({
             'severity': 'warning',
@@ -652,7 +729,7 @@ def _check_fda(ocr_text: str, fname: str) -> dict:
                 'Verify with your legal/regulatory team.'
             )
 
-    # ── % Daily Values footnote ───────────────────────────────────────────────
+    # ── % Daily Values footnote ────────────────────────────────────────────────────────────
     if re.search(r'%\s*daily\s*value', tl) and 'based on a 2,000 calorie' not in tl and '2,000 calorie diet' not in tl:
         notes.append(
             '% Daily Values listed but the required footnote — '
@@ -660,9 +737,28 @@ def _check_fda(ocr_text: str, fname: str) -> dict:
             'was not detected (21 CFR 101.9(d)(9)).'
         )
 
-    # ── Disease claims ────────────────────────────────────────────────────────
+    # ── Disease claims ─────────────────────────────────────────────────────────────────
+    # Strip the required FDA disclaimer before scanning — it contains "treat",
+    # "cure", "diagnose", and "prevent any disease" which would otherwise
+    # trigger false positives on every label that correctly includes the disclaimer.
+    _DISCLAIMER_RE = re.compile(
+        r'(?:this\s+)?statement[s]?\s+ha(?:s|ve)\s+not\s+been\s+evaluated'
+        r'.{0,400}?'
+        r'not\s+intended\s+to\s+diagnose.{0,120}disease',
+        re.IGNORECASE | re.DOTALL,
+    )
+    disclaimer_present = bool(_DISCLAIMER_RE.search(tl))
+    tl_no_disclaimer = _DISCLAIMER_RE.sub('', tl)
+
+    if disclaimer_present:
+        notes.append(
+            'FDA required disclaimer detected — "This statement has not been evaluated by the FDA. '
+            'This product is not intended to diagnose, treat, cure, or prevent any disease." '
+            'Disclaimer text is excluded from disease claim scanning.'
+        )
+
     for pattern, description in _DISEASE_CLAIM_PATTERNS:
-        if re.search(pattern, tl):
+        if re.search(pattern, tl_no_disclaimer):
             issues.append({
                 'severity': 'critical',
                 'message': (
@@ -671,16 +767,10 @@ def _check_fda(ocr_text: str, fname: str) -> dict:
                 ),
             })
 
-    # ── Structure/function claims + disclaimer ────────────────────────────────
+    # ── Structure/function claims + disclaimer ────────────────────────────────────────────
     sf_found = [p for p in _SF_CLAIM_PATTERNS if re.search(p, tl)]
     if sf_found and is_supplement:
-        has_disclaimer = any(phrase in tl for phrase in [
-            'not been evaluated by the food and drug',
-            'not been evaluated by the fda',
-            'not intended to diagnose',
-            'these statements have not',
-        ])
-        if not has_disclaimer:
+        if not disclaimer_present:
             issues.append({
                 'severity': 'critical',
                 'message': (
@@ -697,7 +787,7 @@ def _check_fda(ocr_text: str, fname: str) -> dict:
             'Generally permissible but must not imply treatment or prevention of disease.'
         )
 
-    # ── "All Natural" / "Natural" claim ──────────────────────────────────────
+    # ── "All Natural" / "Natural" claim ────────────────────────────────────────────────
     if re.search(r'\ball\s+natural\b|\bnatural\s+ingredients?\b|\b100%\s+natural\b', tl):
         artificial_markers = [
             'artificial', 'synthetic', 'fd&c', 'fdc', 'acesulfame', 'sucralose',
@@ -717,7 +807,7 @@ def _check_fda(ocr_text: str, fname: str) -> dict:
                 'Ensure no artificial flavors, colors, or synthetic preservatives are present (FDA 2018 guidance).'
             )
 
-    # ── Gluten-Free claim ─────────────────────────────────────────────────────
+    # ── Gluten-Free claim ───────────────────────────────────────────────────────────────
     if re.search(r'gluten[\s\-]?free', tl):
         if any(w in tl for w in ['wheat', 'barley', 'rye', 'triticale']):
             issues.append({
@@ -733,7 +823,7 @@ def _check_fda(ocr_text: str, fname: str) -> dict:
                 'Ensure third-party testing records are on file.'
             )
 
-    # ── Organic claim ─────────────────────────────────────────────────────────
+    # ── Organic claim ────────────────────────────────────────────────────────────────────
     if re.search(r'\borganic\b', tl):
         if 'usda organic' not in tl and 'certified organic' not in tl:
             issues.append({
@@ -744,7 +834,7 @@ def _check_fda(ocr_text: str, fname: str) -> dict:
                 ),
             })
 
-    # ── Nutrient content claims ───────────────────────────────────────────────
+    # ── Nutrient content claims ───────────────────────────────────────────────────────────
     if re.search(r'high\s+protein|excellent\s+source\s+of\s+protein', tl):
         notes.append(
             '"High Protein" / "Excellent Source of Protein" claim: '
@@ -754,27 +844,27 @@ def _check_fda(ocr_text: str, fname: str) -> dict:
     if re.search(r'good\s+source\s+of\s+protein', tl):
         notes.append('"Good Source of Protein" claim: FDA requires 10–19% DV (21 CFR 101.54(e)).')
 
-    # ── Grass-Fed claim ───────────────────────────────────────────────────────
+    # ── Grass-Fed claim ────────────────────────────────────────────────────────────────────
     if re.search(r'grass[\s\-]?fed', tl):
         notes.append(
             '"Grass-Fed" claim detected. Ensure your whey protein supplier can provide documentation. '
             'Third-party certification (e.g., AGA) is strongly recommended.'
         )
 
-    # ── 100% protein source claim ─────────────────────────────────────────────
+    # ── 100% protein source claim ────────────────────────────────────────────────────────────
     if re.search(r'100%\s+(whey|plant|beef)\s+protein', tl):
         notes.append(
             '"100% [Whey/Plant/Beef] Protein" claim: verify there are no other protein sources in the formulation.'
         )
 
-    # ── Sesame allergen (FASTER Act, Jan 2023) ────────────────────────────────
+    # ── Sesame allergen (FASTER Act, Jan 2023) ────────────────────────────────────────────
     if re.search(r'\bsesame\b|\btahini\b', tl):
         notes.append(
             'Sesame detected. Under the FASTER Act (effective Jan 1, 2023), sesame is the 9th major allergen '
             'and must be declared on US food labels (21 USC 321(qq)(2)).'
         )
 
-    # ── Bioengineered food disclosure ─────────────────────────────────────────
+    # ── Bioengineered food disclosure ─────────────────────────────────────────────────────────
     if any(re.search(p, tl) for p in [r'non[\s\-]?gmo', r'bioengineered', r'derived from bioengineering']):
         notes.append(
             'Non-GMO or Bioengineered (BE) disclosure detected. '
@@ -782,14 +872,14 @@ def _check_fda(ocr_text: str, fname: str) -> dict:
             '"Non-GMO" is not a compliant substitute for BE disclosure if the product is in fact BE.'
         )
 
-    # ── "Made in USA" claim ───────────────────────────────────────────────────
+    # ── "Made in USA" claim ───────────────────────────────────────────────────────────────
     if re.search(r'made\s+in\s+(the\s+)?usa|made\s+in\s+america', tl):
         notes.append(
             '"Made in USA" claim detected. FTC requires "all or virtually all" US-origin content. '
             'If foreign-sourced ingredients are used, the claim may need to be qualified.'
         )
 
-    # ── Caffeine / stimulants ─────────────────────────────────────────────────
+    # ── Caffeine / stimulants ──────────────────────────────────────────────────────────────
     if re.search(r'\bcaffeine\b|\bguarana\b|\bgreen\s+tea\s+extract\b|\bgreen\s+coffee\b', tl):
         notes.append(
             'Caffeine or stimulant ingredient detected. '
@@ -799,7 +889,7 @@ def _check_fda(ocr_text: str, fname: str) -> dict:
     return {'issues': issues, 'notes': notes}
 
 
-# ── Summary ───────────────────────────────────────────────────────────────────
+# ── Summary ─────────────────────────────────────────────────────────────────────────────
 
 def _build_summary(results: list) -> dict:
     total = len(results)

@@ -34,16 +34,17 @@
             <div id="fileList" class="mt-2"></div>
           </div>
 
-          <!-- GTIN list -->
+          <!-- GTIN list (optional when sheet is synced) -->
           <div class="mb-4">
             <label class="form-label fw-semibold mb-1">
-              Master GTIN / SKU List
-              <span class="text-muted fw-normal">(optional)</span>
+              Master ProDough SKU &amp; GTIN List
+              <span class="badge bg-secondary ms-1 fw-normal" style="font-size:.7rem">Optional if Google Sheet synced</span>
             </label>
-            <input type="file" name="gtin_list" accept=".xlsx,.csv" class="form-control">
+            <input type="file" name="gtin_list" accept=".xlsx,.csv" class="form-control" id="gtinInput">
             <div class="form-text">
-              Upload your <em>MASTER ProDough SKU &amp; GTIN List.xlsx</em> to cross-check barcode numbers.
-              Without it, the GTIN check will still detect barcodes via OCR but can't verify they're correct for the SKU.
+              Upload the <em>MASTER ProDough SKU &amp; GTIN List.xlsx</em> (or .csv) to override the synced sheet,
+              or leave blank if you've connected a Google Sheet on the
+              <a href="/gtin">GTIN List page</a>.
             </div>
           </div>
 
@@ -69,28 +70,31 @@
                 <span class="badge bg-danger rounded-pill">1</span>
               </td>
               <td class="fw-semibold py-2">GTIN / Barcode</td>
-              <td class="text-muted pe-3">Extracts 12-digit UPCs via OCR; cross-checks vs master list if uploaded</td>
+              <td class="text-muted pe-3">
+                Reads 12-digit UPCs from each PDF via barcode scanning and OCR, cross-checks against the
+                <strong>Master SKU &amp; GTIN List</strong> (uploaded or synced via Google Sheet)
+              </td>
             </tr>
             <tr>
               <td class="ps-3 text-center"><span class="badge bg-warning text-dark rounded-pill">2</span></td>
               <td class="fw-semibold py-2">Front Call-Out vs NFP</td>
-              <td class="text-muted pe-3">Flags calorie, protein &amp; net weight mismatches between front panel and Nutrition Facts</td>
+              <td class="text-muted pe-3">Runs on each <strong>product PDF</strong> — flags calorie, protein &amp; net weight mismatches between the front panel and Nutrition Facts</td>
             </tr>
             <tr>
               <td class="ps-3 text-center"><span class="badge bg-info text-dark rounded-pill">3</span></td>
               <td class="fw-semibold py-2">Eyemark Contrast</td>
-              <td class="text-muted pe-3">Analyzes bottom-right corner brightness — catches dark-on-dark eyemark problems</td>
+              <td class="text-muted pe-3">Runs on each <strong>product PDF</strong> — analyzes bottom-right corner brightness; skipped automatically for pouch/rigid packaging</td>
             </tr>
             <tr>
               <td class="ps-3 text-center"><span class="badge bg-success rounded-pill">4</span></td>
               <td class="fw-semibold py-2">Spelling / Brand Name</td>
-              <td class="text-muted pe-3">"ProDough" spelling, flavor misspellings, UK vs US spelling</td>
+              <td class="text-muted pe-3">Runs on each <strong>product PDF</strong> — "ProDough" spelling, flavor misspellings, UK vs US spelling</td>
             </tr>
             <tr class="table-warning">
               <td class="ps-3 text-center"><span class="badge bg-danger rounded-pill">5</span></td>
               <td class="fw-semibold py-2">FDA Audit Risk</td>
               <td class="text-muted pe-3">
-                Required label elements · allergen declarations (FALCPA + FASTER Act) ·
+                Runs on each <strong>product PDF</strong> — required label elements · allergen declarations ·
                 disease claims · structure/function + disclaimer · "Natural" conflicts ·
                 Gluten-Free · Organic · Bioengineered disclosure · net weight format · and more
               </td>
@@ -168,7 +172,8 @@
             <strong>One PDF per SKU</strong> gives the clearest per-SKU report.
           </li>
           <li class="mb-1">
-            <strong>GTIN cross-check</strong> only works when you upload the master GTIN spreadsheet.
+            <strong>GTIN cross-check</strong> works with an uploaded file or a synced Google Sheet.
+            Connect your sheet on the <a href="/gtin">GTIN List page</a>.
           </li>
           <li class="mb-1">
             <strong>Eyemark analysis</strong> samples the bottom-right corner of the rendered image.
@@ -239,7 +244,15 @@ dropZone.addEventListener('drop', e => {
   e.preventDefault(); dropZone.classList.remove('drag-over');
   addFiles(Array.from(e.dataTransfer.files));
 });
-document.getElementById('proofForm').addEventListener('submit', () => {
+document.getElementById('proofForm').addEventListener('submit', e => {
+  const hasArtwork = selectedFiles.length > 0;
+
+  if (!hasArtwork) {
+    e.preventDefault();
+    alert('Please select at least one artwork file.');
+    return;
+  }
+
   const btn = document.getElementById('submitBtn');
   btn.disabled = true;
   btn.innerHTML = '<span class="spinner-border spinner-border-sm me-2"></span>Uploading…';

@@ -1,6 +1,8 @@
 import os
 import io
 import json
+import time
+import urllib.request
 import openpyxl
 from datetime import datetime
 from flask import (Flask, render_template, request, redirect,
@@ -12,10 +14,14 @@ app = Flask(__name__)
 app.secret_key = os.environ.get('SECRET_KEY', 'prodough-proof-site-2024-local')
 app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024  # 500 MB
 
-BASE_DIR        = os.path.dirname(os.path.abspath(__file__))
-UPLOAD_DIR      = os.path.join(BASE_DIR, 'uploads')
-GTIN_STORE_PATH = os.path.join(UPLOAD_DIR, 'gtin_store.json')
+BASE_DIR              = os.path.dirname(os.path.abspath(__file__))
+UPLOAD_DIR            = os.path.join(BASE_DIR, 'uploads')
+GTIN_STORE_PATH       = os.path.join(UPLOAD_DIR, 'gtin_store.json')
+GTIN_SHEET_CFG_PATH   = os.path.join(UPLOAD_DIR, 'gtin_sheet_config.json')
 os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+_sheet_cache: dict = {'rows': None, 'fetched_at': 0.0, 'url': ''}
+_SHEET_CACHE_TTL = 300  # seconds
 
 ALLOWED_EXTS = {'.pdf', '.ai', '.png', '.jpg', '.jpeg', '.tiff', '.tif', '.eps'}
 
@@ -33,7 +39,7 @@ def basename_filter(path):
     return os.path.basename(path) if path else ''
 
 
-# ── GTIN store ────────────────────────────────────────────────────────────────
+# ── GTIN store ────────────────────────────────────────────────────────────────────
 
 def _load_gtin_store():
     if os.path.exists(GTIN_STORE_PATH):
@@ -72,7 +78,86 @@ def _save_gtin_store(rows: list, source_filename: str) -> dict:
     return store
 
 
-# ── Pages ─────────────────────────────────────────────────────────────────────
+# ── Google Sheets sync ──────────────────────────────────────────────────────
+
+def _load_sheet_config() -> dict:
+    if os.path.exists(GTIN_SHEET_CFG_PATH):
+        try:
+            with open(GTIN_SHEET_CFG_PATH) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+
+def _save_sheet_config(cfg: dict):
+    with open(GTIN_SHEET_CFG_PATH, 'w') as f:
+        json.dump(cfg, f)
+
+
+def _sheet_url_to_csv(url: str) -> str:
+    """Convert any Google Sheets share/edit URL to a direct CSV export URL."""
+    import re
+    if 'export?format=csv' in url or 'output=csv' in url:
+        return url
+    m = re.search(r'/spreadsheets/d/([a-zA-Z0-9_-]+)', url)
+    if not m:
+        raise ValueError('Not a recognized Google Sheets URL. Paste the URL from your browser address bar.')
+    sheet_id = m.group(1)
+    gid_m = re.search(r'[#&?]gid=(\d+)', url)
+    gid_part = f'&gid={gid_m.group(1)}' if gid_m else ''
+    return f'https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv{gid_part}'
+
+
+def _fetch_sheet_rows(csv_url: str) -> list:
+    """Download and parse a published Google Sheet as CSV."""
+    import csv as _csv
+    req = urllib.request.Request(csv_url, headers={'User-Agent': 'Mozilla/5.0'})
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        content = resp.read().decode('utf-8-sig')
+    reader = _csv.DictReader(io.StringIO(content))
+    rows = []
+    for row in reader:
+        d = {k.strip().lower(): (v.strip() if v else '') for k, v in row.items() if k}
+        gtin_raw = d.get('gtin/barcode#') or d.get('gtin') or d.get('barcode') or d.get('upc') or ''
+        flavor   = d.get('flavor') or d.get('product name') or d.get('name') or ''
+        sku      = d.get('sku') or ''
+        gtin_str = str(gtin_raw).strip().replace(' ', '')
+        if '.' in gtin_str and gtin_str.replace('.', '').isdigit():
+            try:
+                gtin_str = str(int(float(gtin_str)))
+            except (ValueError, OverflowError):
+                pass
+        if gtin_str and gtin_str not in ('', 'nan'):
+            rows.append({'gtin': gtin_str, 'flavor': str(flavor).strip().lower(), 'sku': str(sku).strip()})
+    return rows
+
+
+def _get_sheet_gtin_rows(force: bool = False) -> list:
+    """Return GTIN rows from the synced Google Sheet, with a 5-minute in-memory cache."""
+    global _sheet_cache
+    cfg = _load_sheet_config()
+    url = cfg.get('sheet_url', '')
+    if not url:
+        return []
+    now = time.time()
+    if (not force and _sheet_cache['url'] == url
+            and _sheet_cache['rows'] is not None
+            and now - _sheet_cache['fetched_at'] < _SHEET_CACHE_TTL):
+        return _sheet_cache['rows']
+    try:
+        csv_url = _sheet_url_to_csv(url)
+        rows = _fetch_sheet_rows(csv_url)
+        _sheet_cache = {'rows': rows, 'fetched_at': now, 'url': url}
+        cfg['last_synced'] = datetime.now().isoformat()
+        cfg['row_count'] = len(rows)
+        _save_sheet_config(cfg)
+        return rows
+    except Exception:
+        return _sheet_cache['rows'] if _sheet_cache['rows'] is not None else []
+
+
+# ── Pages ───────────────────────────────────────────────────────────────────────
 
 @app.route('/')
 def index():
@@ -82,7 +167,13 @@ def index():
 @app.route('/gtin')
 def gtin_page():
     store = _load_gtin_store()
-    return render_template('gtin.html', store=store)
+    sheet_cfg = _load_sheet_config()
+    # If a sheet is configured, show the live sheet rows in the table
+    if sheet_cfg.get('sheet_url') and not store:
+        rows = _get_sheet_gtin_rows()
+        if rows:
+            store = _save_gtin_store(rows, 'Google Sheets (auto-synced)')
+    return render_template('gtin.html', store=store, sheet_cfg=sheet_cfg)
 
 
 @app.route('/upload', methods=['POST'])
@@ -94,19 +185,27 @@ def upload():
         flash('Please select at least one artwork file.', 'danger')
         return redirect(url_for('index'))
 
-    if not gtin_file or not gtin_file.filename:
-        flash('Please upload the Master ProDough SKU & GTIN List — it is required for the GTIN/barcode check.', 'danger')
-        return redirect(url_for('index'))
+    # GTIN data: uploaded file takes priority; fall back to synced Google Sheet
+    gtin_rows = []
+    if gtin_file and gtin_file.filename:
+        try:
+            gtin_rows = _parse_gtin_list(gtin_file.read(), gtin_file.filename)
+            if gtin_rows:
+                _save_gtin_store(gtin_rows, gtin_file.filename)
+            else:
+                flash('The uploaded GTIN file appears empty — falling back to synced sheet data.', 'warning')
+        except Exception as exc:
+            flash(f'Could not read the uploaded GTIN file ({exc}) — falling back to synced sheet data.', 'warning')
 
-    try:
-        gtin_rows = _parse_gtin_list(gtin_file.read(), gtin_file.filename)
-        if not gtin_rows:
-            flash('The GTIN list uploaded appears to be empty or unreadable. Check that it is the correct file.', 'danger')
-            return redirect(url_for('index'))
-        _save_gtin_store(gtin_rows, gtin_file.filename)
-    except Exception as exc:
-        flash(f'Could not read the GTIN list: {exc}. Upload a valid .xlsx or .csv file.', 'danger')
-        return redirect(url_for('index'))
+    if not gtin_rows:
+        gtin_rows = _get_sheet_gtin_rows()
+
+    if not gtin_rows:
+        flash(
+            'No GTIN data available. Either upload a GTIN list on this page, or connect your '
+            'Google Sheet on the GTIN List page so the barcode check has a master list to match against.',
+            'warning',
+        )
 
     job_id  = proof_engine.create_job([f.filename for f in artwork_files if f.filename])
     job_dir = os.path.join(UPLOAD_DIR, job_id)
@@ -192,7 +291,7 @@ def viewer(job_id):
     return render_template('viewer.html', job=job, job_id=job_id, verify_map=verify_map)
 
 
-# ── API ───────────────────────────────────────────────────────────────────────
+# ── API ───────────────────────────────────────────────────────────────────────────
 
 @app.route('/api/status/<job_id>')
 def api_status(job_id):
@@ -213,6 +312,40 @@ def api_result(job_id):
     if not job:
         return jsonify({'error': 'not found'}), 404
     return jsonify(job)
+
+
+@app.route('/api/gtin-sheet', methods=['POST'])
+def api_gtin_sheet_save():
+    data = request.get_json() or {}
+    url = data.get('url', '').strip()
+    if url:
+        try:
+            _sheet_url_to_csv(url)  # validate it's a Sheets URL
+        except ValueError as e:
+            return jsonify({'ok': False, 'error': str(e)}), 400
+    cfg = _load_sheet_config()
+    cfg['sheet_url'] = url
+    cfg.pop('last_synced', None)
+    cfg.pop('row_count', None)
+    _save_sheet_config(cfg)
+    global _sheet_cache
+    _sheet_cache = {'rows': None, 'fetched_at': 0.0, 'url': ''}
+    return jsonify({'ok': True})
+
+
+@app.route('/api/gtin-sheet/sync', methods=['POST'])
+def api_gtin_sheet_sync():
+    cfg = _load_sheet_config()
+    if not cfg.get('sheet_url'):
+        return jsonify({'ok': False, 'error': 'No sheet URL configured'}), 400
+    try:
+        rows = _get_sheet_gtin_rows(force=True)
+        if rows:
+            _save_gtin_store(rows, 'Google Sheets (auto-synced)')
+        cfg = _load_sheet_config()
+        return jsonify({'ok': True, 'row_count': len(rows), 'last_synced': cfg.get('last_synced', '')})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)}), 500
 
 
 @app.route('/api/dismiss/<job_id>', methods=['POST'])
@@ -257,7 +390,7 @@ def serve_image(job_id, filename):
     return send_file(img_path, mimetype='image/png')
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ── Helpers ─────────────────────────────────────────────────────────────────────
 
 def _safe_name(name: str) -> str:
     keep = set('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._- ')
@@ -323,7 +456,7 @@ def _generate_report(job: dict) -> io.BytesIO:
 
     wb = openpyxl.Workbook()
 
-    # ── Sheet 1: Summary ──────────────────────────────────────────────────────
+    # ── Sheet 1: Summary ──────────────────────────────────────────────────────────
     ws1 = wb.active
     ws1.title = 'Summary'
     ws1.merge_cells('A1:E1')
@@ -352,7 +485,7 @@ def _generate_report(job: dict) -> io.BytesIO:
     for col in ['B', 'C', 'D', 'E']:
         ws1.column_dimensions[col].width = 14
 
-    # ── Sheet 2: Issues to Fix (non-dismissed) ────────────────────────────────
+    # ── Sheet 2: Issues to Fix (non-dismissed) ─────────────────────────────────────────
     ws2 = wb.create_sheet('Issues to Fix')
     for col, hdr in enumerate(['File', 'Check', 'Severity', 'Issue / Required Action'], 1):
         c = ws2.cell(row=1, column=col, value=hdr)
@@ -380,7 +513,7 @@ def _generate_report(job: dict) -> io.BytesIO:
     ws2.column_dimensions['C'].width = 12
     ws2.column_dimensions['D'].width = 80
 
-    # ── Sheet 3: Reviewed / Dismissed ─────────────────────────────────────────
+    # ── Sheet 3: Reviewed / Dismissed ────────────────────────────────────────────────
     if dismissals:
         ws3 = wb.create_sheet('Reviewed OK')
         for col, hdr in enumerate(['File', 'Check', 'Severity', 'Issue (Reviewed — No Action Needed)'], 1):
