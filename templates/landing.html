@@ -14,10 +14,10 @@
 
   <!-- Card 1: ProDough Proof -->
   <div class="col-md-6">
-    <div class="card shadow-sm h-100 border-primary" style="border-width:2px!important">
+    <div class="card shadow-sm h-100 border-dark" style="border-width:2px!important">
       <div class="card-body p-4 d-flex flex-column">
         <div class="mb-3">
-          <span style="font-size:2.5rem">🍩</span>
+          <i class="bi bi-file-earmark-check" style="font-size:2.5rem;color:#0d0d0d"></i>
         </div>
         <h4 class="fw-bold mb-1">ProDough Proof</h4>
         <p class="text-muted mb-3">Full 5-check proofing pass for ProDough packaging</p>
@@ -50,7 +50,7 @@
         </ul>
 
         <div class="mt-auto">
-          <a href="{{ url_for('prodough_proof') }}" class="btn btn-primary btn-lg w-100">
+          <a href="{{ url_for('prodough_proof') }}" class="btn btn-dark btn-lg w-100">
             Run ProDough Proof <i class="bi bi-arrow-right ms-1"></i>
           </a>
         </div>
@@ -95,7 +95,7 @@
         </ul>
 
         <div class="mt-auto">
-          <a href="{{ url_for('brand_page') }}" class="btn btn-secondary btn-lg w-100">
+          <a href="{{ url_for('brand_page') }}" class="btn btn-outline-dark btn-lg w-100">
             Start Brand Proof <i class="bi bi-arrow-right ms-1"></i>
           </a>
         </div>
@@ -138,7 +138,7 @@
                 <span class="badge bg-success">Clean</span>
               {% endif %}
             {% elif job.status == 'running' %}
-              <span class="badge bg-primary">Running…</span>
+              <span class="badge bg-dark">Running…</span>
             {% elif job.status == 'error' %}
               <span class="badge bg-danger">Error</span>
             {% else %}

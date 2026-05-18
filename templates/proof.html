@@ -7,7 +7,7 @@
   <!-- Upload panel -->
   <div class="col-lg-7">
     <div class="card shadow-sm">
-      <div class="card-header bg-primary text-white d-flex align-items-center gap-2 py-3">
+      <div class="card-header bg-dark text-white d-flex align-items-center gap-2 py-3">
         <i class="bi bi-file-earmark-check fs-5"></i>
         <div>
           <div class="fw-semibold">Artwork Proof Upload</div>
@@ -25,7 +25,7 @@
             </label>
             <div id="dropZone" class="drop-zone rounded-3 p-4 text-center"
                  onclick="document.getElementById('artworkInput').click()">
-              <i class="bi bi-cloud-arrow-up fs-1 text-primary opacity-75"></i>
+              <i class="bi bi-cloud-arrow-up fs-1 text-dark opacity-50"></i>
               <div class="fw-semibold mt-2 mb-1">Drag &amp; drop files here, or click to browse</div>
               <div class="text-muted small">PDF, AI, PNG, JPG, TIFF, EPS — multiple files OK</div>
             </div>
@@ -48,7 +48,7 @@
             </div>
           </div>
 
-          <button type="submit" class="btn btn-primary px-5 py-2" id="submitBtn">
+          <button type="submit" class="btn btn-dark px-5 py-2" id="submitBtn">
             <i class="bi bi-play-circle me-2"></i>Run Proof
           </button>
           <button type="button" class="btn btn-outline-secondary ms-2" onclick="clearFiles()">
@@ -138,7 +138,7 @@
                   <span class="badge bg-success">Clean</span>
                 {% endif %}
               {% elif job.status == 'running' %}
-                <span class="badge bg-primary">Running…</span>
+                <span class="badge bg-dark">Running…</span>
               {% elif job.status == 'error' %}
                 <span class="badge bg-danger">Error</span>
               {% else %}

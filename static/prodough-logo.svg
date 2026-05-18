@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 820 178" fill="none">
+  <defs>
+    <style>
+      @import url('https://fonts.googleapis.com/css2?family=Nunito:wght@900&amp;display=swap');
+      .logo-text {
+        font-family: 'Nunito', 'Arial Rounded MT Bold', 'Helvetica Rounded', sans-serif;
+        font-weight: 900;
+        font-size: 158px;
+        fill: #333333;
+        letter-spacing: -2px;
+      }
+      .logo-reg {
+        font-family: 'Nunito', 'Arial Rounded MT Bold', 'Helvetica Rounded', sans-serif;
+        font-weight: 700;
+        font-size: 52px;
+        fill: #333333;
+      }
+    </style>
+  </defs>
+  <text class="logo-text" x="0" y="148">ProDough</text>
+  <text class="logo-reg" x="762" y="58">®</text>
+</svg>

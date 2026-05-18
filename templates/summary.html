@@ -31,7 +31,7 @@
 <!-- Header -->
 <div class="d-flex align-items-center gap-3 mb-4 flex-wrap no-print">
   <div>
-    <h4 class="mb-0 fw-bold"><i class="bi bi-clipboard2-check text-primary me-2"></i>Full Proof Summary</h4>
+    <h4 class="mb-0 fw-bold"><i class="bi bi-clipboard2-check me-2"></i>Full Proof Summary</h4>
     <div class="text-muted small">
       Job {{ job_id }} &bull; {{ job.created[:19].replace('T',' ') }} &bull; {{ results | length }} file{{ 's' if results | length != 1 }}
       {% if dismissed_count > 0 %}
@@ -49,7 +49,7 @@
     <a href="{{ url_for('download_report', job_id=job_id) }}" class="btn btn-success btn-sm">
       <i class="bi bi-download me-1"></i>Download Report
     </a>
-    <button class="btn btn-outline-primary btn-sm" onclick="window.print()">
+    <button class="btn btn-outline-dark btn-sm" onclick="window.print()">
       <i class="bi bi-printer me-1"></i>Print / Save PDF
     </button>
     <a href="{{ url_for('index') }}" class="btn btn-outline-secondary btn-sm">

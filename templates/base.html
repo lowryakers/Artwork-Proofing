@@ -7,18 +7,19 @@
   <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
   <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css" rel="stylesheet">
   <style>
-    body { background: #f4f6fb; }
-    .navbar-brand .icon { font-size: 1.3rem; }
+    body { background: #f7f7f7; }
+    .navbar { border-bottom: 2px solid #000; }
+    .navbar-brand img { height: 36px; width: auto; }
     .drop-zone {
       cursor: pointer;
-      border: 2px dashed #0d6efd !important;
-      background: #f8f9ff;
+      border: 2px dashed #000 !important;
+      background: #fafafa;
       transition: background .15s, border-color .15s;
       min-height: 140px;
       display: flex; flex-direction: column;
       align-items: center; justify-content: center;
     }
-    .drop-zone.drag-over { background: #e0e9ff; border-color: #0a58ca !important; }
+    .drop-zone.drag-over { background: #f0f0f0; border-color: #444 !important; }
     .file-chip {
       display: inline-flex; align-items: center; gap: 4px;
       background: #e9ecef; border-radius: 20px;
@@ -35,30 +36,30 @@
 </head>
 <body>
 
-<nav class="navbar navbar-expand-lg navbar-dark bg-primary py-2 shadow-sm">
+<nav class="navbar navbar-expand-lg navbar-light bg-white py-2">
   <div class="container">
-    <a class="navbar-brand fw-bold d-flex align-items-center gap-2" href="{{ url_for('landing') }}">
-      <span class="icon">🍩</span> Artwork Proof
+    <a class="navbar-brand d-flex align-items-center" href="{{ url_for('landing') }}">
+      <img src="{{ url_for('static', filename='prodough-logo.svg') }}" alt="ProDough" style="height:38px;width:auto;">
     </a>
-    <div class="d-flex gap-2 ms-auto">
+    <div class="d-flex gap-2 ms-auto flex-wrap">
       <a href="{{ url_for('landing') }}"
-         class="btn btn-sm btn-outline-light {% if request.endpoint == 'landing' %}active{% endif %}">
+         class="btn btn-sm {% if request.endpoint == 'landing' %}btn-dark{% else %}btn-outline-dark{% endif %}">
         <i class="bi bi-house me-1"></i>Home
       </a>
       <a href="{{ url_for('prodough_proof') }}"
-         class="btn btn-sm btn-outline-light {% if request.endpoint == 'prodough_proof' %}active{% endif %}">
+         class="btn btn-sm {% if request.endpoint == 'prodough_proof' %}btn-dark{% else %}btn-outline-dark{% endif %}">
         <i class="bi bi-file-earmark-check me-1"></i>ProDough Proof
       </a>
       <a href="{{ url_for('brand_page') }}"
-         class="btn btn-sm btn-outline-light {% if request.endpoint == 'brand_page' %}active{% endif %}">
+         class="btn btn-sm {% if request.endpoint == 'brand_page' %}btn-dark{% else %}btn-outline-dark{% endif %}">
         <i class="bi bi-grid me-1"></i>Brand Proof
       </a>
       <a href="{{ url_for('gtin_page') }}"
-         class="btn btn-sm btn-outline-light {% if request.endpoint == 'gtin_page' %}active{% endif %}">
+         class="btn btn-sm {% if request.endpoint == 'gtin_page' %}btn-dark{% else %}btn-outline-dark{% endif %}">
         <i class="bi bi-upc-scan me-1"></i>GTIN List
       </a>
       <a href="{{ url_for('history') }}"
-         class="btn btn-sm btn-outline-light {% if request.endpoint == 'history' %}active{% endif %}">
+         class="btn btn-sm {% if request.endpoint == 'history' %}btn-dark{% else %}btn-outline-dark{% endif %}">
         <i class="bi bi-clock-history me-1"></i>History
       </a>
     </div>

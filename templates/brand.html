@@ -7,7 +7,7 @@
   <!-- Upload panel -->
   <div class="col-lg-7">
     <div class="card shadow-sm">
-      <div class="card-header bg-secondary text-white d-flex align-items-center gap-2 py-3">
+      <div class="card-header bg-dark text-white d-flex align-items-center gap-2 py-3">
         <i class="bi bi-file-earmark-check fs-5"></i>
         <div>
           <div class="fw-semibold">Brand Artwork Proof Upload</div>
@@ -163,7 +163,7 @@
                   <span class="badge bg-success">Clean</span>
                 {% endif %}
               {% elif job.status == 'running' %}
-                <span class="badge bg-primary">Running…</span>
+                <span class="badge bg-dark">Running…</span>
               {% elif job.status == 'error' %}
                 <span class="badge bg-danger">Error</span>
               {% else %}

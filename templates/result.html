@@ -7,10 +7,10 @@
 <div id="loadingView" {% if job.status in ('done','error') %}style="display:none"{% endif %}>
   <div class="card shadow-sm">
     <div class="card-body py-5 text-center">
-      <div class="spinner-border text-primary mb-3" style="width:3.5rem;height:3.5rem"></div>
+      <div class="spinner-border text-dark mb-3" style="width:3.5rem;height:3.5rem"></div>
       <h5 class="fw-semibold mb-1" id="pLabel">Processing artwork…</h5>
       <div class="progress mx-auto mt-3 mb-2" style="max-width:420px;height:12px">
-        <div class="progress-bar progress-bar-striped progress-bar-animated bg-primary"
+        <div class="progress-bar progress-bar-striped progress-bar-animated bg-dark"
              id="pBar" role="progressbar" style="width:5%"></div>
       </div>
       <div class="text-muted small" id="pFile">Starting…</div>
@@ -50,7 +50,7 @@
 <!-- Header row -->
 <div class="d-flex align-items-center gap-2 mb-4 flex-wrap">
   <div>
-    <h4 class="mb-0 fw-bold"><i class="bi bi-file-earmark-check text-primary me-2"></i>Proof Report</h4>
+    <h4 class="mb-0 fw-bold"><i class="bi bi-file-earmark-check me-2"></i>Proof Report</h4>
     <div class="text-muted small">Job {{ job.id }} &bull; {{ job.created[:19].replace('T',' ') }}</div>
   </div>
   <div class="ms-auto d-flex gap-2 flex-wrap">
@@ -58,7 +58,7 @@
     <a href="{{ url_for('viewer', job_id=job_id) }}" class="btn btn-outline-info btn-sm">
       <i class="bi bi-zoom-in me-1"></i>Manual Review
     </a>
-    <a href="{{ url_for('summary', job_id=job_id) }}" class="btn btn-outline-primary btn-sm">
+    <a href="{{ url_for('summary', job_id=job_id) }}" class="btn btn-outline-dark btn-sm">
       <i class="bi bi-clipboard2-check me-1"></i>Full Summary
     </a>
     <a href="{{ url_for('download_report', job_id=job_id) }}" class="btn btn-success btn-sm">
@@ -507,11 +507,11 @@ function fdaAlert(s) {
 function buildReport(job) {
   const results = job.results || [];
   const hdr = `<div class="d-flex align-items-center gap-2 mb-4 flex-wrap">
-    <div><h4 class="mb-0 fw-bold"><i class="bi bi-file-earmark-check text-primary me-2"></i>Proof Report</h4>
+    <div><h4 class="mb-0 fw-bold"><i class="bi bi-file-earmark-check me-2"></i>Proof Report</h4>
     <div class="text-muted small">Job ${job.id} &bull; ${job.created.substring(0,19).replace('T',' ')}</div></div>
     <div class="ms-auto d-flex gap-2 flex-wrap">
       <a href="/viewer/${job.id}" class="btn btn-outline-info btn-sm"><i class="bi bi-zoom-in me-1"></i>Manual Review</a>
-      <a href="/summary/${job.id}" class="btn btn-outline-primary btn-sm"><i class="bi bi-clipboard2-check me-1"></i>Full Summary</a>
+      <a href="/summary/${job.id}" class="btn btn-outline-dark btn-sm"><i class="bi bi-clipboard2-check me-1"></i>Full Summary</a>
       <a href="/report/${job.id}" class="btn btn-success btn-sm"><i class="bi bi-download me-1"></i>Download Report</a>
       <a href="/" class="btn btn-outline-secondary btn-sm"><i class="bi bi-arrow-left me-1"></i>New Proof</a>
     </div>
