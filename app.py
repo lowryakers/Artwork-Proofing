@@ -39,7 +39,7 @@ def basename_filter(path):
     return os.path.basename(path) if path else ''
 
 
-# ── GTIN store ────────────────────────────────────────────────────────────────────
+# ── GTIN store ────────────────────────────────────────────────────────────────
 
 def _load_gtin_store():
     if os.path.exists(GTIN_STORE_PATH):
@@ -78,7 +78,7 @@ def _save_gtin_store(rows: list, source_filename: str) -> dict:
     return store
 
 
-# ── Google Sheets sync ──────────────────────────────────────────────────────
+# ── Google Sheets sync ───────────────────────────────────────────────────────
 
 def _load_sheet_config() -> dict:
     if os.path.exists(GTIN_SHEET_CFG_PATH):
@@ -157,11 +157,21 @@ def _get_sheet_gtin_rows(force: bool = False) -> list:
         return _sheet_cache['rows'] if _sheet_cache['rows'] is not None else []
 
 
-# ── Pages ───────────────────────────────────────────────────────────────────────
+# ── Pages ─────────────────────────────────────────────────────────────────────
 
 @app.route('/')
-def index():
+def landing():
+    return render_template('landing.html', jobs=proof_engine.list_jobs())
+
+
+@app.route('/proof')
+def prodough_proof():
     return render_template('proof.html', jobs=proof_engine.list_jobs())
+
+
+@app.route('/brand')
+def brand_page():
+    return render_template('brand.html', jobs=proof_engine.list_jobs())
 
 
 @app.route('/gtin')
@@ -183,7 +193,7 @@ def upload():
 
     if not artwork_files or all(f.filename == '' for f in artwork_files):
         flash('Please select at least one artwork file.', 'danger')
-        return redirect(url_for('index'))
+        return redirect(url_for('prodough_proof'))
 
     # GTIN data: uploaded file takes priority; fall back to synced Google Sheet
     gtin_rows = []
@@ -207,7 +217,8 @@ def upload():
             'warning',
         )
 
-    job_id  = proof_engine.create_job([f.filename for f in artwork_files if f.filename])
+    job_id  = proof_engine.create_job([f.filename for f in artwork_files if f.filename],
+                                      brand_config={'brand_mode': 'prodough'})
     job_dir = os.path.join(UPLOAD_DIR, job_id)
     os.makedirs(job_dir, exist_ok=True)
 
@@ -228,9 +239,68 @@ def upload():
         flash(f'Skipped unsupported file(s): {", ".join(skipped)}', 'warning')
     if not saved:
         flash('No supported artwork files were uploaded.', 'danger')
-        return redirect(url_for('index'))
+        return redirect(url_for('prodough_proof'))
 
-    proof_engine.start_job(job_id, saved, gtin_rows, job_dir)
+    proof_engine.start_job(job_id, saved, gtin_rows, job_dir,
+                           brand_config={'brand_mode': 'prodough'})
+    return redirect(url_for('result', job_id=job_id))
+
+
+@app.route('/brand/upload', methods=['POST'])
+def brand_upload():
+    brand_name    = request.form.get('brand_name', '').strip()
+    packaging_type = request.form.get('packaging_type', 'other')
+    artwork_files = request.files.getlist('artwork')
+    gtin_file     = request.files.get('gtin_list')
+
+    if not artwork_files or all(f.filename == '' for f in artwork_files):
+        flash('Please select at least one artwork file.', 'danger')
+        return redirect(url_for('brand_page'))
+
+    if not gtin_file or not gtin_file.filename:
+        flash('A GTIN list is required for Brand Proof. Please upload your brand\'s SKU & GTIN spreadsheet.', 'danger')
+        return redirect(url_for('brand_page'))
+
+    try:
+        gtin_rows = _parse_gtin_list(gtin_file.read(), gtin_file.filename)
+    except Exception as exc:
+        flash(f'Could not read the GTIN file: {exc}', 'danger')
+        return redirect(url_for('brand_page'))
+
+    if not gtin_rows:
+        flash('The uploaded GTIN file appears empty. Please check the file and try again.', 'warning')
+
+    brand_config = {
+        'brand_mode':     'generic',
+        'brand_name':     brand_name,
+        'packaging_type': packaging_type,
+    }
+
+    job_id  = proof_engine.create_job([f.filename for f in artwork_files if f.filename],
+                                      brand_config=brand_config)
+    job_dir = os.path.join(UPLOAD_DIR, job_id)
+    os.makedirs(job_dir, exist_ok=True)
+
+    saved, skipped = [], []
+    for f in artwork_files:
+        if not f.filename:
+            continue
+        ext = os.path.splitext(f.filename)[1].lower()
+        if ext not in ALLOWED_EXTS:
+            skipped.append(f.filename)
+            continue
+        safe = _safe_name(f.filename)
+        dest = os.path.join(job_dir, safe)
+        f.save(dest)
+        saved.append(dest)
+
+    if skipped:
+        flash(f'Skipped unsupported file(s): {", ".join(skipped)}', 'warning')
+    if not saved:
+        flash('No supported artwork files were uploaded.', 'danger')
+        return redirect(url_for('brand_page'))
+
+    proof_engine.start_job(job_id, saved, gtin_rows, job_dir, brand_config=brand_config)
     return redirect(url_for('result', job_id=job_id))
 
 
@@ -239,7 +309,7 @@ def result(job_id):
     job = proof_engine.get_job(job_id)
     if not job:
         flash('Job not found.', 'danger')
-        return redirect(url_for('index'))
+        return redirect(url_for('landing'))
     return render_template('result.html', job=job, job_id=job_id)
 
 
@@ -248,7 +318,7 @@ def summary(job_id):
     job = proof_engine.get_job(job_id)
     if not job:
         flash('Job not found.', 'danger')
-        return redirect(url_for('index'))
+        return redirect(url_for('landing'))
     if job['status'] != 'done':
         return redirect(url_for('result', job_id=job_id))
     return render_template('summary.html', job=job, job_id=job_id)
@@ -265,7 +335,7 @@ def viewer(job_id):
     job = proof_engine.get_job(job_id)
     if not job:
         flash('Job not found.', 'danger')
-        return redirect(url_for('index'))
+        return redirect(url_for('landing'))
 
     verify_map = {}
     for r in job.get('results', []):
@@ -291,7 +361,7 @@ def viewer(job_id):
     return render_template('viewer.html', job=job, job_id=job_id, verify_map=verify_map)
 
 
-# ── API ───────────────────────────────────────────────────────────────────────────
+# ── API ───────────────────────────────────────────────────────────────────────
 
 @app.route('/api/status/<job_id>')
 def api_status(job_id):
@@ -370,9 +440,11 @@ def download_report(job_id):
     job = proof_engine.get_job(job_id)
     if not job or job['status'] != 'done':
         flash('Report not ready — job must complete first.', 'danger')
-        return redirect(url_for('index'))
-    buf = _generate_report(job)
-    fname = f'ProDough_Proof_{job_id}.xlsx'
+        return redirect(url_for('landing'))
+    brand_name = job.get('brand_config', {}).get('brand_name', 'ProDough')
+    buf = _generate_report(job, brand_name=brand_name)
+    safe_brand = _safe_name(brand_name).replace(' ', '_')
+    fname = f'{safe_brand}_Proof_{job_id}.xlsx'
     return send_file(
         buf, download_name=fname, as_attachment=True,
         mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
@@ -390,7 +462,7 @@ def serve_image(job_id, filename):
     return send_file(img_path, mimetype='image/png')
 
 
-# ── Helpers ─────────────────────────────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _safe_name(name: str) -> str:
     keep = set('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._- ')
@@ -437,7 +509,7 @@ def _parse_gtin_list(data: bytes, filename: str) -> list:
     return [r for r in rows if r.get('gtin') and r['gtin'] not in ('', 'nan')]
 
 
-def _generate_report(job: dict) -> io.BytesIO:
+def _generate_report(job: dict, brand_name: str = 'ProDough') -> io.BytesIO:
     from openpyxl.styles import Font, PatternFill, Alignment
 
     dismissals = job.get('dismissals', {})
@@ -456,11 +528,11 @@ def _generate_report(job: dict) -> io.BytesIO:
 
     wb = openpyxl.Workbook()
 
-    # ── Sheet 1: Summary ──────────────────────────────────────────────────────────
+    # ── Sheet 1: Summary ──────────────────────────────────────────────────────
     ws1 = wb.active
     ws1.title = 'Summary'
     ws1.merge_cells('A1:E1')
-    ws1['A1'] = 'ProDough Artwork Proof Report'
+    ws1['A1'] = f'{brand_name} Artwork Proof Report'
     ws1['A1'].font = Font(bold=True, size=14)
     ws1['A2'] = f'Job: {job["id"]}'
     ws1['B2'] = f'Date: {job["created"][:10]}'
@@ -485,7 +557,7 @@ def _generate_report(job: dict) -> io.BytesIO:
     for col in ['B', 'C', 'D', 'E']:
         ws1.column_dimensions[col].width = 14
 
-    # ── Sheet 2: Issues to Fix (non-dismissed) ─────────────────────────────────────────
+    # ── Sheet 2: Issues to Fix (non-dismissed) ────────────────────────────────
     ws2 = wb.create_sheet('Issues to Fix')
     for col, hdr in enumerate(['File', 'Check', 'Severity', 'Issue / Required Action'], 1):
         c = ws2.cell(row=1, column=col, value=hdr)
@@ -513,7 +585,7 @@ def _generate_report(job: dict) -> io.BytesIO:
     ws2.column_dimensions['C'].width = 12
     ws2.column_dimensions['D'].width = 80
 
-    # ── Sheet 3: Reviewed / Dismissed ────────────────────────────────────────────────
+    # ── Sheet 3: Reviewed / Dismissed ─────────────────────────────────────────
     if dismissals:
         ws3 = wb.create_sheet('Reviewed OK')
         for col, hdr in enumerate(['File', 'Check', 'Severity', 'Issue (Reviewed — No Action Needed)'], 1):
