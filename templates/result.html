@@ -23,7 +23,7 @@
   <div class="alert alert-danger">
     <h5 class="alert-heading"><i class="bi bi-x-octagon me-2"></i>Processing Failed</h5>
     <p id="errorMsg" class="mb-2">{{ job.error or '' }}</p>
-    <a href="{{ url_for('index') }}" class="btn btn-outline-danger btn-sm">
+    <a href="{{ url_for('prodough_proof') }}" class="btn btn-outline-danger btn-sm">
       <i class="bi bi-arrow-left me-1"></i>Back to Upload
     </a>
   </div>
@@ -65,7 +65,7 @@
       <i class="bi bi-download me-1"></i>Download Report
     </a>
     {% endif %}
-    <a href="{{ url_for('index') }}" class="btn btn-outline-secondary btn-sm">
+    <a href="{{ url_for('prodough_proof') }}" class="btn btn-outline-secondary btn-sm">
       <i class="bi bi-arrow-left me-1"></i>New Proof
     </a>
   </div>
