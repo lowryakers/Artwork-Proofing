@@ -269,6 +269,9 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
             'spelling': _check_spelling_generic(ocr_text, brand_name),
             'fda':      _check_fda_light(ocr_text, fname),
         }
+        if is_film:
+            checks['wind'] = _check_wind_direction(
+                ocr_text, brand_config.get('wind_direction', ''))
     else:
         # ProDough mode: run all 5 checks as standard
         is_film = _is_film_rollstock(fname, ocr_text)
@@ -279,6 +282,9 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
             'spelling': _check_spelling(ocr_text, fname),
             'fda':      _check_fda(ocr_text, fname),
         }
+        wind_dir = brand_config.get('wind_direction', '')
+        if wind_dir:
+            checks['wind'] = _check_wind_direction(ocr_text, wind_dir)
 
     all_issues = [i for c in checks.values() for i in c.get('issues', [])]
     crit  = [i for i in all_issues if i['severity'] == 'critical']
@@ -1062,6 +1068,79 @@ def _check_fda_light(ocr_text: str, fname: str) -> dict:
     notes.append(
         'FDA audit is in lightweight mode. Full regulatory review recommended before going to print.'
     )
+
+    return {'issues': issues, 'notes': notes}
+
+
+# ── Wind Direction check ──────────────────────────────────────────────────────
+
+_WIND_LABELS = {
+    '1': 'Wind 1 — Outwound, Across roll, Top first',
+    '2': 'Wind 2 — Outwound, Across roll, Bottom first',
+    '3': 'Wind 3 — Outwound, Around roll, Right side first',
+    '4': 'Wind 4 — Outwound, Around roll, Left side first',
+    '5': 'Wind 5 — Inwound, Across roll, Top first',
+    '6': 'Wind 6 — Inwound, Across roll, Bottom first',
+    '7': 'Wind 7 — Inwound, Around roll, Right side first',
+    '8': 'Wind 8 — Inwound, Around roll, Left side first',
+}
+
+def _check_wind_direction(ocr_text: str, required_wind: str) -> dict:
+    issues, notes = [], []
+    required_wind = str(required_wind).strip()
+
+    if not required_wind or required_wind not in _WIND_LABELS:
+        return {'issues': [], 'notes': ['Wind direction check skipped (not specified).']}
+
+    req_label = _WIND_LABELS[required_wind]
+    tl = ocr_text.lower()
+
+    # Determine inwound/outwound and number for detection
+    is_inwound = required_wind in ('5', '6', '7', '8')
+    wind_word  = 'inwound' if is_inwound else 'outwound'
+
+    # Patterns to look for in OCR text
+    import re as _re
+    detected_wind = None
+
+    # Explicit "Wind N" or "Wind Direction N" or "Winding N"
+    m = _re.search(r'\bwind(?:ing|ing direction|direction)?\s*[:#-]?\s*([1-8])\b', tl)
+    if m:
+        detected_wind = m.group(1)
+
+    # "Outwound N" or "Inwound N"
+    if not detected_wind:
+        m = _re.search(r'\b(in|out)wound\s*([1-8])\b', tl)
+        if m:
+            detected_wind = m.group(2)
+
+    # Just the wind number adjacent to "wind" keyword anywhere
+    if not detected_wind:
+        for n in ('1','2','3','4','5','6','7','8'):
+            if _re.search(rf'\bwind\b.*\b{n}\b|\b{n}\b.*\bwind\b', tl):
+                detected_wind = n
+                break
+
+    if detected_wind:
+        if detected_wind == required_wind:
+            notes.append(f'Wind direction confirmed: {req_label}.')
+        else:
+            issues.append({
+                'severity': 'critical',
+                'message': (
+                    f'Wind direction mismatch — PDF specifies Wind {detected_wind} '
+                    f'({_WIND_LABELS.get(detected_wind, "")}), '
+                    f'but job requires {req_label}. Confirm with print supplier before going to press.'
+                ),
+            })
+    else:
+        issues.append({
+            'severity': 'warning',
+            'message': (
+                f'Wind direction not detected in PDF — verify manually that the press proof '
+                f'specifies {req_label}.'
+            ),
+        })
 
     return {'issues': issues, 'notes': notes}
 

@@ -211,6 +211,9 @@
     {{ _check_card('3','Eyemark Contrast',       'bi-eye',                r.checks.eyemark,  idx, r.filename, 'eyemark',  dismissals) }}
     {{ _check_card('4','Spelling / Brand Name', 'bi-spellcheck',         r.checks.spelling, idx, r.filename, 'spelling', dismissals) }}
     {{ _check_card('5','FDA Audit Risk',         'bi-shield-exclamation', r.checks.fda,      idx, r.filename, 'fda',      dismissals, always_open=true) }}
+    {% if r.checks.wind is defined %}
+    {{ _check_card('6','Wind Direction',         'bi-arrow-repeat',       r.checks.wind,     idx, r.filename, 'wind',     dismissals) }}
+    {% endif %}
 
     <!-- OCR text -->
     {% if r.ocr_preview %}
@@ -461,6 +464,7 @@ function fileResult(r, jobId, idx) {
       ${checkCard('3','Eyemark Contrast',       'bi-eye',                checks.eyemark,  uid, r.filename, 'eyemark',  false)}
       ${checkCard('4','Spelling / Brand Name', 'bi-spellcheck',         checks.spelling, uid, r.filename, 'spelling', false)}
       ${checkCard('5','FDA Audit Risk',         'bi-shield-exclamation', checks.fda,      uid, r.filename, 'fda',      true)}
+      ${checks.wind ? checkCard('6','Wind Direction','bi-arrow-repeat',  checks.wind,     uid, r.filename, 'wind',     false) : ''}
       ${r.ocr_preview ? `<div class="mt-2">
         <button class="btn btn-outline-secondary btn-sm" type="button"
                 data-bs-toggle="collapse" data-bs-target="#jsocr${idx}">

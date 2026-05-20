@@ -48,6 +48,32 @@
             </div>
           </div>
 
+          <!-- Wind Direction -->
+          <div class="mb-4">
+            <label class="form-label fw-semibold mb-1" for="windDirectionInput">
+              Required Wind Direction
+              <span class="badge bg-secondary ms-1 fw-normal" style="font-size:.7rem">Stick pack / sachet film</span>
+            </label>
+            <select id="windDirectionInput" name="wind_direction" class="form-select">
+              <option value="">— Skip wind direction check —</option>
+              <optgroup label="Outwound">
+                <option value="1">Wind 1 — Outwound · Across roll · Top of label first</option>
+                <option value="2">Wind 2 — Outwound · Across roll · Bottom of label first</option>
+                <option value="3">Wind 3 — Outwound · Around roll · Right side first</option>
+                <option value="4">Wind 4 — Outwound · Around roll · Left side first</option>
+              </optgroup>
+              <optgroup label="Inwound">
+                <option value="5">Wind 5 — Inwound · Across roll · Top of label first</option>
+                <option value="6">Wind 6 — Inwound · Across roll · Bottom of label first</option>
+                <option value="7">Wind 7 — Inwound · Around roll · Right side first</option>
+                <option value="8">Wind 8 — Inwound · Around roll · Left side first</option>
+              </optgroup>
+            </select>
+            <div class="form-text">
+              Select the wind direction required for this job. The tool will search the press proof PDF for a matching wind direction callout.
+            </div>
+          </div>
+
           <button type="submit" class="btn btn-dark px-5 py-2" id="submitBtn">
             <i class="bi bi-play-circle me-2"></i>Run Proof
           </button>

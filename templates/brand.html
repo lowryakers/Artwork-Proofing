@@ -42,6 +42,31 @@
             </div>
           </div>
 
+          <!-- Wind Direction (stick pack only) -->
+          <div class="mb-3" id="windDirectionGroup" style="display:none">
+            <label class="form-label fw-semibold mb-1" for="windDirectionInput">
+              Required Wind Direction
+            </label>
+            <select id="windDirectionInput" name="wind_direction" class="form-select">
+              <option value="">— Skip wind direction check —</option>
+              <optgroup label="Outwound">
+                <option value="1">Wind 1 — Outwound · Across roll · Top of label first</option>
+                <option value="2">Wind 2 — Outwound · Across roll · Bottom of label first</option>
+                <option value="3">Wind 3 — Outwound · Around roll · Right side first</option>
+                <option value="4">Wind 4 — Outwound · Around roll · Left side first</option>
+              </optgroup>
+              <optgroup label="Inwound">
+                <option value="5">Wind 5 — Inwound · Across roll · Top of label first</option>
+                <option value="6">Wind 6 — Inwound · Across roll · Bottom of label first</option>
+                <option value="7">Wind 7 — Inwound · Around roll · Right side first</option>
+                <option value="8">Wind 8 — Inwound · Around roll · Left side first</option>
+              </optgroup>
+            </select>
+            <div class="form-text">
+              Select the wind direction required for this job. The tool will search the press proof PDF for a matching wind direction callout.
+            </div>
+          </div>
+
           <!-- GTIN List (required) -->
           <div class="mb-4">
             <label class="form-label fw-semibold mb-1" for="gtinInput">
@@ -222,6 +247,13 @@ const dropZone      = document.getElementById('dropZone');
 const artworkInput  = document.getElementById('artworkInput');
 const fileListEl    = document.getElementById('fileList');
 let selectedFiles   = [];
+
+function toggleWindDirection() {
+  const isStick = document.getElementById('packagingTypeInput').value === 'stick';
+  document.getElementById('windDirectionGroup').style.display = isStick ? '' : 'none';
+  if (!isStick) document.getElementById('windDirectionInput').value = '';
+}
+document.getElementById('packagingTypeInput').addEventListener('change', toggleWindDirection);
 
 function renderChips() {
   fileListEl.innerHTML = '';

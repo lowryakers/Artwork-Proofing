@@ -217,8 +217,11 @@ def upload():
             'warning',
         )
 
+    wind_direction = request.form.get('wind_direction', '').strip()
+    prodough_config = {'brand_mode': 'prodough', 'wind_direction': wind_direction}
+
     job_id  = proof_engine.create_job([f.filename for f in artwork_files if f.filename],
-                                      brand_config={'brand_mode': 'prodough'})
+                                      brand_config=prodough_config)
     job_dir = os.path.join(UPLOAD_DIR, job_id)
     os.makedirs(job_dir, exist_ok=True)
 
@@ -241,8 +244,7 @@ def upload():
         flash('No supported artwork files were uploaded.', 'danger')
         return redirect(url_for('prodough_proof'))
 
-    proof_engine.start_job(job_id, saved, gtin_rows, job_dir,
-                           brand_config={'brand_mode': 'prodough'})
+    proof_engine.start_job(job_id, saved, gtin_rows, job_dir, brand_config=prodough_config)
     return redirect(url_for('result', job_id=job_id))
 
 
@@ -270,10 +272,12 @@ def brand_upload():
     if not gtin_rows:
         flash('The uploaded GTIN file appears empty. Please check the file and try again.', 'warning')
 
+    wind_direction = request.form.get('wind_direction', '').strip()
     brand_config = {
-        'brand_mode':     'generic',
-        'brand_name':     brand_name,
-        'packaging_type': packaging_type,
+        'brand_mode':      'generic',
+        'brand_name':      brand_name,
+        'packaging_type':  packaging_type,
+        'wind_direction':  wind_direction,
     }
 
     job_id  = proof_engine.create_job([f.filename for f in artwork_files if f.filename],
