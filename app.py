@@ -80,7 +80,10 @@ def _save_gtin_store(rows: list, source_filename: str) -> dict:
 
 # ── Google Sheets sync ───────────────────────────────────────────────────────
 
+_DEFAULT_CFG_PATH = os.path.join(BASE_DIR, 'gtin_default_config.json')
+
 def _load_sheet_config() -> dict:
+    # 1. Runtime config file (set via UI, wiped on redeploy)
     if os.path.exists(GTIN_SHEET_CFG_PATH):
         try:
             with open(GTIN_SHEET_CFG_PATH) as f:
@@ -89,10 +92,19 @@ def _load_sheet_config() -> dict:
                     return cfg
         except Exception:
             pass
-    # Fall back to environment variable so config survives Railway redeploys
+    # 2. Environment variable
     env_url = os.environ.get('GTIN_SHEET_URL', '').strip()
     if env_url:
         return {'sheet_url': env_url}
+    # 3. Default config baked into the image (survives redeploys)
+    if os.path.exists(_DEFAULT_CFG_PATH):
+        try:
+            with open(_DEFAULT_CFG_PATH) as f:
+                cfg = json.load(f)
+                if cfg.get('sheet_url'):
+                    return cfg
+        except Exception:
+            pass
     return {}
 
 
