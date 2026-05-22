@@ -129,6 +129,31 @@
   Dismissed flags are excluded from the downloaded report.</span>
 </div>
 
+<!-- Global check filter -->
+<div class="card border-0 shadow-sm mb-4 px-3 py-2" id="globalCheckFilter">
+  <div class="d-flex align-items-center gap-2 flex-wrap">
+    <span class="text-muted small fw-semibold me-1">Show checks:</span>
+    {% set _check_defs = [
+      ('1', 'GTIN / Barcode',        'bi-upc-scan'),
+      ('2', 'Front vs NFP',          'bi-clipboard2-pulse'),
+      ('3', 'Eyemark',               'bi-eye'),
+      ('4', 'Spelling',              'bi-spellcheck'),
+      ('5', 'FDA Risk',              'bi-shield-exclamation'),
+      ('6', 'Wind Direction',        'bi-arrow-repeat'),
+    ] %}
+    {% for num, label, icon in _check_defs %}
+    <button class="btn btn-sm btn-dark global-check-filter-btn"
+            data-check-num="{{ num }}"
+            onclick="toggleGlobalCheck(this)"
+            style="font-size:.75rem;padding:3px 10px">
+      <i class="bi {{ icon }} me-1"></i>{{ num }} · {{ label }}
+    </button>
+    {% endfor %}
+    <button class="btn btn-sm btn-link text-muted p-0 ms-1" style="font-size:.75rem"
+            onclick="resetGlobalFilter()">Show all</button>
+  </div>
+</div>
+
 <!-- Per-file tabs (multiple files) -->
 {% if job.results | length > 1 %}
 <ul class="nav nav-tabs mb-3" id="fileTabs" role="tablist">
@@ -206,41 +231,6 @@
       {% endif %}
     </div>
 
-    <!-- Check filter bar -->
-    <div class="d-flex align-items-center gap-1 flex-wrap mb-2" id="checkFilter{{ idx }}">
-      <span class="text-muted small me-1">Filter:</span>
-      {% set _checks = [
-        ('1','GTIN',     r.checks.gtin),
-        ('2','NFP',      r.checks.nfp),
-        ('3','Eyemark',  r.checks.eyemark),
-        ('4','Spelling', r.checks.spelling),
-        ('5','FDA',      r.checks.fda),
-      ] %}
-      {% if r.checks.wind is defined %}
-        {% set _checks = _checks + [('6','Wind', r.checks.wind)] %}
-      {% endif %}
-      {% for num, label, chk in _checks %}
-        {% set _issues = chk.get('issues', []) if chk else [] %}
-        {% set _crits  = _issues | selectattr('severity','equalto','critical') | list %}
-        {% set _warns  = _issues | selectattr('severity','equalto','warning')  | list %}
-        <button class="btn btn-sm btn-dark filter-check-btn"
-                data-check-num="{{ num }}"
-                data-file-idx="{{ idx }}"
-                onclick="toggleCheckFilter(this)"
-                style="font-size:.72rem;padding:2px 8px;opacity:1">
-          <span class="fw-semibold">{{ num }}</span>
-          <span class="d-none d-sm-inline text-muted"> · {{ label }}</span>
-          {% if _crits %}<span class="badge bg-danger ms-1" style="font-size:.65rem">{{ _crits|length }}</span>
-          {% elif _warns %}<span class="badge bg-warning text-dark ms-1" style="font-size:.65rem">{{ _warns|length }}</span>
-          {% else %}<span class="badge bg-success ms-1" style="font-size:.65rem">✓</span>
-          {% endif %}
-        </button>
-      {% endfor %}
-      <button class="btn btn-sm btn-link text-muted p-0 ms-2" style="font-size:.72rem"
-              onclick="resetCheckFilters({{ idx }})">Show all</button>
-    </div>
-
-    <div id="checkCards{{ idx }}">
     {{ _check_card('1','GTIN / Barcode',        'bi-upc-scan',           r.checks.gtin,     idx, r.filename, 'gtin',     dismissals) }}
     {{ _check_card('2','Front Call-Out vs NFP', 'bi-clipboard2-pulse',   r.checks.nfp,      idx, r.filename, 'nfp',      dismissals) }}
     {{ _check_card('3','Eyemark Contrast',       'bi-eye',                r.checks.eyemark,  idx, r.filename, 'eyemark',  dismissals) }}
@@ -249,7 +239,6 @@
     {% if r.checks.wind is defined %}
     {{ _check_card('6','Wind Direction',         'bi-arrow-repeat',       r.checks.wind,     idx, r.filename, 'wind',     dismissals) }}
     {% endif %}
-    </div>
 
     <!-- OCR text -->
     {% if r.ocr_preview %}
@@ -603,33 +592,27 @@ if (INIT_STATUS !== 'done' && INIT_STATUS !== 'error') {
   }, 1500);
 }
 
-/* ── Check filter ── */
-const _CHECK_KEYS = ['gtin','nfp','eyemark','spelling','fda','wind'];
-
-function toggleCheckFilter(btn) {
-  const fileIdx = btn.dataset.fileIdx;
+/* ── Global check filter ── */
+function toggleGlobalCheck(btn) {
   const isActive = btn.classList.contains('btn-dark');
   btn.classList.toggle('btn-dark', !isActive);
   btn.classList.toggle('btn-outline-dark', isActive);
-  applyCheckFilter(fileIdx);
+  applyGlobalFilter();
 }
 
-function resetCheckFilters(fileIdx) {
-  document.querySelectorAll(`#checkFilter${fileIdx} .filter-check-btn`).forEach(b => {
+function resetGlobalFilter() {
+  document.querySelectorAll('#globalCheckFilter .global-check-filter-btn').forEach(b => {
     b.classList.add('btn-dark');
     b.classList.remove('btn-outline-dark');
   });
-  applyCheckFilter(fileIdx);
+  applyGlobalFilter();
 }
 
-function applyCheckFilter(fileIdx) {
-  const btns = document.querySelectorAll(`#checkFilter${fileIdx} .filter-check-btn`);
+function applyGlobalFilter() {
+  const btns = document.querySelectorAll('#globalCheckFilter .global-check-filter-btn');
   const active = new Set([...btns].filter(b => b.classList.contains('btn-dark'))
                                   .map(b => b.dataset.checkNum));
-  const container = document.getElementById(`checkCards${fileIdx}`);
-  if (!container) return;
-  container.querySelectorAll('.check-card').forEach(card => {
-    // Each check card header has "Check N:" text — extract the number
+  document.querySelectorAll('.check-card').forEach(card => {
     const header = card.querySelector('.card-header span.fw-semibold');
     const m = header && header.textContent.match(/Check\s+(\d)/);
     if (m) card.style.display = active.has(m[1]) ? '' : 'none';
