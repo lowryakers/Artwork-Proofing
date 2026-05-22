@@ -142,9 +142,11 @@ def _fetch_sheet_rows(csv_url: str) -> list:
     rows = []
     for row in reader:
         d = {k.strip().lower(): (v.strip() if v else '') for k, v in row.items() if k}
-        gtin_raw = d.get('gtin/barcode#') or d.get('gtin') or d.get('barcode') or d.get('upc') or ''
-        flavor   = d.get('flavor') or d.get('product name') or d.get('name') or ''
-        sku      = d.get('sku') or ''
+        gtin_raw = (d.get('gtin/barcode#') or d.get('gtin / upc') or d.get('gtin/upc')
+                    or d.get('gtin') or d.get('upc') or d.get('barcode') or '')
+        flavor   = (d.get('updated naming') or d.get('flavor') or d.get('product title')
+                    or d.get('product name') or d.get('name') or '')
+        sku      = d.get('variant sku') or d.get('sku') or ''
         gtin_str = str(gtin_raw).strip().replace(' ', '')
         if '.' in gtin_str and gtin_str.replace('.', '').isdigit():
             try:
