@@ -159,7 +159,8 @@ def _get_sheet_gtin_rows(force: bool = False) -> list:
         cfg['row_count'] = len(rows)
         _save_sheet_config(cfg)
         return rows
-    except Exception:
+    except Exception as exc:
+        _sheet_cache['last_error'] = str(exc)
         return _sheet_cache['rows'] if _sheet_cache['rows'] is not None else []
 
 
@@ -215,6 +216,8 @@ def upload():
 
     if not gtin_rows:
         gtin_rows = _get_sheet_gtin_rows()
+        if not gtin_rows and _sheet_cache.get('last_error'):
+            flash(f'Google Sheet sync failed: {_sheet_cache["last_error"]}', 'danger')
 
     if not gtin_rows:
         flash(
