@@ -574,9 +574,8 @@ def _check_eyemark(img, is_film: bool = False, fname: str = '') -> dict:
 # ── Check 4: Spelling / brand name ───────────────────────────────────────────
 
 _MISSPELLINGS = {
-    # Use word boundaries so "prodoughshop" and "@prodoughshop" are never matched.
-    # The (?!®|\(r\)) lookahead prevents flagging correctly formatted ProDough® text.
-    r'\bprodough\b(?!®|\(r\))': 'ProDough® (verify capital P, capital D, no space, and ® symbol)',
+    # Only check for the space variant — OCR can't reliably read the ® symbol
+    # from outlined-text PDFs, so the (?!®) check produces constant false positives.
     r'pro\s+dough':              'ProDough (should be one word, no space)',
     r'\bcheescake\b':            'cheesecake',
     r'\bbanna\b':                'banana',
@@ -726,7 +725,15 @@ def _check_fda(ocr_text: str, fname: str) -> dict:
     # Only flag these if OCR has meaningful yield; otherwise they are noise.
 
     if not sparse:
-        if 'nutrition facts' not in tl and 'supplement facts' not in tl:
+        # NFP: accept explicit text OR numerical signals that only appear inside an NFP
+        # (calories + protein both present → panel almost certainly exists even if
+        #  "Nutrition Facts" header text was outlined and OCR-unreadable)
+        _has_nfp_text    = 'nutrition facts' in tl or 'supplement facts' in tl
+        _has_nfp_numbers = (
+            bool(re.search(r'\bcalories?\b', tl)) and
+            bool(re.search(r'\bprotein\b', tl))
+        )
+        if not _has_nfp_text and not _has_nfp_numbers:
             issues.append({
                 'severity': 'warning',
                 'message': (
@@ -736,7 +743,16 @@ def _check_fda(ocr_text: str, fname: str) -> dict:
                 ),
             })
 
-        if 'ingredient' not in tl:
+        # Ingredients: accept explicit label OR common ingredient words that only
+        # appear inside an ingredient declaration on a food label
+        _ingredient_signals = [
+            r'\bingredient',
+            r'\bwhey\b', r'\blecithin\b', r'\bstevia\b', r'\bsucralose\b',
+            r'\bsunflower\b', r'\bcitric\s+acid\b', r'\bsoy\b', r'\bxanthan\b',
+            r'\bnatural\s+flavor', r'\bartificial\s+flavor',
+        ]
+        _has_ingredients = any(re.search(p, tl) for p in _ingredient_signals)
+        if not _has_ingredients:
             issues.append({
                 'severity': 'warning',
                 'message': (
@@ -757,10 +773,13 @@ def _check_fda(ocr_text: str, fname: str) -> dict:
     has_allergen_stmt = any(re.search(p, tl) for p in
                             [r'contains?:', r'\ballergen\b', r'allergy\s+info', r'may\s+contain'])
 
-    is_whey_product   = any(w in fname.lower() or w in tl for w in ['whey', 'protein stick', 'protein powder'])
-    is_wheat_product  = any(w in fname.lower() or w in tl for w in ['pancake', 'donut', 'flour', 'mix'])
+    is_whey_product  = any(re.search(p, fname.lower() + ' ' + tl)
+                          for p in [r'\bwhey\b', r'protein\s+stick', r'protein\s+powder'])
+    is_wheat_product = any(re.search(p, fname.lower() + ' ' + tl)
+                          for p in [r'\bpancake\b', r'\bdonut\b', r'\bflour\b', r'\bmix\b'])
 
-    if is_whey_product and 'milk' not in tl:
+    # Whey protein inherently contains milk; accept "whey" in OCR as implicit milk evidence
+    if is_whey_product and 'milk' not in tl and 'whey' not in tl:
         issues.append({
             'severity': 'warning',
             'message': (
@@ -812,11 +831,18 @@ def _check_fda(ocr_text: str, fname: str) -> dict:
             })
 
     # ── Net weight ────────────────────────────────────────────────────────────
-    if not sparse and not re.search(r'net\s*wt|net\s*weight', tl):
+    # Accept explicit "Net Wt" text OR any gram/oz measurement — the number almost
+    # always OCRs correctly even when the "Net Wt" label text itself is outlined.
+    _has_net_wt = (
+        bool(re.search(r'net\s*wt|net\s*weight', tl)) or
+        bool(re.search(r'\b\d+\.?\d*\s*g\b', tl)) or
+        bool(re.search(r'\b\d+\.?\d*\s*oz\b', tl))
+    )
+    if not sparse and not _has_net_wt:
         issues.append({
             'severity': 'warning',
             'message': (
-                'No "Net Wt" declaration detected. '
+                'No "Net Wt" declaration or weight measurement detected. '
                 'Net quantity of contents is required (15 USC 1453 / 21 CFR 101.105). Verify manually.'
             ),
         })
@@ -1049,11 +1075,16 @@ def _check_fda_light(ocr_text: str, fname: str) -> dict:
         )
 
     # ── Net weight ────────────────────────────────────────────────────────────
-    if not sparse and not re.search(r'net\s*wt|net\s*weight', tl):
+    _has_net_wt = (
+        bool(re.search(r'net\s*wt|net\s*weight', tl)) or
+        bool(re.search(r'\b\d+\.?\d*\s*g\b', tl)) or
+        bool(re.search(r'\b\d+\.?\d*\s*oz\b', tl))
+    )
+    if not sparse and not _has_net_wt:
         issues.append({
             'severity': 'warning',
             'message': (
-                'No "Net Wt" declaration detected. '
+                'No "Net Wt" declaration or weight measurement detected. '
                 'Net quantity of contents is required (15 USC 1453 / 21 CFR 101.105). Verify manually.'
             ),
         })
