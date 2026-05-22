@@ -102,17 +102,22 @@ def _save_sheet_config(cfg: dict):
 
 
 def _sheet_url_to_csv(url: str) -> str:
-    """Convert any Google Sheets share/edit URL to a direct CSV export URL."""
+    """Convert any Google Sheets share/edit/published URL to a direct CSV export URL."""
     import re
     if 'export?format=csv' in url or 'output=csv' in url:
         return url
+    # Published-to-web format: /spreadsheets/d/e/LONG_KEY/pubhtml
+    m = re.search(r'(https://docs\.google\.com/spreadsheets/d/e/[a-zA-Z0-9_-]+)/pub', url)
+    if m:
+        return f'{m.group(1)}/pub?output=csv'
+    # Standard share/edit format: /spreadsheets/d/SHEET_ID/...
     m = re.search(r'/spreadsheets/d/([a-zA-Z0-9_-]+)', url)
-    if not m:
-        raise ValueError('Not a recognized Google Sheets URL. Paste the URL from your browser address bar.')
-    sheet_id = m.group(1)
-    gid_m = re.search(r'[#&?]gid=(\d+)', url)
-    gid_part = f'&gid={gid_m.group(1)}' if gid_m else ''
-    return f'https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv{gid_part}'
+    if m and m.group(1) != 'e':
+        sheet_id = m.group(1)
+        gid_m = re.search(r'[#&?]gid=(\d+)', url)
+        gid_part = f'&gid={gid_m.group(1)}' if gid_m else ''
+        return f'https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv{gid_part}'
+    raise ValueError('Not a recognized Google Sheets URL. Paste the share/edit URL from your browser address bar.')
 
 
 def _fetch_sheet_rows(csv_url: str) -> list:
