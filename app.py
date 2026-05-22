@@ -84,9 +84,15 @@ def _load_sheet_config() -> dict:
     if os.path.exists(GTIN_SHEET_CFG_PATH):
         try:
             with open(GTIN_SHEET_CFG_PATH) as f:
-                return json.load(f)
+                cfg = json.load(f)
+                if cfg.get('sheet_url'):
+                    return cfg
         except Exception:
             pass
+    # Fall back to environment variable so config survives Railway redeploys
+    env_url = os.environ.get('GTIN_SHEET_URL', '').strip()
+    if env_url:
+        return {'sheet_url': env_url}
     return {}
 
 
