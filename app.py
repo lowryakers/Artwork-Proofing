@@ -195,7 +195,10 @@ def gtin_page():
         rows = _get_sheet_gtin_rows()
         if rows:
             store = _save_gtin_store(rows, 'Google Sheets (auto-synced)')
-    return render_template('gtin.html', store=store, sheet_cfg=sheet_cfg)
+        elif _sheet_cache.get('last_error'):
+            flash(f'Google Sheet sync failed: {_sheet_cache["last_error"]}', 'danger')
+    env_url = os.environ.get('GTIN_SHEET_URL', '')
+    return render_template('gtin.html', store=store, sheet_cfg=sheet_cfg, env_sheet_url=env_url)
 
 
 @app.route('/upload', methods=['POST'])
