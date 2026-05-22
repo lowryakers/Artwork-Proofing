@@ -1117,35 +1117,35 @@ def _check_wind_direction(ocr_text: str, required_wind: str) -> dict:
     import re as _re
     detected_wind = None
 
-    # 1. Explicit "Wind N" or "Wind Direction N" immediately after keyword
-    m = _re.search(r'\bwind(?:ing)?(?:\s+direction)?\s*[:#-]?\s*([1-8])\b', tl)
+    # 1. Explicit "Wind N" (tight match — number right after keyword, no intervening text)
+    m = _re.search(r'\bwind\s*([1-8])\b', tl)
     if m:
         detected_wind = m.group(1)
 
-    # 2. "Winding" box on a press proof — number appears within 250 chars but not
-    #    immediately adjacent (e.g. "Winding:\nRIGHT SIDE OFF\n3")
+    # 2. Winding-box phrase: "RIGHT SIDE OFF N" / "LEFT SIDE OFF N" /
+    #    "TOP FIRST N" / "BOTTOM FIRST N".
+    #    Use .{0,30}? between each word so we tolerate interleaved OCR text
+    #    (Tesseract often reads multi-column proof forms row-by-row, mixing
+    #    winding-box words with adjacent nutrition-facts column text).
+    #    "RIGHT   Serving size\nSIDE    1 Stick\nOFF     130\n3" still matches.
     if not detected_wind:
-        m = _re.search(r'\bwinding\b.{0,250}?\b([1-8])\b', tl, _re.DOTALL)
-        if m:
-            detected_wind = m.group(1)
+        _DIR_PATTERNS = [
+            r'right.{0,30}?side.{0,30}?off.{0,15}?\b([1-8])\b',
+            r'left.{0,30}?side.{0,30}?off.{0,15}?\b([1-8])\b',
+            r'top.{0,30}?first.{0,15}?\b([1-8])\b',
+            r'bottom.{0,30}?first.{0,15}?\b([1-8])\b',
+        ]
+        for pat in _DIR_PATTERNS:
+            m = _re.search(pat, tl, _re.DOTALL)
+            if m:
+                detected_wind = m.group(1)
+                break
 
     # 3. "Outwound N" / "Inwound N"
     if not detected_wind:
         m = _re.search(r'\b(in|out)wound\s*([1-8])\b', tl)
         if m:
             detected_wind = m.group(2)
-
-    # 4. Directional phrases — map to wind number using inwound/outwound from
-    #    the required direction as the winding context
-    if not detected_wind:
-        if _re.search(r'\bright\s*side\b', tl):
-            detected_wind = '7' if is_inwound else '3'
-        elif _re.search(r'\bleft\s*side\b', tl):
-            detected_wind = '8' if is_inwound else '4'
-        elif _re.search(r'\btop\s*(?:of\s*(?:label\s*)?)?first\b', tl):
-            detected_wind = '5' if is_inwound else '1'
-        elif _re.search(r'\bbottom\s*(?:of\s*(?:label\s*)?)?first\b', tl):
-            detected_wind = '6' if is_inwound else '2'
 
     if detected_wind:
         if detected_wind == required_wind:
