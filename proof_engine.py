@@ -733,7 +733,12 @@ def _check_fda(ocr_text: str, fname: str) -> dict:
             bool(re.search(r'\bcalories?\b', tl)) and
             bool(re.search(r'\bprotein\b', tl))
         )
-        if not _has_nfp_text and not _has_nfp_numbers:
+        # Additional NFP signals: any two of these typical NFP row labels
+        _nfp_row_signals = [r'\btotal\s*fat\b', r'\bsodium\b', r'\bcarbohydrate\b',
+                            r'\bdietary\s*fiber\b', r'\b%\s*dv\b', r'%\s*daily\s*value',
+                            r'\bserving\s*size\b', r'\bservings?\s*per\b']
+        _nfp_row_hits = sum(1 for p in _nfp_row_signals if re.search(p, tl))
+        if not _has_nfp_text and not _has_nfp_numbers and _nfp_row_hits < 2:
             issues.append({
                 'severity': 'warning',
                 'message': (
@@ -750,6 +755,8 @@ def _check_fda(ocr_text: str, fname: str) -> dict:
             r'\bwhey\b', r'\blecithin\b', r'\bstevia\b', r'\bsucralose\b',
             r'\bsunflower\b', r'\bcitric\s+acid\b', r'\bsoy\b', r'\bxanthan\b',
             r'\bnatural\s+flavor', r'\bartificial\s+flavor',
+            r'\bmilk\s+powder\b', r'\bnon.fat\s+milk\b', r'\bskim\s+milk\b',
+            r'\bcocoa\b', r'\bsalt\b', r'\bpotassium\b', r'\bvitamin\b',
         ]
         _has_ingredients = any(re.search(p, tl) for p in _ingredient_signals)
         if not _has_ingredients:
@@ -774,16 +781,22 @@ def _check_fda(ocr_text: str, fname: str) -> dict:
                             [r'contains?:', r'\ballergen\b', r'allergy\s+info', r'may\s+contain'])
 
     is_whey_product  = any(re.search(p, fname.lower() + ' ' + tl)
-                          for p in [r'\bwhey\b', r'protein\s+stick', r'protein\s+powder'])
+                          for p in [r'\bwhey\b', r'protein\s+stick', r'protein\s+powder',
+                                    r'\bstick\b', r'\bsticks\b', r'\bpouch\b', r'\bpouches\b'])
     is_wheat_product = any(re.search(p, fname.lower() + ' ' + tl)
                           for p in [r'\bpancake\b', r'\bdonut\b', r'\bflour\b', r'\bmix\b'])
 
-    # Whey protein inherently contains milk; accept "whey" in OCR as implicit milk evidence
-    if is_whey_product and 'milk' not in tl and 'whey' not in tl:
+    # Milk evidence: explicit word, or milk-derived ingredients that OCR from outlined fonts
+    _milk_in_ocr = bool(re.search(
+        r'\bmilk\b|\bnon.fat\s+milk\b|\bmilk\s+powder\b|\bskim\s+milk\b|\bdairy\b|\bcasein\b', tl
+    ))
+    # If it's a whey/stick protein product, the product type implies milk is present.
+    # Only fire if NEITHER the filename NOR any OCR evidence suggests milk/whey.
+    if is_whey_product and not _milk_in_ocr and 'whey' not in tl and 'whey' not in fname.lower():
         issues.append({
             'severity': 'warning',
             'message': (
-                'Whey protein product — "milk" allergen declaration not detected via OCR. '
+                'Whey/milk protein product — "milk" allergen declaration not detected via OCR. '
                 'FDA FALCPA (21 USC 343(w)) requires milk to be declared as a major food allergen. '
                 'Verify the allergen statement is present on the actual artwork.'
             ),
@@ -797,7 +810,7 @@ def _check_fda(ocr_text: str, fname: str) -> dict:
                 'Verify the allergen statement appears on the actual artwork.'
             ),
         })
-    elif not has_allergen_stmt and not sparse:
+    elif not is_whey_product and not is_wheat_product and not has_allergen_stmt and not sparse:
         issues.append({
             'severity': 'warning',
             'message': (
