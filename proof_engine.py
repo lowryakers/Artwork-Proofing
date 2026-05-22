@@ -388,18 +388,36 @@ def _check_gtin(ocr_text: str, fname: str, gtin_rows: list,
         gtin_lookup = {str(r.get('gtin', '')).strip(): str(r.get('flavor', '')).strip().lower()
                        for r in gtin_rows if r.get('gtin')}
         fname_lower = fname.lower()
+        # Generic words that carry no flavor/format identity
+        _GENERIC = {
+            'whey', 'protein', 'powder', 'stick', 'sticks', 'pouch', 'pouches',
+            'bag', 'bags', 'bar', 'bars', 'single', 'prodough', 'pro', 'dough',
+            'pack', 'sachet', 'sachets', 'blend', 'mix', 'sport', 'sports',
+            'the', 'a', 'an', 'and', 'of', 'with', 'for', 'to',
+        }
         for gtin in found:
             if gtin in gtin_lookup:
                 expected_flavor = gtin_lookup[gtin]
-                if expected_flavor and expected_flavor not in fname_lower:
+                if not expected_flavor:
+                    continue
+                # Extract meaningful keywords from the master-list flavor name
+                flavor_words = re.findall(r'[a-z0-9]+', expected_flavor)
+                keywords = [w for w in flavor_words if w not in _GENERIC and len(w) > 1]
+                if not keywords:
+                    continue  # nothing meaningful to match against
+                matched = [kw for kw in keywords if kw in fname_lower]
+                if len(matched) < len(keywords):
+                    missing = [kw for kw in keywords if kw not in matched]
                     issues.append({
-                        'severity': 'critical',
+                        'severity': 'warning',
                         'message': (
-                            f'GTIN {gtin} in the master list belongs to "{expected_flavor}", '
-                            f'but the artwork file is named "{fname}". '
-                            'This may be the wrong barcode — verify against the master SKU list.'
+                            f'GTIN {gtin} is listed under "{expected_flavor}" in the master list. '
+                            f'The filename "{fname}" may not match — '
+                            f'unmatched keyword(s): {", ".join(missing)}. '
+                            'Confirm this is the correct SKU.'
                         ),
                     })
+                # If all keywords matched, the flavor lines up — no issue raised
             else:
                 issues.append({
                     'severity': 'warning',
