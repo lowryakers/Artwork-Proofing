@@ -439,6 +439,18 @@ def api_gtin_sheet_sync():
         return jsonify({'ok': False, 'error': str(e)}), 500
 
 
+@app.route('/api/debug-env')
+def debug_env():
+    gtin_url = os.environ.get('GTIN_SHEET_URL', '')
+    all_keys = [k for k in os.environ if 'GTIN' in k or 'SHEET' in k or 'RAILWAY' in k.upper()]
+    return jsonify({
+        'GTIN_SHEET_URL_set': bool(gtin_url),
+        'GTIN_SHEET_URL_length': len(gtin_url),
+        'GTIN_SHEET_URL_preview': gtin_url[:40] if gtin_url else None,
+        'related_env_keys': all_keys,
+    })
+
+
 @app.route('/api/dismiss/<job_id>', methods=['POST'])
 def api_dismiss(job_id):
     data = request.get_json()
