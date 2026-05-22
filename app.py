@@ -451,6 +451,36 @@ def api_gtin_sheet_sync():
         return jsonify({'ok': False, 'error': str(e)}), 500
 
 
+@app.route('/api/debug-gtin-sync')
+def debug_gtin_sync():
+    cfg = _load_sheet_config()
+    url = cfg.get('sheet_url', '')
+    if not url:
+        return jsonify({'error': 'No sheet URL configured'})
+    try:
+        csv_url = _sheet_url_to_csv(url)
+        import csv as _csv
+        req = __import__('urllib').request.Request(csv_url, headers={'User-Agent': 'Mozilla/5.0'})
+        with __import__('urllib').request.urlopen(req, timeout=15) as resp:
+            raw = resp.read().decode('utf-8-sig')
+        lines = raw.splitlines()
+        reader = _csv.DictReader(__import__('io').StringIO(raw))
+        headers = reader.fieldnames or []
+        first_rows = []
+        for i, row in enumerate(reader):
+            if i >= 3:
+                break
+            first_rows.append(dict(row))
+        return jsonify({
+            'csv_url': csv_url,
+            'total_lines': len(lines),
+            'headers': headers,
+            'first_3_rows': first_rows,
+        })
+    except Exception as exc:
+        return jsonify({'error': str(exc)})
+
+
 @app.route('/api/debug-env')
 def debug_env():
     gtin_url = os.environ.get('GTIN_SHEET_URL', '')

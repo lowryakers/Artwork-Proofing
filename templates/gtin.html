@@ -39,16 +39,16 @@
     {% endif %}
   </div>
   <div class="card-body py-3">
-    {% if env_sheet_url %}
+    {% if sheet_cfg.get('sheet_url') %}
     <div class="alert alert-success py-2 small mb-3">
       <i class="bi bi-check-circle-fill me-1"></i>
-      <strong>GTIN_SHEET_URL</strong> environment variable is set — sheet URL will persist across redeploys.
+      Sheet URL is persisted and will survive redeploys.
+      {% if not env_sheet_url %}<span class="text-muted">(via baked-in config)</span>{% endif %}
     </div>
     {% else %}
     <div class="alert alert-warning py-2 small mb-3">
       <i class="bi bi-exclamation-triangle-fill me-1"></i>
-      <strong>GTIN_SHEET_URL</strong> environment variable is not set in Railway — sheet URL will be lost on redeploy.
-      Add it in Railway → Service → Variables.
+      No sheet URL configured — GTIN sync is inactive.
     </div>
     {% endif %}
     {% if not sheet_cfg.get('sheet_url') %}
