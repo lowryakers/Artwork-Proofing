@@ -187,6 +187,7 @@ def _get_sheet_gtin_rows(force: bool = False) -> list:
 
 @app.route('/')
 def landing():
+    proof_engine.load_jobs_from_disk()
     return render_template('landing.html', jobs=proof_engine.list_jobs())
 
 
@@ -361,6 +362,7 @@ def summary(job_id):
 
 @app.route('/history')
 def history():
+    proof_engine.load_jobs_from_disk()  # refresh from disk in case of restart
     jobs = proof_engine.list_jobs()
     return render_template('history.html', jobs=jobs)
 
