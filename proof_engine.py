@@ -1418,6 +1418,45 @@ def _check_print_specs(pdf_path: str, brand_config: dict = None) -> dict:
         else:
             notes.append('Color mode: CMYK — no RGB content detected ✓')
 
+        # ── Material type ─────────────────────────────────────────────────────
+        # Extract from native PDF text (press proof forms list material in the
+        # finishing/job info panel as editable text, so PyMuPDF reads it exactly).
+        pdf_text = '\n'.join(doc[i].get_text() for i in range(len(doc)))
+        material_found = None
+
+        # Match "Material Order: ..." or "Material: ..." lines
+        m = re.search(
+            r'material\s*(?:order\s*)?[:\-]?\s*([^\n]{5,120})',
+            pdf_text, re.IGNORECASE
+        )
+        if m:
+            material_found = m.group(1).strip().rstrip('.,;')
+        else:
+            # Fallback: look for material codes like "#781 PET Soft Touch"
+            m = re.search(
+                r'(#\d{3,4}[^\n]{5,80}(?:pet|opp|bopp|pe|pp|foil|metallocene|'
+                r'soft\s*touch|matte|gloss|kraft|paper)[^\n]{0,60})',
+                pdf_text, re.IGNORECASE
+            )
+            if m:
+                material_found = m.group(1).strip()
+
+        if material_found:
+            # Clean up: truncate if the regex grabbed too much surrounding text
+            material_found = material_found[:120].strip()
+            notes.append(f'Material: {material_found}')
+            # Validate against required material if configured
+            req_mat = brand_config.get('required_material', '').strip()
+            if req_mat and req_mat.lower() not in material_found.lower():
+                issues.append({'severity': 'warning',
+                               'message': f'Material mismatch — file specifies "{material_found}", '
+                                          f'but job requires "{req_mat}". '
+                                          'Confirm substrate with your print supplier before going to press.'})
+        else:
+            notes.append('Material type: not detected in PDF text. '
+                         'If this is a press proof, verify the material spec in the finishing section '
+                         'of the proof form manually.')
+
         # ── Page count ────────────────────────────────────────────────────────
         if len(doc) > 1:
             issues.append({'severity': 'warning',
