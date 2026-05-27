@@ -140,6 +140,7 @@
       ('4', 'Spelling',        'bi-spellcheck'),
       ('5', 'FDA Risk',        'bi-shield-exclamation'),
       ('6', 'Wind Direction',  'bi-arrow-repeat'),
+      ('7', 'Print Specs',     'bi-rulers'),
     ] %}
     {% for num, label, icon in _check_defs %}
     <button class="btn btn-sm btn-outline-dark global-check-filter-btn"
@@ -170,6 +171,7 @@
   {% if r.checks.spelling and r.checks.spelling.get('issues') %}{% set ns.checks_with_issues = ns.checks_with_issues + ['4'] %}{% endif %}
   {% if r.checks.fda    and r.checks.fda.get('issues')     %}{%  set ns.checks_with_issues = ns.checks_with_issues + ['5'] %}{% endif %}
   {% if r.checks.wind   and r.checks.wind.get('issues')    %}{%  set ns.checks_with_issues = ns.checks_with_issues + ['6'] %}{% endif %}
+  {% if r.checks.specs  and r.checks.specs.get('issues')   %}{%  set ns.checks_with_issues = ns.checks_with_issues + ['7'] %}{% endif %}
   <li class="nav-item file-tab-item" role="presentation"
       data-file-idx="{{ loop.index0 }}"
       data-checks-with-issues="{{ ns.checks_with_issues | join(',') }}"
@@ -257,6 +259,9 @@
     {{ _check_card('5','FDA Audit Risk',         'bi-shield-exclamation', r.checks.fda,      idx, r.filename, 'fda',      dismissals, always_open=true) }}
     {% if r.checks.wind is defined %}
     {{ _check_card('6','Wind Direction',         'bi-arrow-repeat',       r.checks.wind,     idx, r.filename, 'wind',     dismissals) }}
+    {% endif %}
+    {% if r.checks.specs is defined %}
+    {{ _check_card('7','Print Specs',            'bi-rulers',             r.checks.specs,    idx, r.filename, 'specs',    dismissals) }}
     {% endif %}
 
     <!-- OCR text -->

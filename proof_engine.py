@@ -234,7 +234,17 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
             raise FileNotFoundError(f'pdftoppm produced no PNG for {fname}')
         img_path = os.path.join(work_dir, candidates[0])
 
-    # ── OCR ──────────────────────────────────────────────────────────────────
+    # ── Native PDF text extraction (PyMuPDF) — accurate for non-outlined text ──
+    native_text = ''
+    try:
+        import fitz as _fitz
+        _doc = _fitz.open(pdf_path)
+        native_text = '\n'.join(_doc[i].get_text() for i in range(len(_doc)))
+        _doc.close()
+    except Exception:
+        pass
+
+    # ── OCR (Tesseract) — catches outlined/converted text ────────────────────
     ocr_text = ''
     try:
         r = subprocess.run(
@@ -244,6 +254,9 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
         ocr_text = r.stdout
     except Exception:
         pass
+
+    # Merge: native text is authoritative where it exists; OCR fills the gaps
+    combined_text = native_text + '\n' + ocr_text
 
     # ── Load image for visual checks ─────────────────────────────────────────
     img = None
@@ -259,32 +272,32 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
     brand_mode = brand_config.get('brand_mode', 'prodough')
 
     if brand_mode == 'generic':
-        # Generic brand mode: GTIN, eyemark (packaging_type-driven), spelling, fda_light
-        # No NFP check
         is_film = brand_config.get('packaging_type', 'other') == 'stick'
         brand_name = brand_config.get('brand_name', '')
         checks = {
-            'gtin':     _check_gtin(ocr_text, fname, gtin_rows, barcode_gtins),
+            'gtin':     _check_gtin(combined_text, fname, gtin_rows, barcode_gtins),
             'eyemark':  _check_eyemark(img, is_film, fname),
-            'spelling': _check_spelling_generic(ocr_text, brand_name),
-            'fda':      _check_fda_light(ocr_text, fname),
+            'spelling': _check_spelling_generic(combined_text, brand_name),
+            'fda':      _check_fda_light(combined_text, fname),
+            'specs':    _check_print_specs(pdf_path, brand_config),
         }
         if is_film:
             checks['wind'] = _check_wind_direction(
-                ocr_text, brand_config.get('wind_direction', ''))
+                combined_text, brand_config.get('wind_direction', ''))
     else:
-        # ProDough mode: run all 5 checks as standard
-        is_film = _is_film_rollstock(fname, ocr_text)
+        # ProDough mode
+        is_film = _is_film_rollstock(fname, combined_text)
         checks = {
-            'gtin':     _check_gtin(ocr_text, fname, gtin_rows, barcode_gtins),
-            'nfp':      _check_nfp(ocr_text),
+            'gtin':     _check_gtin(combined_text, fname, gtin_rows, barcode_gtins),
+            'nfp':      _check_nfp(combined_text),
             'eyemark':  _check_eyemark(img, is_film, fname),
-            'spelling': _check_spelling(ocr_text, fname),
-            'fda':      _check_fda(ocr_text, fname),
+            'spelling': _check_spelling(combined_text, fname),
+            'fda':      _check_fda(combined_text, fname),
+            'specs':    _check_print_specs(pdf_path, brand_config),
         }
         wind_dir = brand_config.get('wind_direction', '')
         if wind_dir:
-            checks['wind'] = _check_wind_direction(ocr_text, wind_dir)
+            checks['wind'] = _check_wind_direction(combined_text, wind_dir)
 
     all_issues = [i for c in checks.values() for i in c.get('issues', [])]
     crit  = [i for i in all_issues if i['severity'] == 'critical']
@@ -304,7 +317,7 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
         'filename': fname,
         'img_path': img_path,
         'img_web': img_path,
-        'ocr_preview': ocr_text[:2000],
+        'ocr_preview': combined_text[:3000],
         'checks': checks,
         'severity': severity,
         'critical_count': len(crit),
@@ -1213,6 +1226,220 @@ def _check_wind_direction(ocr_text: str, required_wind: str) -> dict:
         })
 
     return {'issues': issues, 'notes': notes}
+
+
+# ── Check 7: Print Specifications (PDF vector data — no OCR) ──────────────────
+
+_DIELINE_KEYWORDS = frozenset([
+    'die', 'dieline', 'die line', 'die-line', 'die cut', 'diecut',
+    'cutcontour', 'cut contour', 'thru-cut', 'thrucut', 'through cut',
+    'score', 'perforation', 'perf', 'kiss cut', 'kisscut',
+    'crease', 'fold', 'cutter guide',
+])
+
+_PROCESS_CS = frozenset([
+    'cyan', 'magenta', 'yellow', 'black', 'cmyk', 'gray', 'grey',
+    'none', 'all', 'devicecmyk', 'devicegray', 'devicergb',
+    'registration', 'red', 'green', 'blue',
+])
+
+
+def _extract_spot_colors(doc) -> set:
+    """
+    Scan every xref object for /Separation and /DeviceN colorspace arrays
+    and return a set of human-readable spot color names.
+    """
+    spots = set()
+    for xref in range(1, doc.xref_length()):
+        try:
+            obj = doc.xref_object(xref, compressed=False)
+        except Exception:
+            continue
+        # /Separation /ColorName ...
+        for m in re.finditer(r'/Separation\s+/([^\s/\[\]()<>{}]+)', obj):
+            name = m.group(1)
+            if name.lower() not in _PROCESS_CS:
+                spots.add(name)
+        # /DeviceN [/Color1 /Color2 ...] — pick non-process names
+        for m in re.finditer(r'/DeviceN\s+\[([^\]]+)\]', obj):
+            for nm in re.finditer(r'/([^\s/\[\]()<>{}]+)', m.group(1)):
+                name = nm.group(1)
+                if name.lower() not in _PROCESS_CS:
+                    spots.add(name)
+    return spots
+
+
+def _get_ocg_names(doc) -> list:
+    """Return Optional Content Group (layer) names from the document."""
+    names = []
+    try:
+        for xref in range(1, doc.xref_length()):
+            try:
+                obj = doc.xref_object(xref, compressed=False)
+            except Exception:
+                continue
+            if '/Type /OCG' in obj:
+                m = re.search(r'/Name\s*\(([^)]+)\)', obj)
+                if not m:
+                    m = re.search(r'/Name\s+<([^>]+)>', obj)  # hex string
+                if m:
+                    names.append(m.group(1))
+    except Exception:
+        pass
+    return names
+
+
+def _check_print_specs(pdf_path: str, brand_config: dict = None) -> dict:
+    """
+    Read actual PDF vector data using PyMuPDF.
+    Checks dimensions, bleed, spot/Pantone colors, die lines, and RGB content.
+    No OCR — all results are exact.
+    """
+    issues, notes = [], []
+    brand_config = brand_config or {}
+    pts_to_mm = 25.4 / 72
+
+    try:
+        import fitz
+    except ImportError:
+        return {'issues': [], 'notes': ['PDF structure check skipped — pymupdf not installed.']}
+
+    try:
+        doc = fitz.open(pdf_path)
+    except Exception as e:
+        return {'issues': [{'severity': 'warning',
+                            'message': f'Could not open PDF for structure analysis: {e}'}], 'notes': []}
+
+    try:
+        page = doc[0]
+
+        # ── Dimensions ────────────────────────────────────────────────────────
+        mb = page.mediabox
+        mb_w = round(mb.width  * pts_to_mm, 1)
+        mb_h = round(mb.height * pts_to_mm, 1)
+
+        # TrimBox — finished trim size (should always be present in print-ready files)
+        tb_w = tb_h = None
+        bleed_mm = None
+        try:
+            trim_raw = doc.xref_get_key(page.xref, 'TrimBox')
+            if trim_raw and trim_raw[0] == 'array':
+                pts = [float(x) for x in re.findall(r'[-\d.]+', trim_raw[1])]
+                if len(pts) == 4:
+                    tb_w = round((pts[2] - pts[0]) * pts_to_mm, 1)
+                    tb_h = round((pts[3] - pts[1]) * pts_to_mm, 1)
+                    bleed_h = round((mb_w - tb_w) / 2, 1)
+                    bleed_v = round((mb_h - tb_h) / 2, 1)
+                    bleed_mm = round(max(bleed_h, bleed_v), 1)
+        except Exception:
+            pass
+
+        if tb_w and tb_h:
+            notes.append(f'Trim size (TrimBox): {tb_w} × {tb_h} mm')
+            notes.append(f'Full page (MediaBox): {mb_w} × {mb_h} mm')
+            if bleed_mm and bleed_mm > 0:
+                if bleed_mm < 2.5:
+                    issues.append({'severity': 'warning',
+                                   'message': f'Bleed is only {bleed_mm} mm (MediaBox vs TrimBox). '
+                                              'Standard print bleed is 3 mm. Verify with your print supplier.'})
+                else:
+                    notes.append(f'Bleed: {bleed_mm} mm ✓')
+            else:
+                issues.append({'severity': 'warning',
+                               'message': 'No bleed detected (TrimBox equals MediaBox). '
+                                          'Print-ready files should have ≥ 3 mm bleed on all sides.'})
+        else:
+            notes.append(f'Page size (MediaBox): {mb_w} × {mb_h} mm')
+            issues.append({'severity': 'warning',
+                           'message': 'No TrimBox found. Print-ready PDFs must define a TrimBox '
+                                      '(the finished trim size). Add a TrimBox in your design app before '
+                                      'exporting (Illustrator: File → Document Setup → Trim Marks & Bleed).'})
+
+        # Compare against expected spec dimensions if configured
+        spec_w = brand_config.get('spec_width_mm')
+        spec_h = brand_config.get('spec_height_mm')
+        dim_ref = (tb_w, tb_h) if tb_w else (mb_w, mb_h)
+        dim_label = 'trim' if tb_w else 'page'
+        if spec_w and spec_h and dim_ref[0]:
+            tol = 2.0  # mm
+            fits = (
+                (abs(dim_ref[0] - spec_w) <= tol and abs(dim_ref[1] - spec_h) <= tol) or
+                (abs(dim_ref[0] - spec_h) <= tol and abs(dim_ref[1] - spec_w) <= tol)
+            )
+            if not fits:
+                issues.append({'severity': 'critical',
+                               'message': f'Dimension mismatch — {dim_label} size is '
+                                          f'{dim_ref[0]} × {dim_ref[1]} mm, '
+                                          f'spec requires {spec_w} × {spec_h} mm (±2 mm). '
+                                          'Verify the artwork size with your print supplier before going to press.'})
+            else:
+                notes.append(f'Dimensions match spec: {spec_w} × {spec_h} mm ✓')
+
+        # ── Spot / Pantone colors ─────────────────────────────────────────────
+        spot_colors = sorted(_extract_spot_colors(doc))
+        if spot_colors:
+            notes.append(f'Spot colors in file: {", ".join(spot_colors)}')
+        else:
+            notes.append('No spot colors detected (process CMYK / RGB only).')
+
+        # ── Die line detection ────────────────────────────────────────────────
+        die_spots  = [c for c in spot_colors
+                      if any(kw in c.lower().replace('_', ' ') for kw in _DIELINE_KEYWORDS)]
+        ocg_names  = _get_ocg_names(doc)
+        die_layers = [l for l in ocg_names
+                      if any(kw in l.lower().replace('_', ' ') for kw in _DIELINE_KEYWORDS)]
+
+        if die_spots:
+            notes.append(f'Die line spot color detected: {", ".join(die_spots)} ✓')
+        elif die_layers:
+            notes.append(f'Die line layer detected: {", ".join(die_layers)} ✓')
+        else:
+            issues.append({'severity': 'warning',
+                           'message': 'No die line spot color or layer detected. '
+                                      'Expected a spot color named "Dieline", "CutContour", "Die", '
+                                      'or similar. Verify die lines are present and correctly labeled '
+                                      'in the file before sending to print.'})
+
+        # ── RGB content ───────────────────────────────────────────────────────
+        has_rgb = False
+        for xref in range(1, doc.xref_length()):
+            try:
+                obj = doc.xref_object(xref, compressed=False)
+                if '/DeviceRGB' in obj or '/CalRGB' in obj:
+                    has_rgb = True
+                    break
+            except Exception:
+                continue
+        if has_rgb:
+            issues.append({'severity': 'warning',
+                           'message': 'RGB color content detected in the PDF. Print-ready files '
+                                      'should be fully CMYK. RGB elements may produce unexpected '
+                                      'color shifts when converted by the RIP at the print supplier.'})
+        else:
+            notes.append('Color mode: CMYK — no RGB content detected ✓')
+
+        # ── Page count ────────────────────────────────────────────────────────
+        if len(doc) > 1:
+            issues.append({'severity': 'warning',
+                           'message': f'PDF has {len(doc)} pages. Artwork files should be '
+                                      'single-page. Verify only page 1 is the artwork and '
+                                      'remove any blank, template, or approval pages.'})
+
+    except Exception as e:
+        issues.append({'severity': 'warning', 'message': f'Print spec analysis error: {e}'})
+    finally:
+        doc.close()
+
+    return {
+        'issues': issues,
+        'notes': notes,
+        'spot_colors': spot_colors if 'spot_colors' in dir() else [],
+        'dimensions': {
+            'mediabox_mm': [mb_w, mb_h] if 'mb_w' in dir() else None,
+            'trimbox_mm':  [tb_w, tb_h] if tb_w else None,
+            'bleed_mm':    bleed_mm,
+        },
+    }
 
 
 # ── Summary ───────────────────────────────────────────────────────────────────
