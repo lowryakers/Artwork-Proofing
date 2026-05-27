@@ -1,6 +1,7 @@
 import os
 import io
 import json
+import re
 import time
 import urllib.request
 import openpyxl
@@ -18,10 +19,14 @@ BASE_DIR              = os.path.dirname(os.path.abspath(__file__))
 UPLOAD_DIR            = os.path.join(BASE_DIR, 'uploads')
 GTIN_STORE_PATH       = os.path.join(UPLOAD_DIR, 'gtin_store.json')
 GTIN_SHEET_CFG_PATH   = os.path.join(UPLOAD_DIR, 'gtin_sheet_config.json')
+SPECS_SHEET_CFG_PATH  = os.path.join(UPLOAD_DIR, 'specs_sheet_config.json')
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 _sheet_cache: dict = {'rows': None, 'fetched_at': 0.0, 'url': ''}
 _SHEET_CACHE_TTL = 300  # seconds
+
+_specs_cache: dict   = {'rows': None, 'fetched_at': 0.0, 'url': ''}
+_SPECS_DEFAULT_CFG   = os.path.join(BASE_DIR, 'specs_default_config.json')
 
 ALLOWED_EXTS = {'.pdf', '.ai', '.png', '.jpg', '.jpeg', '.tiff', '.tif', '.eps'}
 
@@ -31,6 +36,7 @@ CHECK_LABELS = {
     'eyemark':  'Eyemark Contrast',
     'spelling': 'Spelling / Brand Name',
     'fda':      'FDA Audit Risk',
+    'specs':    'Print Specs',
 }
 
 
@@ -80,11 +86,29 @@ def _save_gtin_store(rows: list, source_filename: str) -> dict:
 
 # ── Google Sheets sync ───────────────────────────────────────────────────────
 
+_DEFAULT_CFG_PATH = os.path.join(BASE_DIR, 'gtin_default_config.json')
+
 def _load_sheet_config() -> dict:
+    # 1. Runtime config file (set via UI, wiped on redeploy)
     if os.path.exists(GTIN_SHEET_CFG_PATH):
         try:
             with open(GTIN_SHEET_CFG_PATH) as f:
-                return json.load(f)
+                cfg = json.load(f)
+                if cfg.get('sheet_url'):
+                    return cfg
+        except Exception:
+            pass
+    # 2. Environment variable
+    env_url = os.environ.get('GTIN_SHEET_URL', '').strip()
+    if env_url:
+        return {'sheet_url': env_url}
+    # 3. Default config baked into the image (survives redeploys)
+    if os.path.exists(_DEFAULT_CFG_PATH):
+        try:
+            with open(_DEFAULT_CFG_PATH) as f:
+                cfg = json.load(f)
+                if cfg.get('sheet_url'):
+                    return cfg
         except Exception:
             pass
     return {}
@@ -96,17 +120,22 @@ def _save_sheet_config(cfg: dict):
 
 
 def _sheet_url_to_csv(url: str) -> str:
-    """Convert any Google Sheets share/edit URL to a direct CSV export URL."""
+    """Convert any Google Sheets share/edit/published URL to a direct CSV export URL."""
     import re
     if 'export?format=csv' in url or 'output=csv' in url:
         return url
+    # Published-to-web format: /spreadsheets/d/e/LONG_KEY/pubhtml
+    m = re.search(r'(https://docs\.google\.com/spreadsheets/d/e/[a-zA-Z0-9_-]+)/pub', url)
+    if m:
+        return f'{m.group(1)}/pub?output=csv'
+    # Standard share/edit format: /spreadsheets/d/SHEET_ID/...
     m = re.search(r'/spreadsheets/d/([a-zA-Z0-9_-]+)', url)
-    if not m:
-        raise ValueError('Not a recognized Google Sheets URL. Paste the URL from your browser address bar.')
-    sheet_id = m.group(1)
-    gid_m = re.search(r'[#&?]gid=(\d+)', url)
-    gid_part = f'&gid={gid_m.group(1)}' if gid_m else ''
-    return f'https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv{gid_part}'
+    if m and m.group(1) != 'e':
+        sheet_id = m.group(1)
+        gid_m = re.search(r'[#&?]gid=(\d+)', url)
+        gid_part = f'&gid={gid_m.group(1)}' if gid_m else ''
+        return f'https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv{gid_part}'
+    raise ValueError('Not a recognized Google Sheets URL. Paste the share/edit URL from your browser address bar.')
 
 
 def _fetch_sheet_rows(csv_url: str) -> list:
@@ -119,9 +148,11 @@ def _fetch_sheet_rows(csv_url: str) -> list:
     rows = []
     for row in reader:
         d = {k.strip().lower(): (v.strip() if v else '') for k, v in row.items() if k}
-        gtin_raw = d.get('gtin/barcode#') or d.get('gtin') or d.get('barcode') or d.get('upc') or ''
-        flavor   = d.get('flavor') or d.get('product name') or d.get('name') or ''
-        sku      = d.get('sku') or ''
+        gtin_raw = (d.get('gtin/barcode#') or d.get('gtin / upc') or d.get('gtin/upc')
+                    or d.get('gtin') or d.get('upc') or d.get('barcode') or '')
+        flavor   = (d.get('updated naming') or d.get('flavor') or d.get('product title')
+                    or d.get('product name') or d.get('name') or '')
+        sku      = d.get('variant sku') or d.get('sku') or ''
         gtin_str = str(gtin_raw).strip().replace(' ', '')
         if '.' in gtin_str and gtin_str.replace('.', '').isdigit():
             try:
@@ -153,14 +184,134 @@ def _get_sheet_gtin_rows(force: bool = False) -> list:
         cfg['row_count'] = len(rows)
         _save_sheet_config(cfg)
         return rows
-    except Exception:
+    except Exception as exc:
+        _sheet_cache['last_error'] = str(exc)
         return _sheet_cache['rows'] if _sheet_cache['rows'] is not None else []
+
+
+# ── Spec sheet config ─────────────────────────────────────────────────────────
+
+def _load_specs_config() -> dict:
+    # 1. Runtime config file
+    if os.path.exists(SPECS_SHEET_CFG_PATH):
+        try:
+            with open(SPECS_SHEET_CFG_PATH) as f:
+                cfg = json.load(f)
+                if cfg.get('sheet_url'):
+                    return cfg
+        except Exception:
+            pass
+    # 2. Environment variable
+    env_url = os.environ.get('SPECS_SHEET_URL', '').strip()
+    if env_url:
+        return {'sheet_url': env_url}
+    # 3. Default config baked into the image
+    if os.path.exists(_SPECS_DEFAULT_CFG):
+        try:
+            with open(_SPECS_DEFAULT_CFG) as f:
+                cfg = json.load(f)
+                if cfg.get('sheet_url'):
+                    return cfg
+        except Exception:
+            pass
+    return {}
+
+
+def _save_specs_config(cfg: dict):
+    with open(SPECS_SHEET_CFG_PATH, 'w') as f:
+        json.dump(cfg, f)
+
+
+def _fetch_spec_rows(csv_url: str) -> list:
+    """Download and parse a published spec sheet CSV with flexible column lookup."""
+    import csv as _csv
+    req = urllib.request.Request(csv_url, headers={'User-Agent': 'Mozilla/5.0'})
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        content = resp.read().decode('utf-8-sig')
+    reader = _csv.DictReader(io.StringIO(content))
+    rows = []
+    for row in reader:
+        d = {k.strip().lower(): (v.strip() if v else '') for k, v in row.items() if k}
+
+        # ── Flexible column lookup ────────────────────────────────────────────
+        def _get(*keys):
+            for k in keys:
+                if k in d and d[k]:
+                    return d[k]
+            return ''
+
+        flavor = _get('sku', 'flavor', 'product name', 'name')
+        gtin   = _get('gtin', 'upc', 'barcode')
+        pkg    = _get('packaging type', 'package', 'type')
+        mat    = _get('material', 'material order', 'substrate')
+
+        tw_raw = _get('trim width', 'width mm', 'w mm', 'trim w')
+        th_raw = _get('trim height', 'height mm', 'h mm', 'trim h')
+        try:
+            trim_w = float(tw_raw) if tw_raw else None
+        except (ValueError, TypeError):
+            trim_w = None
+        try:
+            trim_h = float(th_raw) if th_raw else None
+        except (ValueError, TypeError):
+            trim_h = None
+
+        wind_raw = _get('wind direction', 'wind', 'winding')
+        wind_digits = re.sub(r'[^\d]', '', wind_raw)
+        wind = wind_digits[:1] if wind_digits else ''
+
+        spot_raw = _get('spot colors', 'pms colors', 'colors', 'pantone')
+
+        die_raw = _get('die line', 'die lines', 'die line required').strip().lower()
+        die_required = die_raw in ('yes', 'y', 'true', '1')
+
+        if not flavor and not gtin:
+            continue  # skip blank rows
+
+        rows.append({
+            'flavor':           flavor,
+            'gtin':             str(gtin).strip().replace(' ', ''),
+            'packaging_type':   pkg,
+            'material':         mat,
+            'trim_width_mm':    trim_w,
+            'trim_height_mm':   trim_h,
+            'wind_direction':   wind,
+            'spot_colors':      spot_raw,
+            'die_line_required': die_required,
+        })
+    return rows
+
+
+def _get_sheet_spec_rows(force: bool = False) -> list:
+    """Return spec rows from the synced Google Sheet, with a 5-minute in-memory cache."""
+    global _specs_cache
+    cfg = _load_specs_config()
+    url = cfg.get('sheet_url', '')
+    if not url:
+        return []
+    now = time.time()
+    if (not force and _specs_cache['url'] == url
+            and _specs_cache['rows'] is not None
+            and now - _specs_cache['fetched_at'] < _SHEET_CACHE_TTL):
+        return _specs_cache['rows']
+    try:
+        csv_url = _sheet_url_to_csv(url)
+        rows = _fetch_spec_rows(csv_url)
+        _specs_cache = {'rows': rows, 'fetched_at': now, 'url': url}
+        cfg['last_synced'] = datetime.now().isoformat()
+        cfg['row_count'] = len(rows)
+        _save_specs_config(cfg)
+        return rows
+    except Exception as exc:
+        _specs_cache['last_error'] = str(exc)
+        return _specs_cache['rows'] if _specs_cache['rows'] is not None else []
 
 
 # ── Pages ─────────────────────────────────────────────────────────────────────
 
 @app.route('/')
 def landing():
+    proof_engine.load_jobs_from_disk()
     return render_template('landing.html', jobs=proof_engine.list_jobs())
 
 
@@ -183,7 +334,21 @@ def gtin_page():
         rows = _get_sheet_gtin_rows()
         if rows:
             store = _save_gtin_store(rows, 'Google Sheets (auto-synced)')
-    return render_template('gtin.html', store=store, sheet_cfg=sheet_cfg)
+        elif _sheet_cache.get('last_error'):
+            flash(f'Google Sheet sync failed: {_sheet_cache["last_error"]}', 'danger')
+    env_url = os.environ.get('GTIN_SHEET_URL', '')
+    return render_template('gtin.html', store=store, sheet_cfg=sheet_cfg, env_sheet_url=env_url)
+
+
+@app.route('/specs')
+def specs_page():
+    spec_cfg = _load_specs_config()
+    spec_rows = []
+    if spec_cfg.get('sheet_url'):
+        spec_rows = _get_sheet_spec_rows()
+        if not spec_rows and _specs_cache.get('last_error'):
+            flash(f'Spec sheet sync failed: {_specs_cache["last_error"]}', 'danger')
+    return render_template('specs.html', spec_store=spec_rows, spec_sheet_cfg=spec_cfg)
 
 
 @app.route('/upload', methods=['POST'])
@@ -209,6 +374,8 @@ def upload():
 
     if not gtin_rows:
         gtin_rows = _get_sheet_gtin_rows()
+        if not gtin_rows and _sheet_cache.get('last_error'):
+            flash(f'Google Sheet sync failed: {_sheet_cache["last_error"]}', 'danger')
 
     if not gtin_rows:
         flash(
@@ -217,8 +384,18 @@ def upload():
             'warning',
         )
 
+    wind_direction = request.form.get('wind_direction', '').strip()
+    proof_type     = request.form.get('proof_type', 'press').strip()
+    prodough_config = {
+        'brand_mode':    'prodough',
+        'wind_direction': wind_direction,
+        'proof_type':    proof_type,
+    }
+
+    spec_rows = _get_sheet_spec_rows()
+
     job_id  = proof_engine.create_job([f.filename for f in artwork_files if f.filename],
-                                      brand_config={'brand_mode': 'prodough'})
+                                      brand_config=prodough_config)
     job_dir = os.path.join(UPLOAD_DIR, job_id)
     os.makedirs(job_dir, exist_ok=True)
 
@@ -241,8 +418,8 @@ def upload():
         flash('No supported artwork files were uploaded.', 'danger')
         return redirect(url_for('prodough_proof'))
 
-    proof_engine.start_job(job_id, saved, gtin_rows, job_dir,
-                           brand_config={'brand_mode': 'prodough'})
+    proof_engine.start_job(job_id, saved, gtin_rows, job_dir, brand_config=prodough_config,
+                           spec_rows=spec_rows)
     return redirect(url_for('result', job_id=job_id))
 
 
@@ -270,11 +447,17 @@ def brand_upload():
     if not gtin_rows:
         flash('The uploaded GTIN file appears empty. Please check the file and try again.', 'warning')
 
+    wind_direction = request.form.get('wind_direction', '').strip()
+    proof_type     = request.form.get('proof_type', 'press').strip()
     brand_config = {
-        'brand_mode':     'generic',
-        'brand_name':     brand_name,
-        'packaging_type': packaging_type,
+        'brand_mode':      'generic',
+        'brand_name':      brand_name,
+        'packaging_type':  packaging_type,
+        'wind_direction':  wind_direction,
+        'proof_type':      proof_type,
     }
+
+    spec_rows = _get_sheet_spec_rows()
 
     job_id  = proof_engine.create_job([f.filename for f in artwork_files if f.filename],
                                       brand_config=brand_config)
@@ -300,7 +483,8 @@ def brand_upload():
         flash('No supported artwork files were uploaded.', 'danger')
         return redirect(url_for('brand_page'))
 
-    proof_engine.start_job(job_id, saved, gtin_rows, job_dir, brand_config=brand_config)
+    proof_engine.start_job(job_id, saved, gtin_rows, job_dir, brand_config=brand_config,
+                           spec_rows=spec_rows)
     return redirect(url_for('result', job_id=job_id))
 
 
@@ -326,6 +510,7 @@ def summary(job_id):
 
 @app.route('/history')
 def history():
+    proof_engine.load_jobs_from_disk()  # refresh from disk in case of restart
     jobs = proof_engine.list_jobs()
     return render_template('history.html', jobs=jobs)
 
@@ -413,6 +598,38 @@ def api_gtin_sheet_sync():
         if rows:
             _save_gtin_store(rows, 'Google Sheets (auto-synced)')
         cfg = _load_sheet_config()
+        return jsonify({'ok': True, 'row_count': len(rows), 'last_synced': cfg.get('last_synced', '')})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)}), 500
+
+
+@app.route('/api/specs-sheet', methods=['POST'])
+def api_specs_sheet_save():
+    data = request.get_json() or {}
+    url = data.get('url', '').strip()
+    if url:
+        try:
+            _sheet_url_to_csv(url)  # validate it's a Sheets URL
+        except ValueError as e:
+            return jsonify({'ok': False, 'error': str(e)}), 400
+    cfg = _load_specs_config()
+    cfg['sheet_url'] = url
+    cfg.pop('last_synced', None)
+    cfg.pop('row_count', None)
+    _save_specs_config(cfg)
+    global _specs_cache
+    _specs_cache = {'rows': None, 'fetched_at': 0.0, 'url': ''}
+    return jsonify({'ok': True})
+
+
+@app.route('/api/specs-sheet/sync', methods=['POST'])
+def api_specs_sheet_sync():
+    cfg = _load_specs_config()
+    if not cfg.get('sheet_url'):
+        return jsonify({'ok': False, 'error': 'No sheet URL configured'}), 400
+    try:
+        rows = _get_sheet_spec_rows(force=True)
+        cfg = _load_specs_config()
         return jsonify({'ok': True, 'row_count': len(rows), 'last_synced': cfg.get('last_synced', '')})
     except Exception as e:
         return jsonify({'ok': False, 'error': str(e)}), 500

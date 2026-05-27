@@ -212,6 +212,15 @@
     {{ _check_card('4','Spelling / Brand Name', 'bi-spellcheck',         r.checks.spelling, idx, r.filename, 'spelling', dismissals) }}
     {{ _check_card('5','FDA Audit Risk',         'bi-shield-exclamation', r.checks.fda,      idx, r.filename, 'fda',      dismissals, always_open=true) }}
 
+    <!-- Matched spec info -->
+    {% if r.matched_spec %}
+    <div class="small text-muted mt-2 ps-1">
+      <i class="bi bi-crosshair me-1"></i>
+      Matched spec: <strong>{{ r.matched_spec.flavor or r.matched_spec.sku or 'Unknown' }}</strong>
+      {% if r.matched_spec.sku and r.matched_spec.sku != r.matched_spec.flavor %} &middot; SKU {{ r.matched_spec.sku }}{% endif %}
+    </div>
+    {% endif %}
+
     <!-- OCR text -->
     {% if r.ocr_preview %}
     <div class="mt-2">

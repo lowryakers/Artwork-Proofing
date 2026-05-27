@@ -48,6 +48,55 @@
             </div>
           </div>
 
+          <!-- Proof type -->
+          <div class="mb-3">
+            <label class="form-label fw-semibold">Proof Type</label>
+            <div class="d-flex gap-3 flex-wrap">
+              <div class="form-check">
+                <input class="form-check-input" type="radio" name="proof_type" value="press" id="ptPress" checked
+                       onchange="updateWindVisibility()">
+                <label class="form-check-label" for="ptPress">
+                  <strong>Press Proof</strong>
+                  <div class="text-muted small">From print supplier — includes finishing panel, material, winding</div>
+                </label>
+              </div>
+              <div class="form-check">
+                <input class="form-check-input" type="radio" name="proof_type" value="art" id="ptArt"
+                       onchange="updateWindVisibility()">
+                <label class="form-check-label" for="ptArt">
+                  <strong>Art / Design Proof</strong>
+                  <div class="text-muted small">Artwork file only — no finishing panel or material spec</div>
+                </label>
+              </div>
+            </div>
+          </div>
+
+          <!-- Wind direction override -->
+          <div class="mb-4" id="windOverrideGroup">
+            <label class="form-label fw-semibold small mb-1">
+              Wind Direction Override
+              <span class="text-muted fw-normal">(optional — auto-filled from spec sheet)</span>
+            </label>
+            <select id="windDirectionInput" name="wind_direction" class="form-select">
+              <option value="">— Use spec sheet —</option>
+              <optgroup label="Outwound">
+                <option value="1">Wind 1 — Outwound · Across roll · Top of label first</option>
+                <option value="2">Wind 2 — Outwound · Across roll · Bottom of label first</option>
+                <option value="3">Wind 3 — Outwound · Around roll · Right side first</option>
+                <option value="4">Wind 4 — Outwound · Around roll · Left side first</option>
+              </optgroup>
+              <optgroup label="Inwound">
+                <option value="5">Wind 5 — Inwound · Across roll · Top of label first</option>
+                <option value="6">Wind 6 — Inwound · Across roll · Bottom of label first</option>
+                <option value="7">Wind 7 — Inwound · Around roll · Right side first</option>
+                <option value="8">Wind 8 — Inwound · Around roll · Left side first</option>
+              </optgroup>
+            </select>
+            <div class="form-text">
+              Override the wind direction for this job. If blank, the spec sheet value is used automatically.
+            </div>
+          </div>
+
           <button type="submit" class="btn btn-dark px-5 py-2" id="submitBtn">
             <i class="bi bi-play-circle me-2"></i>Run Proof
           </button>
@@ -97,6 +146,14 @@
                 Runs on each <strong>product PDF</strong> — required label elements · allergen declarations ·
                 disease claims · structure/function + disclaimer · "Natural" conflicts ·
                 Gluten-Free · Organic · Bioengineered disclosure · net weight format · and more
+              </td>
+            </tr>
+            <tr>
+              <td class="ps-3 text-center"><span class="badge bg-secondary rounded-pill">6</span></td>
+              <td class="fw-semibold py-2">Wind Direction</td>
+              <td class="text-muted pe-3">
+                Stick pack / sachet only — searches the press proof PDF for a wind direction callout
+                (Wind 1–8) and flags a mismatch or missing callout against the selected requirement
               </td>
             </tr>
           </tbody>
@@ -193,6 +250,13 @@
 
 {% block scripts %}
 <script>
+function updateWindVisibility() {
+  const isPress = document.getElementById('ptPress').checked;
+  document.getElementById('windOverrideGroup').style.display = isPress ? '' : 'none';
+}
+// Set initial state
+updateWindVisibility();
+
 const dropZone      = document.getElementById('dropZone');
 const artworkInput  = document.getElementById('artworkInput');
 const fileListEl    = document.getElementById('fileList');
