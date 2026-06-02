@@ -217,6 +217,7 @@ _SPEC_GENERIC = {
     'whey', 'protein', 'powder', 'stick', 'sticks', 'pouch', 'pouches',
     'bag', 'bags', 'bar', 'bars', 'single', 'prodough', 'pro', 'dough',
     'pack', 'sachet', 'sachets', 'blend', 'mix', 'sport', 'sports',
+    'plant', 'based', 'vegan',
     'the', 'a', 'an', 'and', 'of', 'with', 'for', 'to',
 }
 
@@ -1416,7 +1417,7 @@ def _check_print_specs(pdf_path: str, brand_config: dict = None,
 
         # Compare against expected spec dimensions (spec sheet overrides brand_config)
         spec_w = matched_spec.get('trim_width_mm') or brand_config.get('spec_width_mm')
-        spec_h = matched_spec.get('trim_height_mm') or brand_config.get('spec_height_mm')
+        spec_h = matched_spec.get('trim_length_mm') or matched_spec.get('trim_height_mm') or brand_config.get('spec_height_mm')
         dim_ref = (tb_w, tb_h) if tb_w else (mb_w, mb_h)
         dim_label = 'trim' if tb_w else 'page'
         if spec_w and spec_h and dim_ref[0]:
@@ -1442,7 +1443,7 @@ def _check_print_specs(pdf_path: str, brand_config: dict = None,
             notes.append('No spot colors detected (process CMYK / RGB only).')
 
         # Validate required spot colors from spec sheet
-        req_spots_raw = matched_spec.get('spot_colors', '')
+        req_spots_raw = matched_spec.get('pms_spot_colors', '') or matched_spec.get('spot_colors', '')
         if req_spots_raw:
             req_spots = [s.strip() for s in req_spots_raw.split(',') if s.strip()]
             spot_lower = {c.lower() for c in spot_colors}

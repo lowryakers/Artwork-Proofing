@@ -1,10 +1,10 @@
 {% extends 'base.html' %}
-{% block title %}GTIN Master List — ProDough Proof{% endblock %}
+{% block title %}Master SKU Sheet — ProDough Proof{% endblock %}
 
 {% block content %}
 <div class="d-flex align-items-center gap-3 mb-4 flex-wrap">
   <div>
-    <h4 class="mb-0 fw-bold"><i class="bi bi-upc-scan me-2"></i>Master GTIN List</h4>
+    <h4 class="mb-0 fw-bold"><i class="bi bi-table me-2"></i>Master SKU Sheet</h4>
     {% if store %}
     <div class="text-muted small">
       {{ store.row_count }} SKUs
@@ -14,14 +14,19 @@
         &bull; from <em>{{ store.filename }}</em>
       {% endif %}
       {% if store.error_count > 0 %}
-      &bull; <span class="text-warning fw-semibold">{{ store.error_count }} with issues</span>
+      &bull; <span class="text-warning fw-semibold">{{ store.error_count }} with GTIN issues</span>
       {% else %}
       &bull; <span class="text-success fw-semibold">All GTINs valid</span>
       {% endif %}
     </div>
     {% endif %}
   </div>
-  <div class="ms-auto">
+  <div class="ms-auto d-flex gap-2">
+    {% if sheet_cfg.get('sheet_url') %}
+    <button class="btn btn-dark btn-sm" onclick="syncNow()" id="syncBtn">
+      <i class="bi bi-arrow-clockwise me-1"></i>Sync Now
+    </button>
+    {% endif %}
     <a href="{{ url_for('prodough_proof') }}" class="btn btn-outline-dark btn-sm">
       <i class="bi bi-arrow-up-circle me-1"></i>Run New Proof
     </a>
@@ -33,30 +38,25 @@
   <div class="card-header py-2 d-flex align-items-center gap-2
               {% if sheet_cfg.get('sheet_url') %}bg-success bg-opacity-10{% else %}bg-light{% endif %}">
     <i class="bi bi-cloud-arrow-down{% if sheet_cfg.get('sheet_url') %}-fill text-success{% endif %} me-1"></i>
-    <span class="fw-semibold small">Google Sheets Sync</span>
+    <span class="fw-semibold small">Google Sheets Connection</span>
     {% if sheet_cfg.get('sheet_url') %}
     <span class="badge bg-success ms-1">Connected</span>
+    {% if sheet_cfg.get('last_synced') %}
+    <span class="text-muted small ms-2">Last sync: {{ sheet_cfg.last_synced[:16].replace('T',' ') }} &bull; {{ sheet_cfg.get('row_count', 0) }} SKUs</span>
+    {% endif %}
     {% endif %}
   </div>
   <div class="card-body py-3">
-    {% if sheet_cfg.get('sheet_url') %}
-    <div class="alert alert-success py-2 small mb-3">
-      <i class="bi bi-check-circle-fill me-1"></i>
-      Sheet URL is persisted and will survive redeploys.
-      {% if not env_sheet_url %}<span class="text-muted">(via baked-in config)</span>{% endif %}
-    </div>
-    {% else %}
+    {% if not sheet_cfg.get('sheet_url') %}
     <div class="alert alert-warning py-2 small mb-3">
       <i class="bi bi-exclamation-triangle-fill me-1"></i>
-      No sheet URL configured — GTIN sync is inactive.
+      No sheet connected — GTIN and spec checks will not have a master list to validate against.
     </div>
-    {% endif %}
-    {% if not sheet_cfg.get('sheet_url') %}
     <p class="text-muted small mb-3">
-      Connect your Google Sheet so the GTIN list is always current — no file uploads needed.
-      <strong>Setup:</strong> open your sheet, go to
-      <strong>File → Share → Publish to web</strong>, choose
-      <strong>Comma-separated values (.csv)</strong>, click <em>Publish</em>, then paste the URL (or just the normal sheet URL) below.
+      Connect your Master SKU Google Sheet to automatically sync GTIN, material, dimensions, colors,
+      and all spec data with every proof run. Set the <code>GTIN_SHEET_URL</code> environment variable
+      in Railway, or paste the URL below. The sheet must be published:
+      <strong>File → Share → Publish to web → CSV</strong>.
     </p>
     {% endif %}
     <div class="d-flex gap-2 flex-wrap align-items-end">
@@ -67,35 +67,25 @@
                value="{{ sheet_cfg.get('sheet_url', '') }}">
       </div>
       <button class="btn btn-sm btn-dark" onclick="saveSheetUrl()" id="saveBtn">
-        <i class="bi bi-cloud-check me-1"></i>Save
+        <i class="bi bi-cloud-check me-1"></i>Save & Sync
       </button>
       {% if sheet_cfg.get('sheet_url') %}
-      <button class="btn btn-sm btn-outline-success" onclick="syncNow()" id="syncBtn">
-        <i class="bi bi-arrow-clockwise me-1"></i>Sync Now
-      </button>
       <button class="btn btn-sm btn-outline-danger" onclick="clearSheet()" title="Disconnect sheet">
-        <i class="bi bi-x-circle"></i>
+        <i class="bi bi-x-circle me-1"></i>Disconnect
       </button>
       {% endif %}
     </div>
-    <div id="sheetStatus" class="small mt-2">
-      {% if sheet_cfg.get('last_synced') %}
-        <span class="text-success">
-          <i class="bi bi-check-circle-fill me-1"></i>
-          Last synced {{ sheet_cfg.last_synced[:16].replace('T',' ') }} &bull; {{ sheet_cfg.get('row_count', 0) }} rows
-        </span>
-      {% endif %}
-    </div>
+    <div id="sheetStatus" class="small mt-2"></div>
   </div>
 </div>
 
-{# ── GTIN table ──────────────────────────────────────────────────────────── #}
+{# ── SKU table ────────────────────────────────────────────────────────────── #}
 {% if not store %}
 <div class="card shadow-sm">
   <div class="card-body text-center py-5 text-muted">
-    <i class="bi bi-upc fs-1 d-block mb-3 opacity-50"></i>
-    <h5>No GTIN data yet</h5>
-    <p class="mb-3">Connect your Google Sheet above, or upload the Master ProDough SKU &amp; GTIN List when running a proof.</p>
+    <i class="bi bi-table fs-1 d-block mb-3 opacity-50"></i>
+    <h5>No SKU data yet</h5>
+    <p class="mb-3">Connect your Master SKU Google Sheet above, or set <code>GTIN_SHEET_URL</code> in Railway.</p>
     <a href="{{ url_for('prodough_proof') }}" class="btn btn-dark">
       <i class="bi bi-upload me-2"></i>Go to Upload
     </a>
@@ -108,8 +98,8 @@
 <div class="alert alert-warning d-flex align-items-center gap-2 mb-3">
   <i class="bi bi-exclamation-triangle-fill fs-5"></i>
   <div>
-    <strong>{{ store.error_count }} GTIN(s) have issues</strong> — highlighted below.
-    Fix them in your master spreadsheet; they will update automatically on the next sync.
+    <strong>{{ store.error_count }} SKU(s) have invalid GTINs</strong> — highlighted below.
+    Fix them in your Google Sheet and click <strong>Sync Now</strong>.
   </div>
 </div>
 {% endif %}
@@ -119,19 +109,31 @@
     <span class="fw-semibold small">
       <i class="bi bi-table me-1"></i>{{ store.row_count }} SKUs
     </span>
-    <input type="text" id="gtinSearch" class="form-control form-control-sm ms-auto"
-           style="max-width:280px" placeholder="Search GTIN, SKU, or flavor…"
+    <input type="text" id="skuSearch" class="form-control form-control-sm ms-auto"
+           style="max-width:280px" placeholder="Search flavor, SKU, GTIN…"
            oninput="filterTable()">
   </div>
   <div class="table-responsive" style="max-height:65vh;overflow-y:auto">
-    <table class="table table-sm table-hover align-middle mb-0 small" id="gtinTable">
-      <thead class="table-light sticky-top">
+    <table class="table table-sm table-hover align-middle mb-0 small" id="skuTable">
+      <thead class="table-dark sticky-top">
         <tr>
-          <th class="ps-3" style="width:48px">#</th>
-          <th style="width:160px">GTIN / UPC</th>
-          <th style="width:140px">SKU</th>
-          <th>Flavor / Product Name</th>
-          <th class="pe-3 text-center" style="width:140px">Status</th>
+          <th class="ps-3" style="min-width:36px">#</th>
+          <th style="min-width:180px">Flavor / Product Name</th>
+          <th style="min-width:100px">SKU</th>
+          <th style="min-width:140px">GTIN / Barcode</th>
+          <th style="min-width:110px">Packaging</th>
+          <th style="min-width:130px">Material</th>
+          <th style="min-width:60px">Zipper</th>
+          <th style="min-width:80px">Print</th>
+          <th style="min-width:100px">Trim Length</th>
+          <th style="min-width:100px">Trim Width</th>
+          <th style="min-width:100px">Gusset</th>
+          <th style="min-width:120px">Front Panel</th>
+          <th style="min-width:60px">Wind</th>
+          <th style="min-width:160px">PMS Spot Colors</th>
+          <th style="min-width:130px">Hex Colors</th>
+          <th style="min-width:120px">Eye Mark Color</th>
+          <th style="min-width:80px" class="pe-3">Die Line</th>
         </tr>
       </thead>
       <tbody>
@@ -139,18 +141,45 @@
         {% set valid = row.get('_valid', true) %}
         <tr class="{{ 'table-warning' if not valid }}">
           <td class="ps-3 text-muted">{{ loop.index }}</td>
+          <td class="fw-semibold">{{ row.flavor or '—' }}</td>
+          <td class="text-muted">{{ row.sku or '—' }}</td>
           <td>
             <code class="{{ 'text-danger fw-bold' if not valid else 'text-dark' }}">
               {{ row.gtin or '—' }}
             </code>
-          </td>
-          <td class="text-muted">{{ row.sku or '—' }}</td>
-          <td>{{ row.flavor or '—' }}</td>
-          <td class="pe-3 text-center">
             {% if not valid %}
-              <span class="badge bg-warning text-dark">{{ row.get('_error', 'Invalid') }}</span>
+              <span class="badge bg-warning text-dark ms-1 small">{{ row.get('_error', 'Invalid') }}</span>
+            {% endif %}
+          </td>
+          <td>{{ row.get('packaging_type') or '—' }}</td>
+          <td>{{ row.get('material') or '—' }}</td>
+          <td>{{ row.get('zipper') or '—' }}</td>
+          <td>{{ row.get('print_process') or '—' }}</td>
+          <td>{% if row.get('trim_length_mm') %}{{ row.trim_length_mm }} mm{% else %}—{% endif %}</td>
+          <td>{% if row.get('trim_width_mm') %}{{ row.trim_width_mm }} mm{% else %}—{% endif %}</td>
+          <td>{% if row.get('gusset_mm') %}{{ row.gusset_mm }} mm{% else %}—{% endif %}</td>
+          <td>{% if row.get('front_panel_mm') %}{{ row.front_panel_mm }} mm{% else %}—{% endif %}</td>
+          <td class="text-center">
+            {% if row.get('wind_direction') %}
+              <span class="badge bg-secondary">{{ row.wind_direction }}</span>
+            {% else %}—{% endif %}
+          </td>
+          <td>
+            {% if row.get('pms_spot_colors') %}
+              <span class="text-nowrap">{{ row.pms_spot_colors }}</span>
+            {% else %}—{% endif %}
+          </td>
+          <td>{{ row.get('hex_spot_colors') or '—' }}</td>
+          <td>
+            {% if row.get('eye_mark_color') %}
+              <span class="badge bg-dark">{{ row.eye_mark_color }}</span>
+            {% else %}—{% endif %}
+          </td>
+          <td class="pe-3 text-center">
+            {% if row.get('die_line_required') %}
+              <span class="badge bg-dark">Yes</span>
             {% else %}
-              <span class="badge bg-success">Valid</span>
+              <span class="text-muted">—</span>
             {% endif %}
           </td>
         </tr>
@@ -162,10 +191,8 @@
 
 <div class="text-muted small mt-2 ps-1">
   <i class="bi bi-info-circle me-1"></i>
-  GTINs must be 12-digit numeric UPC codes.
-  {% if sheet_cfg.get('sheet_url') %}
-  This data is automatically refreshed from your Google Sheet every 5 minutes during active proofing.
-  {% endif %}
+  GTINs must be 12-digit numeric UPC codes. All spec data is pulled live from your Google Sheet.
+  Click <strong>Sync Now</strong> anytime to pull the latest version.
 </div>
 
 {% endif %}
@@ -174,15 +201,14 @@
 {% block scripts %}
 <script>
 function filterTable() {
-  const q = document.getElementById('gtinSearch').value.toLowerCase();
-  document.querySelectorAll('#gtinTable tbody tr').forEach(row => {
+  const q = document.getElementById('skuSearch').value.toLowerCase();
+  document.querySelectorAll('#skuTable tbody tr').forEach(row => {
     row.style.display = row.textContent.toLowerCase().includes(q) ? '' : 'none';
   });
 }
 
 function setStatus(msg, cls='text-muted') {
-  document.getElementById('sheetStatus').innerHTML =
-    `<span class="${cls}">${msg}</span>`;
+  document.getElementById('sheetStatus').innerHTML = `<span class="${cls}">${msg}</span>`;
 }
 
 async function saveSheetUrl() {
@@ -208,18 +234,20 @@ async function saveSheetUrl() {
     setStatus('<i class="bi bi-x-circle-fill text-danger me-1"></i>Save failed: ' + e, 'text-danger');
   } finally {
     btn.disabled = false;
-    btn.innerHTML = '<i class="bi bi-cloud-check me-1"></i>Save';
+    btn.innerHTML = '<i class="bi bi-cloud-check me-1"></i>Save & Sync';
   }
 }
 
 async function syncNow() {
   const btn = document.getElementById('syncBtn');
   if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>Syncing…'; }
+  setStatus('<i class="bi bi-arrow-clockwise me-1"></i>Fetching latest data from Google Sheets…', 'text-muted');
   try {
     const r = await fetch('/api/gtin-sheet/sync', {method: 'POST'});
     const d = await r.json();
     if (d.ok) {
-      location.reload();
+      setStatus(`<i class="bi bi-check-circle-fill text-success me-1"></i>Synced ${d.row_count} SKUs at ${d.last_synced.slice(0,16).replace('T',' ')}`, 'text-success');
+      setTimeout(() => location.reload(), 800);
     } else {
       setStatus('<i class="bi bi-x-circle-fill text-danger me-1"></i>' + d.error, 'text-danger');
     }
@@ -231,7 +259,7 @@ async function syncNow() {
 }
 
 async function clearSheet() {
-  if (!confirm('Disconnect the Google Sheet? The GTIN list will no longer auto-sync.')) return;
+  if (!confirm('Disconnect the Google Sheet? Spec and GTIN checks will have no master list to validate against.')) return;
   await fetch('/api/gtin-sheet', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
