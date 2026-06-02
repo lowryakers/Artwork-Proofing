@@ -446,12 +446,14 @@ def _check_gtin(ocr_text: str, fname: str, gtin_rows: list,
     if gtin_rows and found:
         gtin_lookup = {str(r.get('gtin', '')).strip(): str(r.get('flavor', '')).strip().lower()
                        for r in gtin_rows if r.get('gtin')}
-        fname_lower = fname.lower()
+        # Search the actual PDF text content, not the filename
+        pdf_text_lower = ocr_text.lower()
         # Generic words that carry no flavor/format identity
         _GENERIC = {
             'whey', 'protein', 'powder', 'stick', 'sticks', 'pouch', 'pouches',
             'bag', 'bags', 'bar', 'bars', 'single', 'prodough', 'pro', 'dough',
             'pack', 'sachet', 'sachets', 'blend', 'mix', 'sport', 'sports',
+            'plant', 'based', 'vegan',
             'the', 'a', 'an', 'and', 'of', 'with', 'for', 'to',
         }
         for gtin in found:
@@ -464,16 +466,17 @@ def _check_gtin(ocr_text: str, fname: str, gtin_rows: list,
                 keywords = [w for w in flavor_words if w not in _GENERIC and len(w) > 1]
                 if not keywords:
                     continue  # nothing meaningful to match against
-                matched = [kw for kw in keywords if kw in fname_lower]
+                # Match against PDF text content (OCR + native), fall back to filename
+                fname_lower = fname.lower()
+                matched = [kw for kw in keywords if kw in pdf_text_lower or kw in fname_lower]
                 if len(matched) < len(keywords):
-                    missing = [kw for kw in keywords if kw not in matched]
+                    missing = [kw for kw in keywords if kw not in pdf_text_lower and kw not in fname_lower]
                     issues.append({
                         'severity': 'warning',
                         'message': (
-                            f'GTIN {gtin} is listed under "{expected_flavor}" in the master list. '
-                            f'The filename "{fname}" may not match — '
-                            f'unmatched keyword(s): {", ".join(missing)}. '
-                            'Confirm this is the correct SKU.'
+                            f'GTIN {gtin} is listed under "{expected_flavor}" in the master list, '
+                            f'but the keyword(s) "{", ".join(missing)}" were not found in the artwork text '
+                            f'or filename. Confirm this is the correct SKU.'
                         ),
                     })
                 # If all keywords matched, the flavor lines up — no issue raised
