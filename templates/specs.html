@@ -1,0 +1,241 @@
+{% extends 'base.html' %}
+{% block title %}Master SKU Spec Sheet — ProDough Proof{% endblock %}
+
+{% block content %}
+<div class="d-flex align-items-center gap-3 mb-4 flex-wrap">
+  <div>
+    <h4 class="mb-0 fw-bold"><i class="bi bi-rulers me-2"></i>Master SKU Spec Sheet</h4>
+    {% if spec_store %}
+    <div class="text-muted small">
+      {{ spec_store | length }} SKUs
+      {% if spec_sheet_cfg.get('last_synced') %}
+        &bull; synced {{ spec_sheet_cfg.last_synced[:16].replace('T',' ') }}
+      {% endif %}
+    </div>
+    {% endif %}
+  </div>
+  <div class="ms-auto">
+    <a href="{{ url_for('prodough_proof') }}" class="btn btn-outline-dark btn-sm">
+      <i class="bi bi-arrow-up-circle me-1"></i>Run New Proof
+    </a>
+  </div>
+</div>
+
+{# ── Google Sheets sync card ─────────────────────────────────────────────── #}
+<div class="card shadow-sm mb-4 {% if spec_sheet_cfg.get('sheet_url') %}border-success{% endif %}">
+  <div class="card-header py-2 d-flex align-items-center gap-2
+              {% if spec_sheet_cfg.get('sheet_url') %}bg-success bg-opacity-10{% else %}bg-light{% endif %}">
+    <i class="bi bi-cloud-arrow-down{% if spec_sheet_cfg.get('sheet_url') %}-fill text-success{% endif %} me-1"></i>
+    <span class="fw-semibold small">Google Sheets Sync</span>
+    {% if spec_sheet_cfg.get('sheet_url') %}
+    <span class="badge bg-success ms-1">Connected</span>
+    {% endif %}
+  </div>
+  <div class="card-body py-3">
+    {% if spec_sheet_cfg.get('sheet_url') %}
+    <div class="alert alert-success py-2 small mb-3">
+      <i class="bi bi-check-circle-fill me-1"></i>
+      Sheet URL is persisted and will survive redeploys.
+    </div>
+    {% else %}
+    <div class="alert alert-warning py-2 small mb-3">
+      <i class="bi bi-exclamation-triangle-fill me-1"></i>
+      No spec sheet URL configured — spec validation is inactive.
+    </div>
+    {% endif %}
+    {% if not spec_sheet_cfg.get('sheet_url') %}
+    <p class="text-muted small mb-3">
+      Connect your Master SKU Spec Sheet so proofs are automatically validated against per-SKU
+      dimensions, material, wind direction, and spot colors — no manual entry needed.
+      <strong>Setup:</strong> open your sheet, go to
+      <strong>File → Share → Publish to web</strong>, choose
+      <strong>Comma-separated values (.csv)</strong>, click <em>Publish</em>, then paste the URL (or just the normal sheet URL) below.
+    </p>
+    {% endif %}
+    <div class="d-flex gap-2 flex-wrap align-items-end">
+      <div class="flex-grow-1">
+        <label class="form-label small mb-1 fw-semibold">Google Sheets URL</label>
+        <input type="url" id="specSheetUrl" class="form-control form-control-sm"
+               placeholder="https://docs.google.com/spreadsheets/d/…"
+               value="{{ spec_sheet_cfg.get('sheet_url', '') }}">
+      </div>
+      <button class="btn btn-sm btn-dark" onclick="saveSpecSheetUrl()" id="saveBtn">
+        <i class="bi bi-cloud-check me-1"></i>Save
+      </button>
+      {% if spec_sheet_cfg.get('sheet_url') %}
+      <button class="btn btn-sm btn-outline-success" onclick="syncSpecNow()" id="syncBtn">
+        <i class="bi bi-arrow-clockwise me-1"></i>Sync Now
+      </button>
+      <button class="btn btn-sm btn-outline-danger" onclick="clearSpecSheet()" title="Disconnect sheet">
+        <i class="bi bi-x-circle"></i>
+      </button>
+      {% endif %}
+    </div>
+    <div id="specSheetStatus" class="small mt-2">
+      {% if spec_sheet_cfg.get('last_synced') %}
+        <span class="text-success">
+          <i class="bi bi-check-circle-fill me-1"></i>
+          Last synced {{ spec_sheet_cfg.last_synced[:16].replace('T',' ') }} &bull; {{ spec_sheet_cfg.get('row_count', 0) }} rows
+        </span>
+      {% endif %}
+    </div>
+  </div>
+</div>
+
+{# ── Spec table ──────────────────────────────────────────────────────────── #}
+{% if not spec_store %}
+<div class="card shadow-sm">
+  <div class="card-body text-center py-5 text-muted">
+    <i class="bi bi-rulers fs-1 d-block mb-3 opacity-50"></i>
+    <h5>No spec data yet</h5>
+    <p class="mb-3">Connect your spec sheet or upload the Master ProDough SKU Spec sheet.</p>
+    <a href="{{ url_for('prodough_proof') }}" class="btn btn-dark">
+      <i class="bi bi-upload me-2"></i>Go to Upload
+    </a>
+  </div>
+</div>
+
+{% else %}
+
+<div class="card shadow-sm">
+  <div class="card-header bg-light py-2 d-flex align-items-center gap-3 flex-wrap">
+    <span class="fw-semibold small">
+      <i class="bi bi-table me-1"></i>{{ spec_store | length }} SKUs
+    </span>
+    <input type="text" id="specSearch" class="form-control form-control-sm ms-auto"
+           style="max-width:280px" placeholder="Search flavor, GTIN, or material…"
+           oninput="filterSpecTable()">
+  </div>
+  <div class="table-responsive" style="max-height:65vh;overflow-y:auto">
+    <table class="table table-sm table-hover align-middle mb-0 small" id="specTable">
+      <thead class="table-light sticky-top">
+        <tr>
+          <th class="ps-3" style="width:36px">#</th>
+          <th>Flavor / SKU</th>
+          <th style="width:140px">GTIN</th>
+          <th style="width:110px">Packaging</th>
+          <th>Material</th>
+          <th style="width:140px">Trim Size (mm)</th>
+          <th style="width:60px">Wind</th>
+          <th>Spot Colors</th>
+          <th class="pe-3 text-center" style="width:80px">Die Line</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in spec_store %}
+        <tr>
+          <td class="ps-3 text-muted">{{ loop.index }}</td>
+          <td class="fw-semibold">{{ row.flavor or '—' }}</td>
+          <td><code class="text-dark">{{ row.gtin or '—' }}</code></td>
+          <td class="text-muted">{{ row.packaging_type or '—' }}</td>
+          <td>{{ row.material or '—' }}</td>
+          <td class="text-muted">
+            {% if row.trim_width_mm and row.trim_height_mm %}
+              {{ row.trim_width_mm }} × {{ row.trim_height_mm }}
+            {% else %}
+              —
+            {% endif %}
+          </td>
+          <td class="text-center">
+            {% if row.wind_direction %}
+              <span class="badge bg-secondary">{{ row.wind_direction }}</span>
+            {% else %}
+              <span class="text-muted">—</span>
+            {% endif %}
+          </td>
+          <td class="text-muted small">{{ row.spot_colors or '—' }}</td>
+          <td class="pe-3 text-center">
+            {% if row.die_line_required %}
+              <span class="badge bg-danger">Required</span>
+            {% else %}
+              <span class="text-muted">—</span>
+            {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<div class="text-muted small mt-2 ps-1">
+  <i class="bi bi-info-circle me-1"></i>
+  Spec rows are matched to proofs by GTIN first, then by flavor keywords in the filename.
+  {% if spec_sheet_cfg.get('sheet_url') %}
+  This data is automatically refreshed from your Google Sheet every 5 minutes during active proofing.
+  {% endif %}
+</div>
+
+{% endif %}
+{% endblock %}
+
+{% block scripts %}
+<script>
+function filterSpecTable() {
+  const q = document.getElementById('specSearch').value.toLowerCase();
+  document.querySelectorAll('#specTable tbody tr').forEach(row => {
+    row.style.display = row.textContent.toLowerCase().includes(q) ? '' : 'none';
+  });
+}
+
+function setSpecStatus(msg, cls='text-muted') {
+  document.getElementById('specSheetStatus').innerHTML =
+    `<span class="${cls}">${msg}</span>`;
+}
+
+async function saveSpecSheetUrl() {
+  const url = document.getElementById('specSheetUrl').value.trim();
+  const btn = document.getElementById('saveBtn');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>Saving…';
+  try {
+    const r = await fetch('/api/specs-sheet', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({url}),
+    });
+    const d = await r.json();
+    if (!d.ok) { setSpecStatus('<i class="bi bi-x-circle-fill text-danger me-1"></i>' + d.error, 'text-danger'); return; }
+    if (url) {
+      setSpecStatus('<i class="bi bi-arrow-clockwise me-1"></i>Syncing…', 'text-muted');
+      await syncSpecNow();
+    } else {
+      location.reload();
+    }
+  } catch(e) {
+    setSpecStatus('<i class="bi bi-x-circle-fill text-danger me-1"></i>Save failed: ' + e, 'text-danger');
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = '<i class="bi bi-cloud-check me-1"></i>Save';
+  }
+}
+
+async function syncSpecNow() {
+  const btn = document.getElementById('syncBtn');
+  if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>Syncing…'; }
+  try {
+    const r = await fetch('/api/specs-sheet/sync', {method: 'POST'});
+    const d = await r.json();
+    if (d.ok) {
+      location.reload();
+    } else {
+      setSpecStatus('<i class="bi bi-x-circle-fill text-danger me-1"></i>' + d.error, 'text-danger');
+    }
+  } catch(e) {
+    setSpecStatus('<i class="bi bi-x-circle-fill text-danger me-1"></i>Sync failed: ' + e, 'text-danger');
+  } finally {
+    if (btn) { btn.disabled = false; btn.innerHTML = '<i class="bi bi-arrow-clockwise me-1"></i>Sync Now'; }
+  }
+}
+
+async function clearSpecSheet() {
+  if (!confirm('Disconnect the spec sheet? Spec validation will be inactive until reconnected.')) return;
+  await fetch('/api/specs-sheet', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({url: ''}),
+  });
+  location.reload();
+}
+</script>
+{% endblock %}

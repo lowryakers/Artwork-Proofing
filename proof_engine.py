@@ -90,10 +90,10 @@ def _update_job(job_id: str, **kwargs):
 
 
 def start_job(job_id: str, pdf_paths: list, gtin_rows: list, work_dir: str,
-              brand_config: dict = None):
+              brand_config: dict = None, spec_rows: list = None):
     t = threading.Thread(
         target=_process_job,
-        args=(job_id, pdf_paths, gtin_rows, work_dir, brand_config),
+        args=(job_id, pdf_paths, gtin_rows, work_dir, brand_config, spec_rows),
         daemon=True,
     )
     t.start()
@@ -139,7 +139,7 @@ load_jobs_from_disk()
 # ── Main processing loop ──────────────────────────────────────────────────────
 
 def _process_job(job_id: str, pdf_paths: list, gtin_rows: list, work_dir: str,
-                 brand_config: dict = None):
+                 brand_config: dict = None, spec_rows: list = None):
     _update_job(job_id, status='running')
     results = []
     total = len(pdf_paths)
@@ -149,7 +149,8 @@ def _process_job(job_id: str, pdf_paths: list, gtin_rows: list, work_dir: str,
             fname = os.path.basename(pdf_path)
             _update_job(job_id, current_file=fname, progress=int(i / total * 90))
             try:
-                result = _proof_single(pdf_path, gtin_rows, work_dir, brand_config=brand_config)
+                result = _proof_single(pdf_path, gtin_rows, work_dir, brand_config=brand_config,
+                                       spec_rows=spec_rows)
             except Exception as exc:
                 result = {
                     'filename': fname,
@@ -210,10 +211,48 @@ def _is_film_rollstock(fname: str, ocr_text: str = '') -> bool:
     return False
 
 
+# ── Spec row matching ─────────────────────────────────────────────────────────
+
+_SPEC_GENERIC = {
+    'whey', 'protein', 'powder', 'stick', 'sticks', 'pouch', 'pouches',
+    'bag', 'bags', 'bar', 'bars', 'single', 'prodough', 'pro', 'dough',
+    'pack', 'sachet', 'sachets', 'blend', 'mix', 'sport', 'sports',
+    'the', 'a', 'an', 'and', 'of', 'with', 'for', 'to',
+}
+
+
+def _match_spec_row(gtin_list: list, fname: str, spec_rows: list) -> dict:
+    """Match a spec row by GTIN first, then by filename keyword matching."""
+    if not spec_rows:
+        return {}
+
+    # 1. Exact GTIN match
+    for gtin in (gtin_list or []):
+        gtin_str = str(gtin).strip()
+        for row in spec_rows:
+            if str(row.get('gtin', '')).strip() == gtin_str:
+                return row
+
+    # 2. Keyword match against filename
+    fname_lower = fname.lower()
+    for row in spec_rows:
+        flavor = str(row.get('flavor', '')).strip().lower()
+        if not flavor:
+            continue
+        flavor_words = re.findall(r'[a-z0-9]+', flavor)
+        keywords = [w for w in flavor_words if w not in _SPEC_GENERIC and len(w) > 1]
+        if not keywords:
+            continue
+        if all(kw in fname_lower for kw in keywords):
+            return row
+
+    return {}
+
+
 # ── Single-file proofing ──────────────────────────────────────────────────────
 
 def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
-                  brand_config: dict = None) -> dict:
+                  brand_config: dict = None, spec_rows: list = None) -> dict:
     brand_config = brand_config or {}
     fname = os.path.basename(pdf_path)
     stem = Path(pdf_path).stem
@@ -271,6 +310,14 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
 
     brand_mode = brand_config.get('brand_mode', 'prodough')
 
+    # ── Match spec row from sheet ────────────────────────────────────────────
+    matched_spec = _match_spec_row(barcode_gtins, fname, spec_rows or [])
+
+    # Wind direction: form override > spec sheet > nothing
+    effective_wind = brand_config.get('wind_direction', '').strip()
+    if not effective_wind and matched_spec.get('wind_direction'):
+        effective_wind = matched_spec['wind_direction']
+
     if brand_mode == 'generic':
         is_film = brand_config.get('packaging_type', 'other') == 'stick'
         brand_name = brand_config.get('brand_name', '')
@@ -279,11 +326,10 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
             'eyemark':  _check_eyemark(img, is_film, fname),
             'spelling': _check_spelling_generic(combined_text, brand_name),
             'fda':      _check_fda_light(combined_text, fname),
-            'specs':    _check_print_specs(pdf_path, brand_config),
+            'specs':    _check_print_specs(pdf_path, brand_config, matched_spec),
         }
         if is_film:
-            checks['wind'] = _check_wind_direction(
-                combined_text, brand_config.get('wind_direction', ''))
+            checks['wind'] = _check_wind_direction(combined_text, effective_wind)
     else:
         # ProDough mode
         is_film = _is_film_rollstock(fname, combined_text)
@@ -293,11 +339,10 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
             'eyemark':  _check_eyemark(img, is_film, fname),
             'spelling': _check_spelling(combined_text, fname),
             'fda':      _check_fda(combined_text, fname),
-            'specs':    _check_print_specs(pdf_path, brand_config),
+            'specs':    _check_print_specs(pdf_path, brand_config, matched_spec),
         }
-        wind_dir = brand_config.get('wind_direction', '')
-        if wind_dir:
-            checks['wind'] = _check_wind_direction(combined_text, wind_dir)
+        if effective_wind:
+            checks['wind'] = _check_wind_direction(combined_text, effective_wind)
 
     all_issues = [i for c in checks.values() for i in c.get('issues', [])]
     crit  = [i for i in all_issues if i['severity'] == 'critical']
@@ -324,6 +369,7 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
         'warning_count': len(warns),
         'info_count': len(infos),
         'error': None,
+        'matched_spec': matched_spec,
     }
 
 
@@ -400,12 +446,14 @@ def _check_gtin(ocr_text: str, fname: str, gtin_rows: list,
     if gtin_rows and found:
         gtin_lookup = {str(r.get('gtin', '')).strip(): str(r.get('flavor', '')).strip().lower()
                        for r in gtin_rows if r.get('gtin')}
-        fname_lower = fname.lower()
+        # Search the actual PDF text content, not the filename
+        pdf_text_lower = ocr_text.lower()
         # Generic words that carry no flavor/format identity
         _GENERIC = {
             'whey', 'protein', 'powder', 'stick', 'sticks', 'pouch', 'pouches',
             'bag', 'bags', 'bar', 'bars', 'single', 'prodough', 'pro', 'dough',
             'pack', 'sachet', 'sachets', 'blend', 'mix', 'sport', 'sports',
+            'plant', 'based', 'vegan',
             'the', 'a', 'an', 'and', 'of', 'with', 'for', 'to',
         }
         for gtin in found:
@@ -418,16 +466,17 @@ def _check_gtin(ocr_text: str, fname: str, gtin_rows: list,
                 keywords = [w for w in flavor_words if w not in _GENERIC and len(w) > 1]
                 if not keywords:
                     continue  # nothing meaningful to match against
-                matched = [kw for kw in keywords if kw in fname_lower]
+                # Match against PDF text content (OCR + native), fall back to filename
+                fname_lower = fname.lower()
+                matched = [kw for kw in keywords if kw in pdf_text_lower or kw in fname_lower]
                 if len(matched) < len(keywords):
-                    missing = [kw for kw in keywords if kw not in matched]
+                    missing = [kw for kw in keywords if kw not in pdf_text_lower and kw not in fname_lower]
                     issues.append({
                         'severity': 'warning',
                         'message': (
-                            f'GTIN {gtin} is listed under "{expected_flavor}" in the master list. '
-                            f'The filename "{fname}" may not match — '
-                            f'unmatched keyword(s): {", ".join(missing)}. '
-                            'Confirm this is the correct SKU.'
+                            f'GTIN {gtin} is listed under "{expected_flavor}" in the master list, '
+                            f'but the keyword(s) "{", ".join(missing)}" were not found in the artwork text '
+                            f'or filename. Confirm this is the correct SKU.'
                         ),
                     })
                 # If all keywords matched, the flavor lines up — no issue raised
@@ -1289,14 +1338,19 @@ def _get_ocg_names(doc) -> list:
     return names
 
 
-def _check_print_specs(pdf_path: str, brand_config: dict = None) -> dict:
+def _check_print_specs(pdf_path: str, brand_config: dict = None,
+                       matched_spec: dict = None) -> dict:
     """
     Read actual PDF vector data using PyMuPDF.
     Checks dimensions, bleed, spot/Pantone colors, die lines, and RGB content.
     No OCR — all results are exact.
+    If matched_spec is provided (from the Master SKU Spec Sheet), its values
+    override brand_config for dimension/material/spot color validation.
     """
     issues, notes = [], []
     brand_config = brand_config or {}
+    matched_spec = matched_spec or {}
+    proof_type = brand_config.get('proof_type', 'press')
     pts_to_mm = 25.4 / 72
 
     try:
@@ -1350,14 +1404,19 @@ def _check_print_specs(pdf_path: str, brand_config: dict = None) -> dict:
                                           'Print-ready files should have ≥ 3 mm bleed on all sides.'})
         else:
             notes.append(f'Page size (MediaBox): {mb_w} × {mb_h} mm')
-            issues.append({'severity': 'warning',
-                           'message': 'No TrimBox found. Print-ready PDFs must define a TrimBox '
-                                      '(the finished trim size). Add a TrimBox in your design app before '
-                                      'exporting (Illustrator: File → Document Setup → Trim Marks & Bleed).'})
+            trimbox_sev = 'note' if proof_type == 'art' else 'warning'
+            if trimbox_sev == 'warning':
+                issues.append({'severity': 'warning',
+                               'message': 'No TrimBox found. Print-ready PDFs must define a TrimBox '
+                                          '(the finished trim size). Add a TrimBox in your design app before '
+                                          'exporting (Illustrator: File → Document Setup → Trim Marks & Bleed).'})
+            else:
+                notes.append('No TrimBox found (art proof — no finishing panel expected). '
+                             'Add a TrimBox before submitting press-ready files.')
 
-        # Compare against expected spec dimensions if configured
-        spec_w = brand_config.get('spec_width_mm')
-        spec_h = brand_config.get('spec_height_mm')
+        # Compare against expected spec dimensions (spec sheet overrides brand_config)
+        spec_w = matched_spec.get('trim_width_mm') or brand_config.get('spec_width_mm')
+        spec_h = matched_spec.get('trim_height_mm') or brand_config.get('spec_height_mm')
         dim_ref = (tb_w, tb_h) if tb_w else (mb_w, mb_h)
         dim_label = 'trim' if tb_w else 'page'
         if spec_w and spec_h and dim_ref[0]:
@@ -1382,6 +1441,20 @@ def _check_print_specs(pdf_path: str, brand_config: dict = None) -> dict:
         else:
             notes.append('No spot colors detected (process CMYK / RGB only).')
 
+        # Validate required spot colors from spec sheet
+        req_spots_raw = matched_spec.get('spot_colors', '')
+        if req_spots_raw:
+            req_spots = [s.strip() for s in req_spots_raw.split(',') if s.strip()]
+            spot_lower = {c.lower() for c in spot_colors}
+            for req in req_spots:
+                if req.lower() not in spot_lower:
+                    # Partial match: any spot color contains the required name
+                    if not any(req.lower() in c.lower() for c in spot_colors):
+                        issues.append({'severity': 'warning',
+                                       'message': f'Required spot color "{req}" (from spec sheet) '
+                                                  'not found in the PDF. Verify color setup with '
+                                                  'your designer before sending to print.'})
+
         # ── Die line detection ────────────────────────────────────────────────
         die_spots  = [c for c in spot_colors
                       if any(kw in c.lower().replace('_', ' ') for kw in _DIELINE_KEYWORDS)]
@@ -1394,11 +1467,13 @@ def _check_print_specs(pdf_path: str, brand_config: dict = None) -> dict:
         elif die_layers:
             notes.append(f'Die line layer detected: {", ".join(die_layers)} ✓')
         else:
-            issues.append({'severity': 'warning',
+            die_sev = 'critical' if matched_spec.get('die_line_required') else 'warning'
+            issues.append({'severity': die_sev,
                            'message': 'No die line spot color or layer detected. '
                                       'Expected a spot color named "Dieline", "CutContour", "Die", '
                                       'or similar. Verify die lines are present and correctly labeled '
-                                      'in the file before sending to print.'})
+                                      'in the file before sending to print.'
+                                      + (' Die line is required per the master spec sheet.' if die_sev == 'critical' else '')})
 
         # ── RGB content ───────────────────────────────────────────────────────
         has_rgb = False
@@ -1445,17 +1520,39 @@ def _check_print_specs(pdf_path: str, brand_config: dict = None) -> dict:
             # Clean up: truncate if the regex grabbed too much surrounding text
             material_found = material_found[:120].strip()
             notes.append(f'Material: {material_found}')
-            # Validate against required material if configured
-            req_mat = brand_config.get('required_material', '').strip()
+            # Validate against required material — spec sheet takes priority over brand_config
+            req_mat = (matched_spec.get('material') or brand_config.get('required_material', '')).strip()
             if req_mat and req_mat.lower() not in material_found.lower():
                 issues.append({'severity': 'warning',
                                'message': f'Material mismatch — file specifies "{material_found}", '
-                                          f'but job requires "{req_mat}". '
+                                          f'but spec requires "{req_mat}". '
                                           'Confirm substrate with your print supplier before going to press.'})
         else:
-            notes.append('Material type: not detected in PDF text. '
-                         'If this is a press proof, verify the material spec in the finishing section '
-                         'of the proof form manually.')
+            if proof_type == 'art':
+                notes.append('Material type: not detected (art proof — no finishing panel expected).')
+            else:
+                notes.append('Material type: not detected in PDF text. '
+                             'If this is a press proof, verify the material spec in the finishing section '
+                             'of the proof form manually.')
+
+        # ── Spec sheet match note ─────────────────────────────────────────────
+        if matched_spec:
+            flavor_label = matched_spec.get('flavor') or matched_spec.get('sku') or 'Unknown'
+            sku_part = f" · SKU {matched_spec['sku']}" if matched_spec.get('sku') and matched_spec.get('sku') != matched_spec.get('flavor') else ''
+            notes.append(f'Matched spec: {flavor_label}{sku_part}')
+            if matched_spec.get('wind_direction'):
+                wd = matched_spec['wind_direction']
+                _WIND_LABELS_LOCAL = {
+                    '1': 'Wind 1 — Outwound, Across roll, Top first',
+                    '2': 'Wind 2 — Outwound, Across roll, Bottom first',
+                    '3': 'Wind 3 — Outwound, Around roll, Right side first',
+                    '4': 'Wind 4 — Outwound, Around roll, Left side first',
+                    '5': 'Wind 5 — Inwound, Across roll, Top first',
+                    '6': 'Wind 6 — Inwound, Across roll, Bottom first',
+                    '7': 'Wind 7 — Inwound, Around roll, Right side first',
+                    '8': 'Wind 8 — Inwound, Around roll, Left side first',
+                }
+                notes.append(f'Expected wind direction from spec sheet: {_WIND_LABELS_LOCAL.get(wd, wd)}')
 
         # ── Page count ────────────────────────────────────────────────────────
         if len(doc) > 1:

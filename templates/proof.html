@@ -48,14 +48,37 @@
             </div>
           </div>
 
-          <!-- Wind Direction -->
-          <div class="mb-4">
-            <label class="form-label fw-semibold mb-1" for="windDirectionInput">
-              Required Wind Direction
-              <span class="badge bg-secondary ms-1 fw-normal" style="font-size:.7rem">Stick pack / sachet film</span>
+          <!-- Proof type -->
+          <div class="mb-3">
+            <label class="form-label fw-semibold">Proof Type</label>
+            <div class="d-flex gap-3 flex-wrap">
+              <div class="form-check">
+                <input class="form-check-input" type="radio" name="proof_type" value="press" id="ptPress" checked
+                       onchange="updateWindVisibility()">
+                <label class="form-check-label" for="ptPress">
+                  <strong>Press Proof</strong>
+                  <div class="text-muted small">From print supplier — includes finishing panel, material, winding</div>
+                </label>
+              </div>
+              <div class="form-check">
+                <input class="form-check-input" type="radio" name="proof_type" value="art" id="ptArt"
+                       onchange="updateWindVisibility()">
+                <label class="form-check-label" for="ptArt">
+                  <strong>Art / Design Proof</strong>
+                  <div class="text-muted small">Artwork file only — no finishing panel or material spec</div>
+                </label>
+              </div>
+            </div>
+          </div>
+
+          <!-- Wind direction override -->
+          <div class="mb-4" id="windOverrideGroup">
+            <label class="form-label fw-semibold small mb-1">
+              Wind Direction Override
+              <span class="text-muted fw-normal">(optional — auto-filled from spec sheet)</span>
             </label>
             <select id="windDirectionInput" name="wind_direction" class="form-select">
-              <option value="">— Skip wind direction check —</option>
+              <option value="">— Use spec sheet —</option>
               <optgroup label="Outwound">
                 <option value="1">Wind 1 — Outwound · Across roll · Top of label first</option>
                 <option value="2">Wind 2 — Outwound · Across roll · Bottom of label first</option>
@@ -70,7 +93,7 @@
               </optgroup>
             </select>
             <div class="form-text">
-              Select the wind direction required for this job. The tool will search the press proof PDF for a matching wind direction callout.
+              Override the wind direction for this job. If blank, the spec sheet value is used automatically.
             </div>
           </div>
 
@@ -227,6 +250,13 @@
 
 {% block scripts %}
 <script>
+function updateWindVisibility() {
+  const isPress = document.getElementById('ptPress').checked;
+  document.getElementById('windOverrideGroup').style.display = isPress ? '' : 'none';
+}
+// Set initial state
+updateWindVisibility();
+
 const dropZone      = document.getElementById('dropZone');
 const artworkInput  = document.getElementById('artworkInput');
 const fileListEl    = document.getElementById('fileList');

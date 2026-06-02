@@ -23,7 +23,7 @@
   <div class="alert alert-danger">
     <h5 class="alert-heading"><i class="bi bi-x-octagon me-2"></i>Processing Failed</h5>
     <p id="errorMsg" class="mb-2">{{ job.error or '' }}</p>
-    <a href="{{ url_for('prodough_proof') }}" class="btn btn-outline-danger btn-sm">
+    <a href="{{ url_for('landing') }}" class="btn btn-outline-danger btn-sm">
       <i class="bi bi-arrow-left me-1"></i>Back to Upload
     </a>
   </div>
@@ -65,7 +65,7 @@
       <i class="bi bi-download me-1"></i>Download Report
     </a>
     {% endif %}
-    <a href="{{ url_for('prodough_proof') }}" class="btn btn-outline-secondary btn-sm">
+    <a href="{{ url_for('landing') }}" class="btn btn-outline-secondary btn-sm">
       <i class="bi bi-arrow-left me-1"></i>New Proof
     </a>
   </div>
@@ -129,55 +129,12 @@
   Dismissed flags are excluded from the downloaded report.</span>
 </div>
 
-<!-- Global check filter -->
-<div class="card border-0 shadow-sm mb-3 px-3 py-2" id="globalCheckFilter">
-  <div class="d-flex align-items-center gap-2 flex-wrap">
-    <span class="text-muted small fw-semibold me-1">Show checks:</span>
-    {% set _check_defs = [
-      ('1', 'GTIN / Barcode',  'bi-upc-scan'),
-      ('2', 'Front vs NFP',    'bi-clipboard2-pulse'),
-      ('3', 'Eyemark',         'bi-eye'),
-      ('4', 'Spelling',        'bi-spellcheck'),
-      ('5', 'FDA Risk',        'bi-shield-exclamation'),
-      ('6', 'Wind Direction',  'bi-arrow-repeat'),
-      ('7', 'Print Specs',     'bi-rulers'),
-    ] %}
-    {% for num, label, icon in _check_defs %}
-    <button class="btn btn-sm btn-outline-dark global-check-filter-btn"
-            data-check-num="{{ num }}"
-            onclick="toggleGlobalCheck(this)"
-            style="font-size:.75rem;padding:3px 10px">
-      <i class="bi {{ icon }} me-1"></i>{{ num }} · {{ label }}
-    </button>
-    {% endfor %}
-    <button class="btn btn-sm btn-link text-muted p-0 ms-1" style="font-size:.75rem"
-            onclick="showAllGlobalFilter()">Show all</button>
-  </div>
-  <div class="text-muted mt-2" style="font-size:.73rem" id="filterHint">
-    <i class="bi bi-info-circle me-1"></i>Select a check above to view files and issues for that check.
-  </div>
-</div>
-
 <!-- Per-file tabs (multiple files) -->
 {% if job.results | length > 1 %}
-{# Compute which check numbers have issues per file for JS filter #}
-<ul class="nav nav-tabs mb-3 flex-wrap" id="fileTabs" role="tablist">
+<ul class="nav nav-tabs mb-3" id="fileTabs" role="tablist">
   {% for r in job.results %}
-  {# Build a comma-separated list of check numbers that have issues for this file #}
-  {% set ns = namespace(checks_with_issues=[]) %}
-  {% if r.checks.gtin   and r.checks.gtin.get('issues')    %}{%  set ns.checks_with_issues = ns.checks_with_issues + ['1'] %}{% endif %}
-  {% if r.checks.nfp    and r.checks.nfp.get('issues')     %}{%  set ns.checks_with_issues = ns.checks_with_issues + ['2'] %}{% endif %}
-  {% if r.checks.eyemark and r.checks.eyemark.get('issues') %}{% set ns.checks_with_issues = ns.checks_with_issues + ['3'] %}{% endif %}
-  {% if r.checks.spelling and r.checks.spelling.get('issues') %}{% set ns.checks_with_issues = ns.checks_with_issues + ['4'] %}{% endif %}
-  {% if r.checks.fda    and r.checks.fda.get('issues')     %}{%  set ns.checks_with_issues = ns.checks_with_issues + ['5'] %}{% endif %}
-  {% if r.checks.wind   and r.checks.wind.get('issues')    %}{%  set ns.checks_with_issues = ns.checks_with_issues + ['6'] %}{% endif %}
-  {% if r.checks.specs  and r.checks.specs.get('issues')   %}{%  set ns.checks_with_issues = ns.checks_with_issues + ['7'] %}{% endif %}
-  <li class="nav-item file-tab-item" role="presentation"
-      data-file-idx="{{ loop.index0 }}"
-      data-checks-with-issues="{{ ns.checks_with_issues | join(',') }}"
-      style="display:none">
+  <li class="nav-item" role="presentation">
     <button class="nav-link small px-3 py-2 {% if loop.first %}active{% endif %}"
-            id="fileTab{{ loop.index0 }}"
             data-bs-toggle="tab" data-bs-target="#fp{{ loop.index0 }}" type="button">
       {{ _sev_icon(r.severity) }}
       {{ r.filename | truncate(28, true, '…') }}
@@ -185,9 +142,6 @@
   </li>
   {% endfor %}
 </ul>
-<div id="noFilesMsg" class="text-muted text-center py-4 small" style="display:none">
-  <i class="bi bi-funnel me-1"></i>No files have issues for the selected check(s).
-</div>
 <div class="tab-content">
   {% for r in job.results %}
   <div class="tab-pane fade {% if loop.first %}show active{% endif %}" id="fp{{ loop.index0 }}">
@@ -257,11 +211,14 @@
     {{ _check_card('3','Eyemark Contrast',       'bi-eye',                r.checks.eyemark,  idx, r.filename, 'eyemark',  dismissals) }}
     {{ _check_card('4','Spelling / Brand Name', 'bi-spellcheck',         r.checks.spelling, idx, r.filename, 'spelling', dismissals) }}
     {{ _check_card('5','FDA Audit Risk',         'bi-shield-exclamation', r.checks.fda,      idx, r.filename, 'fda',      dismissals, always_open=true) }}
-    {% if r.checks.wind is defined %}
-    {{ _check_card('6','Wind Direction',         'bi-arrow-repeat',       r.checks.wind,     idx, r.filename, 'wind',     dismissals) }}
-    {% endif %}
-    {% if r.checks.specs is defined %}
-    {{ _check_card('7','Print Specs',            'bi-rulers',             r.checks.specs,    idx, r.filename, 'specs',    dismissals) }}
+
+    <!-- Matched spec info -->
+    {% if r.matched_spec %}
+    <div class="small text-muted mt-2 ps-1">
+      <i class="bi bi-crosshair me-1"></i>
+      Matched spec: <strong>{{ r.matched_spec.flavor or r.matched_spec.sku or 'Unknown' }}</strong>
+      {% if r.matched_spec.sku and r.matched_spec.sku != r.matched_spec.flavor %} &middot; SKU {{ r.matched_spec.sku }}{% endif %}
+    </div>
     {% endif %}
 
     <!-- OCR text -->
@@ -513,7 +470,6 @@ function fileResult(r, jobId, idx) {
       ${checkCard('3','Eyemark Contrast',       'bi-eye',                checks.eyemark,  uid, r.filename, 'eyemark',  false)}
       ${checkCard('4','Spelling / Brand Name', 'bi-spellcheck',         checks.spelling, uid, r.filename, 'spelling', false)}
       ${checkCard('5','FDA Audit Risk',         'bi-shield-exclamation', checks.fda,      uid, r.filename, 'fda',      true)}
-      ${checks.wind ? checkCard('6','Wind Direction','bi-arrow-repeat',  checks.wind,     uid, r.filename, 'wind',     false) : ''}
       ${r.ocr_preview ? `<div class="mt-2">
         <button class="btn btn-outline-secondary btn-sm" type="button"
                 data-bs-toggle="collapse" data-bs-target="#jsocr${idx}">
@@ -614,66 +570,6 @@ if (INIT_STATUS !== 'done' && INIT_STATUS !== 'error') {
       }
     } catch (_) {}
   }, 1500);
-}
-
-/* ── Global check filter ── */
-function toggleGlobalCheck(btn) {
-  const isActive = btn.classList.contains('btn-dark');
-  btn.classList.toggle('btn-dark', !isActive);
-  btn.classList.toggle('btn-outline-dark', isActive);
-  applyGlobalFilter();
-}
-
-function showAllGlobalFilter() {
-  document.querySelectorAll('#globalCheckFilter .global-check-filter-btn').forEach(b => {
-    b.classList.add('btn-dark');
-    b.classList.remove('btn-outline-dark');
-  });
-  applyGlobalFilter();
-}
-
-function applyGlobalFilter() {
-  const btns   = document.querySelectorAll('#globalCheckFilter .global-check-filter-btn');
-  const active = new Set([...btns].filter(b => b.classList.contains('btn-dark'))
-                                  .map(b => b.dataset.checkNum));
-  const noneSelected = active.size === 0;
-
-  // Show hint when nothing is selected
-  const hint = document.getElementById('filterHint');
-  if (hint) hint.style.display = noneSelected ? '' : 'none';
-
-  // Hide/show check cards in the current view
-  document.querySelectorAll('.check-card').forEach(card => {
-    const header = card.querySelector('.card-header span.fw-semibold');
-    const m = header && header.textContent.match(/Check\s+(\d)/);
-    if (m) card.style.display = (!noneSelected && active.has(m[1])) ? '' : 'none';
-  });
-
-  // Show/hide file tabs — only show files that have issues in an active check
-  const tabItems = document.querySelectorAll('.file-tab-item');
-  if (!tabItems.length) return;
-
-  let firstVisible = null;
-  let activeTabStillVisible = false;
-  tabItems.forEach(li => {
-    const fileChecks = new Set((li.dataset.checksWithIssues || '').split(',').filter(Boolean));
-    const show = !noneSelected && [...active].some(n => fileChecks.has(n));
-    li.style.display = show ? '' : 'none';
-    if (show) {
-      if (!firstVisible) firstVisible = li;
-      const btn = li.querySelector('button.nav-link');
-      if (btn && btn.classList.contains('active')) activeTabStillVisible = true;
-    }
-  });
-
-  // If the currently active tab was hidden, activate the first visible one
-  if (!activeTabStillVisible && firstVisible) {
-    bootstrap.Tab.getOrCreateInstance(firstVisible.querySelector('button.nav-link')).show();
-  }
-
-  // No-files message
-  const noMsg = document.getElementById('noFilesMsg');
-  if (noMsg) noMsg.style.display = (!noneSelected && !firstVisible) ? '' : 'none';
 }
 </script>
 {% endblock %}
