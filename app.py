@@ -433,34 +433,7 @@ def result(job_id):
     if not job:
         flash('Job not found.', 'danger')
         return redirect(url_for('landing'))
-    return render_template('result.html', job=job, job_id=job_id)
-
-
-@app.route('/summary/<job_id>')
-def summary(job_id):
-    job = proof_engine.get_job(job_id)
-    if not job:
-        flash('Job not found.', 'danger')
-        return redirect(url_for('landing'))
-    if job['status'] != 'done':
-        return redirect(url_for('result', job_id=job_id))
-    return render_template('summary.html', job=job, job_id=job_id)
-
-
-@app.route('/history')
-def history():
-    proof_engine.load_jobs_from_disk()  # refresh from disk in case of restart
-    jobs = proof_engine.list_jobs()
-    return render_template('history.html', jobs=jobs)
-
-
-@app.route('/viewer/<job_id>')
-def viewer(job_id):
-    job = proof_engine.get_job(job_id)
-    if not job:
-        flash('Job not found.', 'danger')
-        return redirect(url_for('landing'))
-
+    # Build verify_map inline — items that say "verify" or "manually" in their message
     verify_map = {}
     for r in job.get('results', []):
         items = []
@@ -468,21 +441,19 @@ def viewer(job_id):
             for issue in check.get('issues', []):
                 msg = issue.get('message', '')
                 if 'verify' in msg.lower() or 'manually' in msg.lower():
-                    items.append({
-                        'check_label': CHECK_LABELS.get(check_name, check_name),
-                        'severity': issue['severity'],
-                        'message': msg,
-                    })
+                    items.append({'check_label': CHECK_LABELS.get(check_name, check_name),
+                                  'severity': issue['severity'], 'message': msg})
             for note in check.get('notes', []):
                 if 'verify' in note.lower() or 'manually' in note.lower():
-                    items.append({
-                        'check_label': CHECK_LABELS.get(check_name, check_name),
-                        'severity': 'info',
-                        'message': note,
-                    })
+                    items.append({'check_label': CHECK_LABELS.get(check_name, check_name),
+                                  'severity': 'info', 'message': note})
         verify_map[r['filename']] = items
+    return render_template('result.html', job=job, job_id=job_id, verify_map=verify_map)
 
-    return render_template('viewer.html', job=job, job_id=job_id, verify_map=verify_map)
+
+@app.route('/viewer/<job_id>')
+def viewer(job_id):
+    return redirect(url_for('result', job_id=job_id))
 
 
 # ── API ───────────────────────────────────────────────────────────────────────

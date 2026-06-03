@@ -55,9 +55,6 @@
   </div>
   <div class="ms-auto d-flex gap-2 flex-wrap">
     {% if job.status == 'done' %}
-    <a href="{{ url_for('viewer', job_id=job_id) }}" class="btn btn-outline-info btn-sm">
-      <i class="bi bi-zoom-in me-1"></i>Manual Review
-    </a>
     <a href="{{ url_for('summary', job_id=job_id) }}" class="btn btn-outline-dark btn-sm">
       <i class="bi bi-clipboard2-check me-1"></i>Full Summary
     </a>
@@ -122,11 +119,22 @@
 </div>
 {% endif %}
 
-<!-- Dismiss tip -->
-<div class="alert alert-light border small d-flex align-items-center gap-2 mb-3 py-2">
-  <i class="bi bi-check2-square text-secondary fs-5"></i>
-  <span>Click <strong>Dismiss</strong> on any flag you've manually verified and confirmed is not an issue.
-  Dismissed flags are excluded from the downloaded report.</span>
+<!-- Dismiss tip + global filter bar -->
+<div class="d-flex align-items-center gap-3 mb-3 flex-wrap">
+  <div class="alert alert-light border small d-flex align-items-center gap-2 mb-0 py-2 flex-grow-1">
+    <i class="bi bi-check2-square text-secondary fs-5"></i>
+    <span>Click <strong>Dismiss</strong> on any flag you've manually verified.
+    Dismissed flags are excluded from the downloaded report.</span>
+  </div>
+  <!-- Filter bar -->
+  <div class="d-flex align-items-center gap-2 flex-shrink-0">
+    <span class="text-muted small fw-semibold">Filter:</span>
+    <div class="btn-group btn-group-sm" id="filterBar" role="group">
+      <button type="button" class="btn btn-dark active" onclick="setFilter('all')">All</button>
+      <button type="button" class="btn btn-outline-dark" onclick="setFilter('issues')">Issues Only</button>
+      <button type="button" class="btn btn-outline-danger" onclick="setFilter('critical')">Critical</button>
+    </div>
+  </div>
 </div>
 
 <!-- Per-file tabs (multiple files) -->
@@ -165,23 +173,44 @@
 
 
 {% macro _file_result(r, job_id, idx, dismissals) %}
+{% set verify_items = verify_map.get(r.filename, []) if verify_map is defined else [] %}
 <div class="row g-4">
 
-  <!-- Artwork image — sticky so it stays visible while scrolling checks -->
+  <!-- Artwork image with zoom/pan — sticky on desktop -->
   <div class="col-lg-5 artwork-col">
     <div class="card shadow-sm">
-      <div class="card-header small fw-semibold bg-light py-2">Rendered Artwork</div>
-      <div class="card-body p-2 text-center bg-dark bg-opacity-10">
+      <div class="card-header bg-light py-1 d-flex align-items-center gap-1">
+        <span class="small fw-semibold flex-grow-1 text-truncate" title="{{ r.filename }}">Artwork</span>
         {% if r.img_path %}
-          <img src="{{ url_for('serve_image', job_id=job_id, filename=r.img_path | basename_filter) }}"
-               class="img-fluid rounded shadow-sm" style="max-height:78vh;object-fit:contain"
-               alt="{{ r.filename }}">
-        {% else %}
-          <div class="text-muted py-5">
-            <i class="bi bi-image fs-1 d-block mb-2"></i>Image not available
-          </div>
+        <button onclick="resRotate({{ idx }},-90)" class="btn btn-sm btn-outline-secondary border-0 px-1 py-0" title="Rotate left"><i class="bi bi-arrow-counterclockwise"></i></button>
+        <button onclick="resRotate({{ idx }}, 90)" class="btn btn-sm btn-outline-secondary border-0 px-1 py-0" title="Rotate right"><i class="bi bi-arrow-clockwise"></i></button>
+        <span class="vr mx-1"></span>
+        <button onclick="resZoomStep({{ idx }},-1)" class="btn btn-sm btn-outline-secondary border-0 px-1 py-0" title="Zoom out"><i class="bi bi-zoom-out"></i></button>
+        <span class="badge bg-light text-dark border px-2" id="resZoomLbl{{ idx }}" style="min-width:38px;font-size:.72rem;cursor:pointer" onclick="resReset({{ idx }})" title="Click to reset">Fit</span>
+        <button onclick="resZoomStep({{ idx }}, 1)" class="btn btn-sm btn-outline-secondary border-0 px-1 py-0" title="Zoom in"><i class="bi bi-zoom-in"></i></button>
+        <button onclick="resReset({{ idx }})" class="btn btn-sm btn-outline-secondary border-0 px-1 py-0" title="Fit to window"><i class="bi bi-arrows-angle-contract"></i></button>
         {% endif %}
       </div>
+      {% if r.img_path %}
+      <div class="card-body p-0 bg-dark bg-opacity-10 res-viewer-box"
+           style="overflow:hidden;height:58vh;cursor:grab;user-select:none"
+           id="resBox{{ idx }}">
+        <div id="resWrap{{ idx }}"
+             style="width:100%;height:100%;display:flex;align-items:center;justify-content:center;transform-origin:0 0;will-change:transform">
+          <img src="{{ url_for('serve_image', job_id=job_id, filename=r.img_path | basename_filter) }}"
+               id="resImg{{ idx }}"
+               style="max-width:100%;max-height:100%;object-fit:contain;pointer-events:none;display:block"
+               draggable="false" alt="{{ r.filename }}">
+        </div>
+      </div>
+      <div class="card-footer bg-light py-1 text-center" style="font-size:.7rem;color:#888">
+        Scroll to zoom &nbsp;·&nbsp; Drag to pan &nbsp;·&nbsp; Double-click to zoom in
+      </div>
+      {% else %}
+      <div class="card-body text-center text-muted py-5">
+        <i class="bi bi-image fs-1 d-block mb-2"></i>Image not available
+      </div>
+      {% endif %}
     </div>
   </div>
 
@@ -191,7 +220,7 @@
       <div class="alert alert-danger"><strong>Processing error:</strong> {{ r.error }}</div>
     {% else %}
 
-    <!-- File header + Issues-Only toggle -->
+    <!-- File header -->
     <div class="d-flex align-items-center gap-2 mb-3 flex-wrap">
       {{ _sev_icon(r.severity) }}
       <span class="fw-bold text-truncate">{{ r.filename }}</span>
@@ -204,10 +233,6 @@
       {% elif r.severity == 'info' %}
         <span class="badge bg-info text-dark ms-auto">{{ r.info_count }} notes</span>
       {% endif %}
-      <button class="btn btn-outline-secondary btn-sm py-0 ms-1 filter-toggle"
-              onclick="toggleIssuesOnly(this)" title="Hide notes and passing checks">
-        <i class="bi bi-funnel me-1"></i>Issues Only
-      </button>
     </div>
 
     <div class="checks-container">
@@ -224,7 +249,35 @@
     {{ _check_card('7','Print Specifications',  'bi-rulers',             r.checks.specs,    idx, r.filename, 'specs',    dismissals) }}
     </div>
 
-    <!-- Matched spec info -->
+    <!-- Manual verify items -->
+    {% if verify_items %}
+    <div class="mt-2">
+      <button class="btn btn-outline-warning btn-sm" type="button"
+              data-bs-toggle="collapse" data-bs-target="#verify{{ idx }}">
+        <i class="bi bi-search me-1"></i>{{ verify_items | length }} item{{ 's' if verify_items | length != 1 }} need manual verification
+      </button>
+      <div class="collapse mt-2" id="verify{{ idx }}">
+        <div class="card border-warning shadow-sm">
+          <div class="card-body py-2 small">
+            {% for item in verify_items %}
+            <div class="d-flex gap-2 mb-2 p-2 rounded
+              {% if item.severity == 'critical' %}bg-danger bg-opacity-10
+              {% elif item.severity == 'warning' %}bg-warning bg-opacity-10
+              {% else %}bg-info bg-opacity-10{% endif %}">
+              <i class="bi {% if item.severity == 'critical' %}bi-x-circle-fill text-danger{% elif item.severity == 'warning' %}bi-exclamation-triangle-fill text-warning{% else %}bi-info-circle-fill text-info{% endif %} flex-shrink-0 mt-1"></i>
+              <div>
+                <div class="fw-semibold text-muted mb-1" style="font-size:.72rem">{{ item.check_label }}</div>
+                {{ item.message }}
+              </div>
+            </div>
+            {% endfor %}
+          </div>
+        </div>
+      </div>
+    </div>
+    {% endif %}
+
+    <!-- Matched spec -->
     {% if r.matched_spec %}
     <div class="small text-muted mt-2 ps-1">
       <i class="bi bi-crosshair me-1"></i>
@@ -263,7 +316,9 @@
 {% set card_id = 'chk' ~ num ~ '_' ~ idx %}
 
 <div class="card mb-2 check-card
-  {% if crits %}border-danger check-has-issues{% elif warns %}border-warning check-has-issues{% else %}border-0{% endif %} shadow-sm">
+  {% if crits %}border-danger check-has-issues check-has-critical
+  {% elif warns %}border-warning check-has-issues
+  {% else %}border-0{% endif %} shadow-sm">
 
   <div class="card-header d-flex align-items-center gap-2 py-2
     {% if crits %}bg-danger bg-opacity-10{% elif warns %}bg-warning bg-opacity-10{% else %}bg-light{% endif %}"
@@ -317,7 +372,6 @@
       <span class="text-success"><i class="bi bi-check-circle me-1"></i>No issues detected.</span>
       {% endif %}
 
-      <!-- Extra data pills -->
       {% if check.get('found_gtins') %}
       <div class="mt-2 text-muted">GTINs detected: <code>{{ check.found_gtins | join(', ') }}</code></div>
       {% endif %}
@@ -326,9 +380,6 @@
       {% endif %}
       {% if check.get('proteins') %}
       <div class="mt-1 text-muted">Protein (g) found: {{ check.proteins | join(', ') }}</div>
-      {% endif %}
-      {% if check.get('contrast') is not none %}
-      <div class="mt-1 text-muted">Eyemark contrast delta: {{ check.contrast }}</div>
       {% endif %}
 
     </div>
@@ -339,20 +390,41 @@
 
 {% block scripts %}
 <style>
-  /* Sticky artwork panel — image stays in view while scrolling check cards */
+  /* ── Artwork sticky panel ── */
   @media (min-width: 992px) {
     .artwork-col { position: sticky; top: 1rem; align-self: flex-start; }
   }
-  /* Issues-only filter — hide notes and clean cards when active */
-  .checks-container.issues-only .check-notes       { display: none !important; }
-  .checks-container.issues-only .check-card:not(.check-has-issues) { display: none !important; }
-  .filter-toggle.active { background: #212529; color: #fff; border-color: #212529; }
+  /* ── Global filter modes (set as data-filter on #reportRoot) ── */
+  #reportRoot[data-filter="issues"] .check-notes                         { display:none!important; }
+  #reportRoot[data-filter="issues"] .check-card:not(.check-has-issues)   { display:none!important; }
+  #reportRoot[data-filter="critical"] .check-notes                       { display:none!important; }
+  #reportRoot[data-filter="critical"] .check-card:not(.check-has-critical){ display:none!important; }
+  /* ── Dismissed ── */
+  .issue-row.dismissed { opacity:.45; text-decoration:line-through; }
 </style>
 <script>
 const JOB_ID      = "{{ job_id }}";
 const INIT_STATUS = "{{ job.status }}";
 
 function esc(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+/* ── Global filter ── */
+function setFilter(mode) {
+  const root = document.getElementById('reportRoot');
+  if (!root) return;
+  if (mode === 'all') root.removeAttribute('data-filter');
+  else root.setAttribute('data-filter', mode);
+  document.querySelectorAll('#filterBar button').forEach(b => {
+    const bMode = b.getAttribute('onclick').match(/'(\w+)'/)?.[1];
+    b.className = b.className.replace(/\bbtn-(outline-)?(dark|danger)\b/g, '').trim();
+    if (bMode === mode) {
+      b.classList.add(bMode === 'critical' ? 'btn-danger' : 'btn-dark', 'active');
+    } else {
+      b.classList.add(bMode === 'critical' ? 'btn-outline-danger' : 'btn-outline-dark');
+      b.classList.remove('active');
+    }
+  });
+}
 
 /* ── Dismiss ── */
 async function toggleDismiss(btn, event) {
@@ -362,7 +434,6 @@ async function toggleDismiss(btn, event) {
   const check    = row.dataset.check;
   const idx      = parseInt(row.dataset.idx);
   const isDismissed = row.classList.contains('dismissed');
-
   try {
     const resp = await fetch(`/api/dismiss/${JOB_ID}`, {
       method: 'POST',
@@ -370,7 +441,6 @@ async function toggleDismiss(btn, event) {
       body: JSON.stringify({ filename, check, index: idx, dismissed: !isDismissed }),
     });
     if (!resp.ok) return;
-
     if (!isDismissed) {
       row.classList.add('dismissed');
       btn.innerHTML = '<i class="bi bi-arrow-counterclockwise"></i> Restore';
@@ -383,23 +453,141 @@ async function toggleDismiss(btn, event) {
   } catch (e) { console.error('Dismiss failed', e); }
 }
 
-/* ── JS rendering (polling path) ── */
+/* ════════════════════════════════════════════════════════
+   Artwork zoom/pan engine — lightweight viewer per file
+   ════════════════════════════════════════════════════════ */
+const _rs = {};
+function rsState(idx) {
+  if (!_rs[idx]) _rs[idx] = { scale:1, tx:0, ty:0, rotation:0, dragging:false, dragAnchor:null, pinchStart:null };
+  return _rs[idx];
+}
+function rsApply(idx) {
+  const s   = rsState(idx);
+  const wrap = document.getElementById('resWrap' + idx);
+  const lbl  = document.getElementById('resZoomLbl' + idx);
+  if (wrap) wrap.style.transform = `translate(${s.tx}px,${s.ty}px) rotate(${s.rotation}deg) scale(${s.scale})`;
+  if (lbl)  lbl.textContent = (s.scale === 1 && s.tx === 0 && s.ty === 0) ? 'Fit' : Math.round(s.scale * 100) + '%';
+}
+function rsZoomAt(idx, newScale, sx, sy) {
+  const s   = rsState(idx);
+  const box = document.getElementById('resBox' + idx);
+  if (!box) return;
+  const r  = box.getBoundingClientRect();
+  const lx = (sx - r.left - s.tx) / s.scale;
+  const ly = (sy - r.top  - s.ty) / s.scale;
+  s.scale = Math.max(0.05, Math.min(12, newScale));
+  s.tx = sx - r.left - lx * s.scale;
+  s.ty = sy - r.top  - ly * s.scale;
+  rsApply(idx);
+}
+function resZoomStep(idx, dir) {
+  const s = rsState(idx), box = document.getElementById('resBox' + idx);
+  if (!box) return;
+  const r  = box.getBoundingClientRect();
+  rsZoomAt(idx, s.scale * (dir > 0 ? 1.25 : 0.8), r.left + r.width / 2, r.top + r.height / 2);
+}
+function resReset(idx) {
+  const s = rsState(idx); s.scale=1; s.tx=0; s.ty=0; s.rotation=0;
+  rsApply(idx);
+}
+function resRotate(idx, deg) {
+  rsState(idx).rotation = (rsState(idx).rotation + deg + 360) % 360;
+  rsApply(idx);
+}
+
+function wireViewerBox(box) {
+  const idx = parseInt(box.id.replace('resBox', ''));
+  /* Wheel zoom at cursor */
+  box.addEventListener('wheel', e => {
+    e.preventDefault();
+    rsZoomAt(idx, rsState(idx).scale * (e.deltaY < 0 ? 1.12 : 1/1.12), e.clientX, e.clientY);
+  }, { passive: false });
+  /* Double-click zoom */
+  box.addEventListener('dblclick', e => {
+    const s = rsState(idx);
+    if (s.scale < 1.8) rsZoomAt(idx, s.scale * 2, e.clientX, e.clientY);
+    else resReset(idx);
+  });
+  /* Drag-to-pan: mousedown */
+  box.addEventListener('mousedown', e => {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    const s = rsState(idx);
+    s.dragging = true;
+    s.dragAnchor = { x: e.clientX, y: e.clientY, tx: s.tx, ty: s.ty };
+    box.style.cursor = 'grabbing';
+  });
+  /* Touch pan + pinch */
+  box.addEventListener('touchstart', e => {
+    const s = rsState(idx);
+    if (e.touches.length === 1) {
+      s.dragging = true;
+      s.dragAnchor = { x: e.touches[0].clientX, y: e.touches[0].clientY, tx: s.tx, ty: s.ty };
+    } else if (e.touches.length === 2) {
+      s.dragging = false;
+      s.pinchStart = { dist: Math.hypot(e.touches[0].clientX-e.touches[1].clientX, e.touches[0].clientY-e.touches[1].clientY), scale: s.scale };
+    }
+  }, { passive: true });
+  box.addEventListener('touchmove', e => {
+    e.preventDefault();
+    const s = rsState(idx);
+    if (e.touches.length === 2 && s.pinchStart) {
+      const dist = Math.hypot(e.touches[0].clientX-e.touches[1].clientX, e.touches[0].clientY-e.touches[1].clientY);
+      rsZoomAt(idx, s.pinchStart.scale * (dist / s.pinchStart.dist),
+               (e.touches[0].clientX+e.touches[1].clientX)/2,
+               (e.touches[0].clientY+e.touches[1].clientY)/2);
+    } else if (e.touches.length === 1 && s.dragging && s.dragAnchor) {
+      s.tx = s.dragAnchor.tx + (e.touches[0].clientX - s.dragAnchor.x);
+      s.ty = s.dragAnchor.ty + (e.touches[0].clientY - s.dragAnchor.y);
+      rsApply(idx);
+    }
+  }, { passive: false });
+  box.addEventListener('touchend', e => {
+    const s = rsState(idx); s.dragging = false;
+    if (e.touches.length < 2) s.pinchStart = null;
+  });
+}
+
+/* Global mouse move/up for pan */
+window.addEventListener('mousemove', e => {
+  document.querySelectorAll('.res-viewer-box').forEach(box => {
+    const idx = parseInt(box.id.replace('resBox', ''));
+    const s = rsState(idx);
+    if (s.dragging && s.dragAnchor) {
+      s.tx = s.dragAnchor.tx + (e.clientX - s.dragAnchor.x);
+      s.ty = s.dragAnchor.ty + (e.clientY - s.dragAnchor.y);
+      rsApply(idx);
+    }
+  });
+});
+window.addEventListener('mouseup', () => {
+  document.querySelectorAll('.res-viewer-box').forEach(box => {
+    const idx = parseInt(box.id.replace('resBox', ''));
+    const s = rsState(idx);
+    if (s.dragging) { s.dragging = false; s.dragAnchor = null; box.style.cursor = 'grab'; }
+  });
+});
+
+/* Wire up any viewer boxes already in DOM */
+document.querySelectorAll('.res-viewer-box').forEach(wireViewerBox);
+
+
+/* ════════════════════════════════════════════════════════
+   JS rendering (polling path)
+   ════════════════════════════════════════════════════════ */
 
 function issueRows(issues, filename, checkKey) {
   if (!issues || !issues.length)
     return '<span class="text-success"><i class="bi bi-check-circle me-1"></i>No issues detected.</span>';
   return issues.map((issue, i) => {
     const sev = issue.severity;
-    const ic  = sev === 'critical' ? 'x-circle-fill text-danger'
-              : sev === 'warning'  ? 'exclamation-triangle-fill text-warning'
-              :                      'info-circle-fill text-info';
+    const ic  = sev==='critical' ? 'x-circle-fill text-danger' : sev==='warning' ? 'exclamation-triangle-fill text-warning' : 'info-circle-fill text-info';
     return `<div class="d-flex gap-2 mb-2 p-2 rounded sev-${sev} issue-row"
       data-filename="${esc(filename)}" data-check="${esc(checkKey)}" data-idx="${i}">
       <i class="bi bi-${ic} flex-shrink-0 mt-1"></i>
       <span class="flex-grow-1">${esc(issue.message)}</span>
       <button class="btn btn-sm btn-outline-secondary py-0 px-2 flex-shrink-0 dismiss-btn"
-              title="Mark as reviewed — excluded from report"
-              onclick="toggleDismiss(this, event)">
+              title="Mark as reviewed" onclick="toggleDismiss(this, event)">
         <i class="bi bi-check2"></i> Dismiss
       </button>
     </div>`;
@@ -421,26 +609,20 @@ function checkCard(num, title, icon, check, uid, filename, checkKey, alwaysOpen)
   const warns  = issues.filter(i => i.severity === 'warning');
   const infos  = issues.filter(i => i.severity === 'info');
   const id     = `jschk${num}_${uid}`;
-
-  const hasIssues = crits.length || warns.length;
+  const hasCrit = crits.length > 0;
+  const hasIss  = crits.length > 0 || warns.length > 0;
   const hdrCls  = crits.length ? 'bg-danger bg-opacity-10' : warns.length ? 'bg-warning bg-opacity-10' : 'bg-light';
-  const bdrCls  = crits.length ? 'border-danger check-has-issues' : warns.length ? 'border-warning check-has-issues' : 'border-0';
+  const bdrCls  = crits.length ? 'border-danger check-has-issues check-has-critical'
+                : warns.length ? 'border-warning check-has-issues' : 'border-0';
   const iconCls = crits.length ? 'text-danger' : warns.length ? 'text-warning' : 'text-secondary';
   const badge   = crits.length ? `<span class="badge bg-danger">${crits.length} critical</span>`
                 : warns.length ? `<span class="badge bg-warning text-dark">${warns.length} warnings</span>`
                 : infos.length ? `<span class="badge bg-info text-dark">${infos.length} notes</span>`
                 :                `<span class="badge bg-success">OK</span>`;
-
   let extras = '';
-  if (check.found_gtins && check.found_gtins.length)
-    extras += `<div class="mt-2 text-muted">GTINs detected: <code>${check.found_gtins.join(', ')}</code></div>`;
-  if (check.calories && check.calories.length)
-    extras += `<div class="mt-1 text-muted">Calories found: ${check.calories.join(', ')}</div>`;
-  if (check.proteins && check.proteins.length)
-    extras += `<div class="mt-1 text-muted">Protein (g) found: ${check.proteins.join(', ')}</div>`;
-  if (check.contrast != null)
-    extras += `<div class="mt-1 text-muted">Eyemark contrast delta: ${check.contrast}</div>`;
-
+  if (check.found_gtins?.length) extras += `<div class="mt-2 text-muted">GTINs detected: <code>${check.found_gtins.join(', ')}</code></div>`;
+  if (check.calories?.length)    extras += `<div class="mt-1 text-muted">Calories found: ${check.calories.join(', ')}</div>`;
+  if (check.proteins?.length)    extras += `<div class="mt-1 text-muted">Protein (g) found: ${check.proteins.join(', ')}</div>`;
   return `<div class="card mb-2 check-card ${bdrCls} shadow-sm">
     <div class="card-header d-flex align-items-center gap-2 py-2 ${hdrCls}"
          data-bs-toggle="collapse" data-bs-target="#${id}" style="cursor:pointer">
@@ -473,56 +655,84 @@ function sevBadge(r) {
 
 function fileResult(r, jobId, idx) {
   const imgFname = r.img_path ? r.img_path.split('/').pop() : null;
-  const imgHtml  = imgFname
-    ? `<img src="/image/${jobId}/${imgFname}" class="img-fluid rounded shadow-sm"
-            style="max-height:78vh;object-fit:contain" alt="${esc(r.filename)}">`
-    : `<div class="text-muted py-5"><i class="bi bi-image fs-1 d-block mb-2"></i>Image not available</div>`;
-
-  const checks = r.checks || {};
   const uid    = `${jobId}_${idx}`;
-  const sevBadgeHtml = sevBadge(r);
+  const checks = r.checks || {};
+
+  const viewerControls = imgFname ? `
+    <button onclick="resRotate(${idx},-90)" class="btn btn-sm btn-outline-secondary border-0 px-1 py-0" title="Rotate left"><i class="bi bi-arrow-counterclockwise"></i></button>
+    <button onclick="resRotate(${idx}, 90)" class="btn btn-sm btn-outline-secondary border-0 px-1 py-0" title="Rotate right"><i class="bi bi-arrow-clockwise"></i></button>
+    <span class="vr mx-1"></span>
+    <button onclick="resZoomStep(${idx},-1)" class="btn btn-sm btn-outline-secondary border-0 px-1 py-0" title="Zoom out"><i class="bi bi-zoom-out"></i></button>
+    <span class="badge bg-light text-dark border px-2" id="resZoomLbl${idx}" style="min-width:38px;font-size:.72rem;cursor:pointer" onclick="resReset(${idx})" title="Click to reset">Fit</span>
+    <button onclick="resZoomStep(${idx}, 1)" class="btn btn-sm btn-outline-secondary border-0 px-1 py-0" title="Zoom in"><i class="bi bi-zoom-in"></i></button>
+    <button onclick="resReset(${idx})" class="btn btn-sm btn-outline-secondary border-0 px-1 py-0" title="Fit to window"><i class="bi bi-arrows-angle-contract"></i></button>` : '';
+
+  const imgBox = imgFname ? `
+    <div class="card-body p-0 bg-dark bg-opacity-10 res-viewer-box"
+         style="overflow:hidden;height:58vh;cursor:grab;user-select:none" id="resBox${idx}">
+      <div id="resWrap${idx}" style="width:100%;height:100%;display:flex;align-items:center;justify-content:center;transform-origin:0 0;will-change:transform">
+        <img src="/image/${jobId}/${esc(imgFname)}" id="resImg${idx}"
+             style="max-width:100%;max-height:100%;object-fit:contain;pointer-events:none;display:block"
+             draggable="false" alt="${esc(r.filename)}">
+      </div>
+    </div>
+    <div class="card-footer bg-light py-1 text-center" style="font-size:.7rem;color:#888">Scroll to zoom &nbsp;·&nbsp; Drag to pan &nbsp;·&nbsp; Double-click to zoom in</div>`
+    : `<div class="card-body text-center text-muted py-5"><i class="bi bi-image fs-1 d-block mb-2"></i>Image not available</div>`;
 
   let checksHtml = '';
   checksHtml += checkCard('1','GTIN / Barcode',        'bi-upc-scan',           checks.gtin,     uid, r.filename, 'gtin',     false);
-  if (checks.nfp != null)
-    checksHtml += checkCard('2','Front Call-Out vs NFP','bi-clipboard2-pulse',   checks.nfp,      uid, r.filename, 'nfp',      false);
+  if (checks.nfp != null) checksHtml += checkCard('2','Front Call-Out vs NFP','bi-clipboard2-pulse', checks.nfp, uid, r.filename, 'nfp', false);
   checksHtml += checkCard('3','Eyemark Contrast',       'bi-eye',                checks.eyemark,  uid, r.filename, 'eyemark',  false);
   checksHtml += checkCard('4','Spelling / Brand Name', 'bi-spellcheck',         checks.spelling, uid, r.filename, 'spelling', false);
   checksHtml += checkCard('5','FDA Audit Risk',         'bi-shield-exclamation', checks.fda,      uid, r.filename, 'fda',      true);
-  if (checks.wind != null)
-    checksHtml += checkCard('6','Wind Direction',       'bi-arrow-repeat',       checks.wind,     uid, r.filename, 'wind',     false);
+  if (checks.wind != null) checksHtml += checkCard('6','Wind Direction','bi-arrow-repeat', checks.wind, uid, r.filename, 'wind', false);
   checksHtml += checkCard('7','Print Specifications',  'bi-rulers',             checks.specs,    uid, r.filename, 'specs',    false);
 
-  let content = r.error
+  const content = r.error
     ? `<div class="alert alert-danger"><strong>Error:</strong> ${esc(r.error)}</div>`
     : `<div class="d-flex align-items-center gap-2 mb-3 flex-wrap">
-        ${sevIcon(r.severity)}
-        <span class="fw-bold text-truncate">${esc(r.filename)}</span>
-        ${sevBadgeHtml}
-        <button class="btn btn-outline-secondary btn-sm py-0 ms-1 filter-toggle"
-                onclick="toggleIssuesOnly(this)" title="Hide notes and passing checks">
-          <i class="bi bi-funnel me-1"></i>Issues Only
-        </button>
-      </div>
-      <div class="checks-container">${checksHtml}</div>
-      ${r.ocr_preview ? `<div class="mt-2">
-        <button class="btn btn-outline-secondary btn-sm" type="button"
-                data-bs-toggle="collapse" data-bs-target="#jsocr${idx}">
-          <i class="bi bi-text-paragraph me-1"></i>Show OCR Text
-        </button>
-        <div class="collapse mt-2" id="jsocr${idx}">
-          <pre class="bg-light border rounded p-3 small"
-               style="max-height:220px;overflow:auto;white-space:pre-wrap">${esc(r.ocr_preview)}</pre>
-        </div></div>` : ''}`;
+        ${sevIcon(r.severity)}<span class="fw-bold text-truncate">${esc(r.filename)}</span>${sevBadge(r)}
+       </div>
+       <div class="checks-container">${checksHtml}</div>
+       ${r.ocr_preview ? `<div class="mt-2">
+         <button class="btn btn-outline-secondary btn-sm" type="button" data-bs-toggle="collapse" data-bs-target="#jsocr${idx}">
+           <i class="bi bi-text-paragraph me-1"></i>Show OCR Text
+         </button>
+         <div class="collapse mt-2" id="jsocr${idx}">
+           <pre class="bg-light border rounded p-3 small" style="max-height:220px;overflow:auto;white-space:pre-wrap">${esc(r.ocr_preview)}</pre>
+         </div></div>` : ''}`;
 
-  return `<div class="row g-4">
+  const html = `<div class="row g-4">
     <div class="col-lg-5 artwork-col">
       <div class="card shadow-sm">
-        <div class="card-header small fw-semibold bg-light py-2">Rendered Artwork</div>
-        <div class="card-body p-2 text-center bg-dark bg-opacity-10">${imgHtml}</div>
+        <div class="card-header bg-light py-1 d-flex align-items-center gap-1">
+          <span class="small fw-semibold flex-grow-1 text-truncate">Artwork</span>
+          ${viewerControls}
+        </div>
+        ${imgBox}
       </div>
     </div>
     <div class="col-lg-7">${content}</div>
+  </div>`;
+
+  // Wire up viewer after DOM insertion (called from buildReport)
+  return html;
+}
+
+function filterBarHTML() {
+  return `<div class="d-flex align-items-center gap-3 mb-3 flex-wrap">
+    <div class="alert alert-light border small d-flex align-items-center gap-2 mb-0 py-2 flex-grow-1">
+      <i class="bi bi-check2-square text-secondary fs-5"></i>
+      <span>Click <strong>Dismiss</strong> on any flag you've manually verified. Dismissed flags are excluded from the downloaded report.</span>
+    </div>
+    <div class="d-flex align-items-center gap-2 flex-shrink-0">
+      <span class="text-muted small fw-semibold">Filter:</span>
+      <div class="btn-group btn-group-sm" id="filterBar" role="group">
+        <button type="button" class="btn btn-dark active" onclick="setFilter('all')">All</button>
+        <button type="button" class="btn btn-outline-dark" onclick="setFilter('issues')">Issues Only</button>
+        <button type="button" class="btn btn-outline-danger" onclick="setFilter('critical')">Critical</button>
+      </div>
+    </div>
   </div>`;
 }
 
@@ -554,43 +764,23 @@ function buildReport(job) {
     <div><h4 class="mb-0 fw-bold"><i class="bi bi-file-earmark-check me-2"></i>Proof Report</h4>
     <div class="text-muted small">Job ${job.id} &bull; ${job.created.substring(0,19).replace('T',' ')}</div></div>
     <div class="ms-auto d-flex gap-2 flex-wrap">
-      <a href="/viewer/${job.id}" class="btn btn-outline-info btn-sm"><i class="bi bi-zoom-in me-1"></i>Manual Review</a>
       <a href="/summary/${job.id}" class="btn btn-outline-dark btn-sm"><i class="bi bi-clipboard2-check me-1"></i>Full Summary</a>
       <a href="/report/${job.id}" class="btn btn-success btn-sm"><i class="bi bi-download me-1"></i>Download Report</a>
       <a href="/" class="btn btn-outline-secondary btn-sm"><i class="bi bi-arrow-left me-1"></i>New Proof</a>
     </div>
   </div>`;
 
-  const dismissTip = `<div class="alert alert-light border small d-flex align-items-center gap-2 mb-3 py-2">
-    <i class="bi bi-check2-square text-secondary fs-5"></i>
-    <span>Click <strong>Dismiss</strong> on any flag you've manually verified and confirmed is not an issue. Dismissed flags are excluded from the downloaded report.</span>
-  </div>`;
-
+  let body;
   if (results.length > 1) {
-    const tabs  = results.map((r, i) => `<li class="nav-item" role="presentation">
-      <button class="nav-link small px-3 py-2 ${i===0?'active':''}"
-              data-bs-toggle="tab" data-bs-target="#jsfp${i}" type="button">
-        ${sevIcon(r.severity)}${esc(r.filename.length>28?r.filename.substring(0,28)+'…':r.filename)}
-      </button></li>`).join('');
-    const panes = results.map((r, i) =>
-      `<div class="tab-pane fade ${i===0?'show active':''}" id="jsfp${i}">${fileResult(r,job.id,i)}</div>`
-    ).join('');
-    return hdr + summaryCards(job.summary) + fdaAlert(job.summary) + dismissTip +
-      `<ul class="nav nav-tabs mb-3">${tabs}</ul><div class="tab-content">${panes}</div>`;
+    const tabs  = results.map((r, i) => `<li class="nav-item"><button class="nav-link small px-3 py-2 ${i===0?'active':''}" data-bs-toggle="tab" data-bs-target="#jsfp${i}" type="button">${sevIcon(r.severity)}${esc(r.filename.length>28?r.filename.substring(0,28)+'…':r.filename)}</button></li>`).join('');
+    const panes = results.map((r, i) => `<div class="tab-pane fade ${i===0?'show active':''}" id="jsfp${i}">${fileResult(r,job.id,i)}</div>`).join('');
+    body = `<ul class="nav nav-tabs mb-3">${tabs}</ul><div class="tab-content">${panes}</div>`;
+  } else {
+    body = results[0] ? fileResult(results[0], job.id, 0) : '';
   }
-  return hdr + summaryCards(job.summary) + fdaAlert(job.summary) + dismissTip +
-    (results[0] ? fileResult(results[0], job.id, 0) : '');
-}
 
-/* ── Issues-Only filter ── */
-function toggleIssuesOnly(btn) {
-  const container = btn.closest('.col-lg-7').querySelector('.checks-container');
-  if (!container) return;
-  const on = container.classList.toggle('issues-only');
-  btn.classList.toggle('active', on);
-  btn.innerHTML = on
-    ? '<i class="bi bi-funnel-fill me-1"></i>Show All'
-    : '<i class="bi bi-funnel me-1"></i>Issues Only';
+  const html = hdr + summaryCards(job.summary) + fdaAlert(job.summary) + filterBarHTML() + body;
+  return html;
 }
 
 /* ── Polling ── */
@@ -608,6 +798,8 @@ if (INIT_STATUS !== 'done' && INIT_STATUS !== 'error') {
         document.getElementById('loadingView').style.display = 'none';
         document.getElementById('reportRoot').innerHTML = buildReport(job);
         document.getElementById('resultsView').style.display = '';
+        // Wire up any viewer boxes that were just inserted
+        document.querySelectorAll('.res-viewer-box').forEach(wireViewerBox);
       } else if (s.status === 'error') {
         clearInterval(interval);
         document.getElementById('loadingView').style.display = 'none';
