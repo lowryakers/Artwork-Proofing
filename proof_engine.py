@@ -293,12 +293,19 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
     except Exception:
         pass
 
-    # ── OCR (Tesseract) — skip when native text is rich enough (saves 2-4s) ──
-    # Print-ready PDFs often have all text converted to outlines; those return
-    # near-zero native text and need OCR.  Live-text PDFs return 100+ words
-    # and OCR would only add noise and latency.
+    # ── OCR (Tesseract) ────────────────────────────────────────────────────────
+    # Skip Tesseract only when native text already contains key label signals
+    # (NFP header, ingredients, net weight, etc.). This catches the press-proof
+    # case where the editable form fields give 100+ words of native text but the
+    # actual artwork content is outlined/vectorized and invisible to PyMuPDF —
+    # without Tesseract all absence-based checks fire as false positives.
+    _label_signals = [
+        'nutrition facts', 'supplement facts', 'serving size', 'calories',
+        'ingredients', 'contains:', 'net wt', 'net weight',
+    ]
+    _native_has_label = any(sig in native_text.lower() for sig in _label_signals)
     ocr_text = ''
-    if len(native_text.split()) < 100:
+    if not _native_has_label:
         try:
             r = subprocess.run(
                 ['tesseract', img_path, 'stdout', '--oem', '3', '--psm', '3', '-l', 'eng'],
@@ -925,7 +932,9 @@ def _check_fda(ocr_text: str, fname: str) -> dict:
     ))
     # If it's a whey/stick protein product, the product type implies milk is present.
     # Only fire if NEITHER the filename NOR any OCR evidence suggests milk/whey.
-    if is_whey_product and not _milk_in_ocr and 'whey' not in tl and 'whey' not in fname.lower():
+    # Filename containing "whey" identifies the product type but does NOT prove the
+    # allergen is declared on the label — only check OCR/native text for that.
+    if is_whey_product and not _milk_in_ocr and 'whey' not in tl:
         issues.append({
             'severity': 'warning',
             'message': (
