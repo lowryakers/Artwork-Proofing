@@ -165,12 +165,17 @@ def _fetch_sheet_rows(csv_url: str) -> list:
         print_p  = _get('print', 'print process')
 
         def _to_float(v):
+            if not v:
+                return None
+            # Strip common unit suffixes before converting (e.g. "254mm" → 254.0)
+            v_clean = re.sub(r'\s*(?:mm|cm|in|inch(?:es)?|ft|g|oz|lbs?)\s*$', '',
+                             str(v).strip(), flags=re.IGNORECASE)
             try:
-                return float(v) if v else None
+                return float(v_clean) if v_clean else None
             except (ValueError, TypeError):
                 return None
 
-        trim_length = _to_float(_get('trim length', 'length mm', 'trim l'))
+        trim_length = _to_float(_get('trim length', 'length mm', 'trim l', 'height mm', 'trim h'))
         trim_width  = _to_float(_get('trim width',  'width mm',  'trim w', 'w mm'))
         gusset      = _to_float(_get('gusset dimension', 'gusset'))
         front_panel = _to_float(_get('front panel dimension', 'front panel'))
@@ -213,6 +218,7 @@ def _fetch_sheet_rows(csv_url: str) -> list:
             'zipper':            zipper,
             'print_process':     print_p,
             'trim_length_mm':    trim_length,
+            'trim_height_mm':    trim_length,   # alias — proof_engine uses trim_height_mm
             'trim_width_mm':     trim_width,
             'gusset_mm':         gusset,
             'front_panel_mm':    front_panel,
