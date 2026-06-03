@@ -456,6 +456,24 @@ def viewer(job_id):
     return redirect(url_for('result', job_id=job_id))
 
 
+@app.route('/summary/<job_id>')
+def summary(job_id):
+    job = proof_engine.get_job(job_id)
+    if not job:
+        flash('Job not found.', 'danger')
+        return redirect(url_for('landing'))
+    if job['status'] != 'done':
+        return redirect(url_for('result', job_id=job_id))
+    return render_template('summary.html', job=job, job_id=job_id)
+
+
+@app.route('/history')
+def history():
+    proof_engine.load_jobs_from_disk()
+    jobs = proof_engine.list_jobs()
+    return render_template('history.html', jobs=jobs)
+
+
 # ── API ───────────────────────────────────────────────────────────────────────
 
 @app.route('/api/status/<job_id>')
