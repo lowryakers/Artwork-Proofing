@@ -331,7 +331,7 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
             'fda':      _check_fda_light(combined_text, fname),
             'specs':    _check_print_specs(pdf_path, brand_config, matched_spec),
         }
-        if is_film:
+        if is_film or effective_wind:
             checks['wind'] = _check_wind_direction(combined_text, effective_wind)
     else:
         # ProDough mode
@@ -344,8 +344,7 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
             'fda':      _check_fda(combined_text, fname),
             'specs':    _check_print_specs(pdf_path, brand_config, matched_spec),
         }
-        if effective_wind:
-            checks['wind'] = _check_wind_direction(combined_text, effective_wind)
+        checks['wind'] = _check_wind_direction(combined_text, effective_wind)
 
     all_issues = [i for c in checks.values() for i in c.get('issues', [])]
     crit  = [i for i in all_issues if i['severity'] == 'critical']
@@ -574,47 +573,63 @@ def _check_eyemark(img, is_film: bool = False, fname: str = '') -> dict:
         return {'issues': issues, 'notes': notes, 'eyemark_color': None}
 
     w, h = img.size
-    mw = max(1, int(w * 0.10))
-    mh = max(1, int(h * 0.08))
+    cw = max(1, int(w * 0.10))  # corner width  — 10% of image width
+    ch = max(1, int(h * 0.08))  # corner height — 8% of image height
 
-    mark_region = img.crop((w - mw, h - mh, w, h))
-    pixels = list(mark_region.getdata())
-    if not pixels:
-        return {'issues': issues, 'notes': notes, 'eyemark_color': None}
+    # Sample all 4 corners + center of each edge (6 regions total).
+    # Eyemarks appear in different positions depending on press layout — scanning
+    # all candidate regions finds them regardless of placement.
+    regions = {
+        'bottom-right': (w - cw, h - ch, w, h),
+        'bottom-left':  (0,      h - ch, cw, h),
+        'top-right':    (w - cw, 0,      w,  ch),
+        'top-left':     (0,      0,      cw, ch),
+        'bottom-center':(w // 2 - cw // 2, h - ch, w // 2 + cw // 2, h),
+        'top-center':   (w // 2 - cw // 2, 0,      w // 2 + cw // 2, ch),
+    }
 
-    lumas = [0.299 * r + 0.587 * g + 0.114 * b for r, g, b in pixels]
-    min_luma = min(lumas)
-    max_luma = max(lumas)
-    avg_luma = sum(lumas) / len(lumas)
+    def _score_region(crop):
+        """Return (eyemark_color, min_luma, max_luma, avg_luma, confidence).
+        confidence is how extreme the luminance is (higher = more likely an eyemark).
+        """
+        pixels = list(crop.getdata())
+        if not pixels:
+            return None, 255, 0, 128, 0
+        lumas = [0.299 * r + 0.587 * g + 0.114 * b for r, g, b in pixels]
+        mn, mx, avg = min(lumas), max(lumas), sum(lumas) / len(lumas)
+        black_frac = sum(1 for l in lumas if l < 25) / len(lumas)
+        white_frac = sum(1 for l in lumas if l > 230) / len(lumas)
+        if black_frac >= 0.15:
+            return 'black', mn, mx, avg, black_frac
+        if white_frac >= 0.85:
+            return 'white', mn, mx, avg, white_frac
+        return 'none', mn, mx, avg, 0
 
-    # A black eyemark leaves very dark pixels (<25); a white eyemark leaves very light pixels (>230).
-    has_black = min_luma < 25
-    has_white = max_luma > 230
+    best_color = 'none'
+    best_confidence = 0
+    best_loc = ''
+    best_lumas = (255, 0, 128)
 
-    if has_black and has_white:
-        # Both extremes present — determine which is the eyemark (the minority element)
-        black_count = sum(1 for l in lumas if l < 25)
-        white_count = sum(1 for l in lumas if l > 230)
-        eyemark_color = 'black' if black_count <= white_count else 'white'
-    elif has_black:
-        eyemark_color = 'black'
-    elif has_white:
-        eyemark_color = 'white'
-    else:
-        eyemark_color = 'none'
+    for loc, box in regions.items():
+        crop = img.crop(box)
+        color, mn, mx, avg, conf = _score_region(crop)
+        if color in ('black', 'white') and conf > best_confidence:
+            best_color, best_confidence, best_loc, best_lumas = color, conf, loc, (mn, mx, avg)
+
+    eyemark_color = best_color
+    min_luma, max_luma, avg_luma = best_lumas
 
     if eyemark_color == 'black':
         notes.append(
-            f'✔ BLACK eyemark detected (darkest pixel: {min_luma:.0f}/255) — OK. '
+            f'✔ BLACK eyemark detected at {best_loc} (darkest pixel: {min_luma:.0f}/255) — OK. '
             'Solid black eyemark provides reliable photo-eye detection.'
         )
     elif eyemark_color == 'white':
         notes.append(
-            f'✔ WHITE eyemark detected (lightest pixel: {max_luma:.0f}/255) — OK. '
+            f'✔ WHITE eyemark detected at {best_loc} (lightest pixel: {max_luma:.0f}/255) — OK. '
             'Solid white eyemark provides reliable photo-eye detection.'
         )
     else:
-        # Describe the actual color so the designer knows exactly what to fix
         if avg_luma < 85:
             color_desc = f'dark grey or a dark color (avg brightness {avg_luma:.0f}/255)'
         elif avg_luma < 170:
@@ -625,7 +640,8 @@ def _check_eyemark(img, is_film: bool = False, fname: str = '') -> dict:
         issues.append({
             'severity': 'critical',
             'message': (
-                f'Eyemark is not solid black or solid white — detected as {color_desc}. '
+                f'Eyemark not detected as solid black or white in any corner or edge region — '
+                f'the brightest candidate region was {color_desc}. '
                 'The production line photo-eye sensor requires a solid BLACK (#000000) '
                 'or solid WHITE (#FFFFFF) eyemark. A colored or grey eyemark WILL cause '
                 'missed or false triggers on the bagger/sealer. '
@@ -637,48 +653,98 @@ def _check_eyemark(img, is_film: bool = False, fname: str = '') -> dict:
 
 
 # ── Check 4: Spelling / brand name ───────────────────────────────────────────
+#
+# Three tiers — higher tiers are warnings, lower tiers are notes:
+#
+# Tier 1 (critical) — Brand name & flavor names. These appear prominently on
+#   the front panel and are the most visible errors to consumers and regulators.
+#
+# Tier 2 (warning) — Front call-out and marketing copy. Common misspellings in
+#   claim language (protein, natural, artificial, nutritional, excellent).
+#
+# Tier 3 (note) — Body text / supporting copy. UK vs US spellings; patterns
+#   that only appear in ingredient declarations or fine print.
 
-_MISSPELLINGS = {
-    # Only check for the space variant — OCR can't reliably read the ® symbol
-    # from outlined-text PDFs, so the (?!®) check produces constant false positives.
-    r'pro\s+dough':              'ProDough (should be one word, no space)',
-    r'\bcheescake\b':            'cheesecake',
-    r'\bbanna\b':                'banana',
-    r'\bchoclate\b':             'chocolate',
-    r'\bvanila\b':               'vanilla',
-    r'\bcarmel\b':               'caramel',
-    r'\bcinamon\b':              'cinnamon',
-    r'\bstrwberry\b':            'strawberry',
-    r'\brasberry\b':             'raspberry',
-    r'\braspbery\b':             'raspberry',
-    r'\bprotien\b':              'protein',
-    r'\bingrediant':             'ingredient',
-    r'\bartifical\b':            'artificial',
-    r'\bnatrual\b':              'natural',
-    r'\bexellent\b':             'excellent',
-    r'\bnutrional\b':            'nutritional',
+_SPELLING_TIER1 = {
+    # Brand name
+    r'pro\s+dough':     'ProDough (one word, no space)',
+    # Flavor names — most likely to appear in large display type
+    r'\bcheescake\b':   'cheesecake',
+    r'\bbanna\b':       'banana',
+    r'\bchoclate\b':    'chocolate',
+    r'\bvanila\b':      'vanilla',
+    r'\bcarmel\b':      'caramel',
+    r'\bcinamon\b':     'cinnamon',
+    r'\bstrwberry\b':   'strawberry',
+    r'\brasberry\b':    'raspberry',
+    r'\braspbery\b':    'raspberry',
+    r'\bpeanut\s+budder\b': 'peanut butter',
+    r'\bcookeis\b':     'cookies',
+    r'\bbrowny\b':      'brownie',
+}
+
+_SPELLING_TIER2 = {
+    # Front call-out / marketing claims
+    r'\bprotien\b':     'protein',
+    r'\bnatrual\b':     'natural',
+    r'\bartifical\b':   'artificial',
+    r'\bnutrional\b':   'nutritional',
+    r'\bexellent\b':    'excellent',
+    r'\bsuplements?\b': 'supplement',
+    r'\bbenifits?\b':   'benefit',
+    r'\bvitiman\b':     'vitamin',
+    r'\baminoacid\b':   'amino acid',
+    r'\bglutamine\b':   'glutamine',   # common supplement term, worth checking
+}
+
+_SPELLING_TIER3 = {
+    # Body / fine print — lower visibility, but still flagged
+    r'\bingrediant':    'ingredient',
+    r'\bpreservitive\b':'preservative',
+    r'\bcolestrol\b':   'cholesterol',
+    r'\bdietary\s+fible\b': 'dietary fiber',
+    r'\bcontians\b':    'contains',
+    r'\bdistribted\b':  'distributed',
+    r'\bmanufactred\b': 'manufactured',
 }
 
 
 def _check_spelling(ocr_text: str, fname: str) -> dict:
     issues, notes = [], []
 
-    for pattern, correction in _MISSPELLINGS.items():
+    for pattern, correction in _SPELLING_TIER1.items():
+        if re.search(pattern, ocr_text, re.IGNORECASE):
+            issues.append({
+                'severity': 'critical',
+                'message': (
+                    f'[Tier 1 — Brand/Flavor] Misspelling detected: should be "{correction}". '
+                    'Verify on the actual artwork file (OCR on outlined text can produce false positives).'
+                ),
+            })
+
+    for pattern, correction in _SPELLING_TIER2.items():
         if re.search(pattern, ocr_text, re.IGNORECASE):
             issues.append({
                 'severity': 'warning',
                 'message': (
-                    f'Possible misspelling detected → should be "{correction}". '
-                    'OCR on outlined-text PDFs can produce false positives; verify on the actual artwork file.'
+                    f'[Tier 2 — Call-Out/Claims] Possible misspelling: should be "{correction}". '
+                    'Verify on the actual artwork file.'
                 ),
             })
 
+    for pattern, correction in _SPELLING_TIER3.items():
+        if re.search(pattern, ocr_text, re.IGNORECASE):
+            notes.append(
+                f'[Tier 3 — Body Text] Possible misspelling: should be "{correction}". '
+                'Verify on the actual artwork file.'
+            )
+
     if re.search(r'\bflavour\b', ocr_text, re.IGNORECASE):
-        notes.append('UK spelling "flavour" detected. US market labels should use "flavor".')
+        notes.append('[Tier 3] UK spelling "flavour" detected — US labels should use "flavor".')
 
     notes.append(
-        'ProDough® wordmark check: verify capital P, capital D, no space, and the ® symbol appear correctly. '
-        'Social handles (@prodoughshop) and website URLs (prodoughshop.com) are excluded from this check.'
+        'ProDough® wordmark: verify capital P, capital D, no space, and the ® symbol appear correctly. '
+        'Social handles (@prodoughshop) and website URLs are excluded from this check.'
     )
 
     return {'issues': issues, 'notes': notes}
@@ -686,46 +752,46 @@ def _check_spelling(ocr_text: str, fname: str) -> dict:
 
 # ── Generic brand spelling check ─────────────────────────────────────────────
 
-# Generic food misspellings — same as _MISSPELLINGS but without ProDough-specific patterns
-_GENERIC_MISSPELLINGS = {
-    r'\bcheescake\b':  'cheesecake',
-    r'\bbanna\b':      'banana',
-    r'\bchoclate\b':   'chocolate',
-    r'\bvanila\b':     'vanilla',
-    r'\bcarmel\b':     'caramel',
-    r'\bcinamon\b':    'cinnamon',
-    r'\bstrwberry\b':  'strawberry',
-    r'\brasberry\b':   'raspberry',
-    r'\braspbery\b':   'raspberry',
-    r'\bprotien\b':    'protein',
-    r'\bingrediant':   'ingredient',
-    r'\bartifical\b':  'artificial',
-    r'\bnatrual\b':    'natural',
-    r'\bexellent\b':   'excellent',
-    r'\bnutrional\b':  'nutritional',
-}
-
-
 def _check_spelling_generic(ocr_text: str, brand_name: str) -> dict:
+    """Tiered spelling check for generic/non-ProDough brands.
+    Uses the same tier dictionaries as the ProDough check, minus ProDough brand patterns.
+    """
     issues, notes = [], []
 
-    for pattern, correction in _GENERIC_MISSPELLINGS.items():
+    # Tier 1: flavor name misspellings (skip the 'pro dough' brand pattern)
+    tier1_generic = {k: v for k, v in _SPELLING_TIER1.items() if 'dough' not in k}
+    for pattern, correction in tier1_generic.items():
+        if re.search(pattern, ocr_text, re.IGNORECASE):
+            issues.append({
+                'severity': 'critical',
+                'message': (
+                    f'[Tier 1 — Flavor] Misspelling detected: should be "{correction}". '
+                    'Verify on the actual artwork file.'
+                ),
+            })
+
+    for pattern, correction in _SPELLING_TIER2.items():
         if re.search(pattern, ocr_text, re.IGNORECASE):
             issues.append({
                 'severity': 'warning',
                 'message': (
-                    f'Possible misspelling detected → should be "{correction}". '
-                    'OCR on outlined-text PDFs can produce false positives; verify on the actual artwork file.'
+                    f'[Tier 2 — Call-Out/Claims] Possible misspelling: should be "{correction}". '
+                    'Verify on the actual artwork file.'
                 ),
             })
 
+    for pattern, correction in _SPELLING_TIER3.items():
+        if re.search(pattern, ocr_text, re.IGNORECASE):
+            notes.append(
+                f'[Tier 3 — Body Text] Possible misspelling: should be "{correction}". '
+                'Verify on the actual artwork file.'
+            )
+
     if re.search(r'\bflavour\b', ocr_text, re.IGNORECASE):
-        notes.append('UK spelling "flavour" detected. US market labels should use "flavor".')
+        notes.append('[Tier 3] UK spelling "flavour" detected — US labels should use "flavor".')
 
     if brand_name:
-        notes.append(
-            f"verify brand name '{brand_name}' is spelled correctly throughout"
-        )
+        notes.append(f"Verify brand name '{brand_name}' is spelled correctly throughout.")
 
     return {'issues': issues, 'notes': notes}
 
