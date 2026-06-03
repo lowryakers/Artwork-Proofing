@@ -71,9 +71,10 @@
       <div class="card shadow-sm mb-3">
         <div class="card-header bg-light py-2 d-flex align-items-center gap-2 flex-wrap">
           <span class="small fw-semibold text-truncate flex-grow-1">{{ r.filename }}</span>
-          <div class="d-flex gap-1 ms-auto flex-shrink-0 flex-wrap">
+          <div class="d-flex gap-1 ms-auto flex-shrink-0 flex-wrap align-items-center">
+            <!-- Rotate -->
             <button class="btn btn-sm btn-outline-secondary" onclick="rotate({{ loop.index0 }}, -90)"
-                    title="Rotate 90° counter-clockwise">
+                    title="Rotate 90° counter-clockwise (R)">
               <i class="bi bi-arrow-counterclockwise"></i>
             </button>
             <button class="btn btn-sm btn-outline-secondary" onclick="rotate({{ loop.index0 }}, 90)"
@@ -81,38 +82,55 @@
               <i class="bi bi-arrow-clockwise"></i>
             </button>
             <div class="vr mx-1"></div>
-            <button class="btn btn-sm btn-outline-secondary" onclick="zoom({{ loop.index0 }}, -0.25)"
-                    title="Zoom out">
+            <!-- Zoom -->
+            <button class="btn btn-sm btn-outline-secondary" onclick="zoomStep({{ loop.index0 }}, -1)"
+                    title="Zoom out (−)">
               <i class="bi bi-zoom-out"></i>
             </button>
-            <button class="btn btn-sm btn-outline-secondary" onclick="zoom({{ loop.index0 }}, 0)"
-                    title="Reset zoom &amp; rotation">
-              <i class="bi bi-aspect-ratio"></i>
-            </button>
-            <button class="btn btn-sm btn-outline-secondary" onclick="zoom({{ loop.index0 }}, 0.25)"
-                    title="Zoom in">
+            <span class="badge bg-light text-dark border px-2 zoom-label"
+                  id="zoomLabel{{ loop.index0 }}"
+                  style="font-size:.8rem;min-width:46px;cursor:pointer"
+                  onclick="resetView({{ loop.index0 }})"
+                  title="Click to reset to Fit">Fit</span>
+            <button class="btn btn-sm btn-outline-secondary" onclick="zoomStep({{ loop.index0 }}, 1)"
+                    title="Zoom in (+)">
               <i class="bi bi-zoom-in"></i>
             </button>
-            <span class="badge bg-light text-dark border small ms-1 align-self-center"
-                  id="zoomLabel{{ loop.index0 }}">100%</span>
+            <div class="vr mx-1"></div>
+            <button class="btn btn-sm btn-outline-secondary" onclick="resetView({{ loop.index0 }})"
+                    title="Fit to window (0)">
+              <i class="bi bi-arrows-angle-contract"></i> Fit
+            </button>
+            <button class="btn btn-sm btn-outline-secondary" onclick="zoomActual({{ loop.index0 }})"
+                    title="Actual pixel size (1)">
+              <i class="bi bi-aspect-ratio"></i> 100%
+            </button>
           </div>
         </div>
-        <div class="card-body p-2 bg-dark bg-opacity-10 text-center"
-             style="overflow:auto;max-height:65vh;cursor:grab"
+        <div class="card-body p-0 bg-dark bg-opacity-10 viewer-box"
+             style="overflow:hidden;height:72vh;cursor:grab;user-select:none"
              id="imgBox{{ loop.index0 }}">
           {% if r.img_path %}
-          <div id="imgWrap{{ loop.index0 }}"
-               style="display:inline-block;transform-origin:top center;transition:transform .15s">
+          <div class="imgWrap" id="imgWrap{{ loop.index0 }}"
+               style="width:100%;height:100%;display:flex;align-items:center;justify-content:center;
+                      transform-origin:0 0;will-change:transform">
             <img src="{{ url_for('serve_image', job_id=job_id, filename=r.img_path | basename_filter) }}"
-                 class="rounded shadow"
-                 style="max-width:100%;display:block"
-                 alt="{{ r.filename }}">
+                 class="viewer-img rounded shadow"
+                 id="img{{ loop.index0 }}"
+                 style="max-width:100%;max-height:100%;object-fit:contain;pointer-events:none;display:block"
+                 alt="{{ r.filename }}"
+                 draggable="false">
           </div>
           {% else %}
-          <div class="text-muted py-5">
-            <i class="bi bi-image fs-1 d-block mb-2"></i>Image not available
+          <div class="text-muted d-flex align-items-center justify-content-center h-100">
+            <div class="text-center"><i class="bi bi-image fs-1 d-block mb-2"></i>Image not available</div>
           </div>
           {% endif %}
+        </div>
+        <div class="card-footer bg-light py-1 d-flex justify-content-center gap-3 small text-muted">
+          <span><i class="bi bi-mouse2 me-1"></i>Scroll to zoom</span>
+          <span><i class="bi bi-hand-index me-1"></i>Drag to pan</span>
+          <span><kbd>+</kbd><kbd>−</kbd> zoom &nbsp;·&nbsp; <kbd>R</kbd> rotate &nbsp;·&nbsp; <kbd>0</kbd> fit &nbsp;·&nbsp; <kbd>1</kbd> 100%</span>
         </div>
       </div>
 
@@ -161,44 +179,230 @@
 
 {% block scripts %}
 <script>
-const scales  = {};
-const rotations = {};
+/*
+ * Zoom/pan engine — each panel has independent state.
+ * Transform: translate(tx, ty) applied to the wrap element.
+ * Scale is applied separately via CSS scale().
+ * transform-origin: 0 0 — simplifies all coordinate math.
+ */
+const _vs = {};  // viewport state keyed by panel index
 
+function vs(idx) {
+  if (!_vs[idx]) {
+    _vs[idx] = { scale: 1, tx: 0, ty: 0, rotation: 0,
+                 dragging: false, dragAnchor: null,
+                 pinchStart: null };
+  }
+  return _vs[idx];
+}
+
+function applyTransform(idx) {
+  const s = vs(idx);
+  const wrap = document.getElementById('imgWrap' + idx);
+  const lbl  = document.getElementById('zoomLabel' + idx);
+  if (!wrap) return;
+  // With transform-origin:0 0, translate moves top-left corner of wrap.
+  // We center the content via flexbox inside the wrap, then offset.
+  wrap.style.transform = `translate(${s.tx}px,${s.ty}px) rotate(${s.rotation}deg) scale(${s.scale})`;
+  if (lbl) lbl.textContent = Math.round(s.scale * 100) + '%';
+}
+
+/* ── Zoom to a specific scale, keeping screen point (sx,sy) fixed ── */
+function zoomAt(idx, newScale, sx, sy) {
+  const s   = vs(idx);
+  const box = document.getElementById('imgBox' + idx);
+  if (!box) return;
+  const r   = box.getBoundingClientRect();
+  // Point in wrap-local coords before zoom
+  const lx = (sx - r.left - s.tx) / s.scale;
+  const ly = (sy - r.top  - s.ty) / s.scale;
+  s.scale = Math.max(0.05, Math.min(12, newScale));
+  s.tx = sx - r.left - lx * s.scale;
+  s.ty = sy - r.top  - ly * s.scale;
+  applyTransform(idx);
+}
+
+/* ── Button zoom (step toward/away from center) ── */
+function zoomStep(idx, dir) {
+  const s   = vs(idx);
+  const box = document.getElementById('imgBox' + idx);
+  if (!box) return;
+  const r   = box.getBoundingClientRect();
+  const cx  = r.left + r.width  / 2;
+  const cy  = r.top  + r.height / 2;
+  const steps = [0.1,0.15,0.2,0.25,0.33,0.5,0.67,0.75,1,1.25,1.5,2,2.5,3,4,5,6,8,10,12];
+  let ni = steps.findIndex(v => v > s.scale * (dir > 0 ? 0.99 : 1.01));
+  if (dir < 0) ni = steps.slice(0, steps.findIndex(v => v >= s.scale * 0.99)).length - 1;
+  const ns = steps[Math.max(0, Math.min(steps.length - 1, dir > 0 ? ni : ni))];
+  zoomAt(idx, ns, cx, cy);
+}
+
+/* ── Fit / Reset ── */
+function resetView(idx) {
+  const s = vs(idx);
+  s.scale = 1; s.tx = 0; s.ty = 0; s.rotation = 0;
+  applyTransform(idx);
+  const lbl = document.getElementById('zoomLabel' + idx);
+  if (lbl) lbl.textContent = 'Fit';
+}
+
+/* ── Actual pixel size (1 image pixel = 1 screen pixel) ── */
+function zoomActual(idx) {
+  const img = document.getElementById('img' + idx);
+  if (!img || !img.naturalWidth) return;
+  // Reset first so offsetWidth reflects base CSS size
+  const s = vs(idx);
+  s.scale = 1; s.tx = 0; s.ty = 0;
+  applyTransform(idx);
+  // Ratio of natural px to displayed px at scale=1
+  const ratio = img.naturalWidth / img.offsetWidth;
+  const box   = document.getElementById('imgBox' + idx);
+  const r     = box.getBoundingClientRect();
+  zoomAt(idx, ratio, r.left + r.width / 2, r.top + r.height / 2);
+}
+
+/* ── Rotate ── */
+function rotate(idx, deg) {
+  vs(idx).rotation = (vs(idx).rotation + deg + 360) % 360;
+  applyTransform(idx);
+}
+
+/* ── File selection ── */
 function selectFile(idx) {
   document.querySelectorAll('.file-panel').forEach(p => p.classList.add('d-none'));
   document.querySelectorAll('.file-btn').forEach(b => b.classList.remove('active'));
   document.getElementById('panel' + idx).classList.remove('d-none');
-  document.getElementById('fbtn' + idx).classList.add('active');
+  document.getElementById('fbtn'  + idx).classList.add('active');
 }
 
-function applyTransform(idx) {
-  const s = scales[idx]    ?? 1.0;
-  const r = rotations[idx] ?? 0;
-  const wrap  = document.getElementById('imgWrap' + idx);
-  const label = document.getElementById('zoomLabel' + idx);
-  if (wrap)  wrap.style.transform = `rotate(${r}deg) scale(${s})`;
-  if (label) label.textContent = Math.round(s * 100) + '%';
-}
+/* ── Wire up event listeners after DOM is ready ── */
+document.addEventListener('DOMContentLoaded', () => {
 
-function zoom(idx, delta) {
-  if (delta === 0) { scales[idx] = 1.0; rotations[idx] = 0; }
-  else scales[idx] = Math.max(0.25, Math.min(5, (scales[idx] ?? 1.0) + delta));
-  applyTransform(idx);
-}
-
-function rotate(idx, deg) {
-  rotations[idx] = ((rotations[idx] ?? 0) + deg + 360) % 360;
-  applyTransform(idx);
-}
-
-/* Mouse-wheel zoom */
-document.querySelectorAll('[id^="imgBox"]').forEach(box => {
-  box.addEventListener('wheel', e => {
-    e.preventDefault();
+  document.querySelectorAll('.viewer-box').forEach(box => {
     const idx = parseInt(box.id.replace('imgBox', ''));
-    scales[idx] = Math.max(0.25, Math.min(5, (scales[idx] ?? 1.0) + (e.deltaY < 0 ? 0.15 : -0.15)));
-    applyTransform(idx);
-  }, { passive: false });
+
+    /* Mouse wheel — zoom at cursor */
+    box.addEventListener('wheel', e => {
+      e.preventDefault();
+      const factor = e.deltaY < 0 ? 1.12 : (1 / 1.12);
+      zoomAt(idx, vs(idx).scale * factor, e.clientX, e.clientY);
+    }, { passive: false });
+
+    /* Drag-to-pan — mouse */
+    box.addEventListener('mousedown', e => {
+      if (e.button !== 0) return;
+      e.preventDefault();
+      const s = vs(idx);
+      s.dragging   = true;
+      s.dragAnchor = { x: e.clientX, y: e.clientY, tx: s.tx, ty: s.ty };
+      box.style.cursor = 'grabbing';
+    });
+
+    /* Touch — single-finger pan, two-finger pinch */
+    box.addEventListener('touchstart', e => {
+      const s = vs(idx);
+      if (e.touches.length === 1) {
+        s.dragging   = true;
+        s.dragAnchor = { x: e.touches[0].clientX, y: e.touches[0].clientY, tx: s.tx, ty: s.ty };
+      } else if (e.touches.length === 2) {
+        s.dragging   = false;
+        s.dragAnchor = null;
+        s.pinchStart = {
+          dist:  Math.hypot(e.touches[0].clientX - e.touches[1].clientX,
+                            e.touches[0].clientY - e.touches[1].clientY),
+          scale: s.scale,
+          tx: s.tx, ty: s.ty,
+        };
+      }
+    }, { passive: true });
+
+    box.addEventListener('touchmove', e => {
+      e.preventDefault();
+      const s = vs(idx);
+      if (e.touches.length === 2 && s.pinchStart) {
+        const dist  = Math.hypot(e.touches[0].clientX - e.touches[1].clientX,
+                                 e.touches[0].clientY - e.touches[1].clientY);
+        const midX  = (e.touches[0].clientX + e.touches[1].clientX) / 2;
+        const midY  = (e.touches[0].clientY + e.touches[1].clientY) / 2;
+        zoomAt(idx, s.pinchStart.scale * (dist / s.pinchStart.dist), midX, midY);
+      } else if (e.touches.length === 1 && s.dragging && s.dragAnchor) {
+        s.tx = s.dragAnchor.tx + (e.touches[0].clientX - s.dragAnchor.x);
+        s.ty = s.dragAnchor.ty + (e.touches[0].clientY - s.dragAnchor.y);
+        applyTransform(idx);
+      }
+    }, { passive: false });
+
+    box.addEventListener('touchend', e => {
+      const s = vs(idx);
+      s.dragging   = false;
+      s.dragAnchor = null;
+      if (e.touches.length < 2) s.pinchStart = null;
+    });
+
+    /* Double-click — zoom in 2× at click point */
+    box.addEventListener('dblclick', e => {
+      const s = vs(idx);
+      const newScale = s.scale < 1.8 ? s.scale * 2 : 1;
+      if (newScale === 1) resetView(idx);
+      else zoomAt(idx, newScale, e.clientX, e.clientY);
+    });
+  });
+
+  /* Global mouse move / up for pan */
+  window.addEventListener('mousemove', e => {
+    for (const box of document.querySelectorAll('.viewer-box')) {
+      const idx = parseInt(box.id.replace('imgBox', ''));
+      const s   = vs(idx);
+      if (s.dragging && s.dragAnchor) {
+        s.tx = s.dragAnchor.tx + (e.clientX - s.dragAnchor.x);
+        s.ty = s.dragAnchor.ty + (e.clientY - s.dragAnchor.y);
+        applyTransform(idx);
+      }
+    }
+  });
+
+  window.addEventListener('mouseup', () => {
+    document.querySelectorAll('.viewer-box').forEach(box => {
+      const idx = parseInt(box.id.replace('imgBox', ''));
+      const s   = vs(idx);
+      if (s.dragging) {
+        s.dragging   = false;
+        s.dragAnchor = null;
+        box.style.cursor = 'grab';
+      }
+    });
+  });
+
+  /* Keyboard shortcuts — act on the visible panel */
+  document.addEventListener('keydown', e => {
+    const tag = document.activeElement.tagName;
+    if (tag === 'INPUT' || tag === 'TEXTAREA') return;
+
+    const panelEl = document.querySelector('.file-panel:not(.d-none)');
+    if (!panelEl) return;
+    const idx = parseInt(panelEl.id.replace('panel', ''));
+    const s   = vs(idx);
+
+    const keyMap = {
+      '+': () => zoomStep(idx,  1),
+      '=': () => zoomStep(idx,  1),
+      '-': () => zoomStep(idx, -1),
+      '_': () => zoomStep(idx, -1),
+      '0': () => resetView(idx),
+      '1': () => zoomActual(idx),
+      'r': () => rotate(idx,  90),
+      'R': () => rotate(idx, -90),
+      'ArrowLeft':  () => { s.tx -= 60; applyTransform(idx); },
+      'ArrowRight': () => { s.tx += 60; applyTransform(idx); },
+      'ArrowUp':    () => { s.ty -= 60; applyTransform(idx); },
+      'ArrowDown':  () => { s.ty += 60; applyTransform(idx); },
+    };
+
+    if (keyMap[e.key]) {
+      e.preventDefault();
+      keyMap[e.key]();
+    }
+  });
 });
 </script>
 {% endblock %}
