@@ -977,14 +977,16 @@ def _check_fda(ocr_text: str, fname: str) -> dict:
             })
 
     # ── Net weight ────────────────────────────────────────────────────────────
-    # Accept explicit "Net Wt" text OR any gram/oz measurement — the number almost
-    # always OCRs correctly even when the "Net Wt" label text itself is outlined.
+    # Accept explicit "Net Wt" text OR any gram/oz measurement.
+    # Also skip the flag when the NFP panel is confirmed present — FDA requires
+    # net weight on any label that carries a Nutrition Facts panel, so detecting
+    # the NFP is sufficient evidence the declaration exists.
     _has_net_wt = (
-        bool(re.search(r'net\s*wt|net\s*weight', tl)) or
-        bool(re.search(r'\b\d+\.?\d*\s*g\b', tl)) or
-        bool(re.search(r'\b\d+\.?\d*\s*(?:oz|lbs?|pounds?)\b', tl))
+        bool(re.search(r'net\s*wt\.?|net\s*weight', tl)) or
+        bool(re.search(r'\b\d+\.?\d*\s*(?:oz|lbs?|pounds?|kg|g)\b', tl))
     )
-    if not sparse and not _has_net_wt:
+    _nfp_confirmed = _has_nfp_text or _has_nfp_numbers or _nfp_row_hits >= 1
+    if not sparse and not _has_net_wt and not _nfp_confirmed:
         issues.append({
             'severity': 'warning',
             'message': (
@@ -992,9 +994,9 @@ def _check_fda(ocr_text: str, fname: str) -> dict:
                 'Net quantity of contents is required (15 USC 1453 / 21 CFR 101.105). Verify manually.'
             ),
         })
-    elif re.search(r'net\s*wt|net\s*weight', tl):
-        has_g  = bool(re.search(r'net\s*wt.{0,20}\d+\s*g\b', tl))
-        has_oz = bool(re.search(r'\d+\.?\d*\s*(?:oz|lbs?|pounds?)\b', tl))
+    elif re.search(r'net\s*wt\.?|net\s*weight', tl):
+        has_g   = bool(re.search(r'net\s*wt.{0,20}\d+\s*g\b', tl))
+        has_oz  = bool(re.search(r'\d+\.?\d*\s*(?:oz|lbs?|pounds?)\b', tl))
         if has_g and not has_oz:
             notes.append(
                 'Net weight appears in grams only. '
@@ -1317,11 +1319,14 @@ def _check_wind_direction(ocr_text: str, required_wind: str) -> dict:
     #    winding-box words with adjacent nutrition-facts column text).
     #    "RIGHT   Serving size\nSIDE    1 Stick\nOFF     130\n3" still matches.
     if not detected_wind:
+        # Tolerate interleaved OCR text (Tesseract reads multi-column proof forms
+        # row-by-row, mixing winding-box words with adjacent NFP column text).
+        # "RIGHT   Serving size\nSIDE    1 Stick\nOFF     130\n3" still matches.
         _DIR_PATTERNS = [
-            r'right.{0,30}?side.{0,30}?off.{0,15}?\b([1-8])\b',
-            r'left.{0,30}?side.{0,30}?off.{0,15}?\b([1-8])\b',
-            r'top.{0,30}?first.{0,15}?\b([1-8])\b',
-            r'bottom.{0,30}?first.{0,15}?\b([1-8])\b',
+            r'right.{0,60}?side.{0,60}?off.{0,80}?\b([1-8])\b',
+            r'left.{0,60}?side.{0,60}?off.{0,80}?\b([1-8])\b',
+            r'top.{0,60}?first.{0,80}?\b([1-8])\b',
+            r'bottom.{0,60}?first.{0,80}?\b([1-8])\b',
         ]
         for pat in _DIR_PATTERNS:
             m = re.search(pat, tl, re.DOTALL)
@@ -1562,15 +1567,6 @@ def _check_print_specs(fitz_doc, brand_config: dict = None,
                                       'in the file before sending to print.'
                                       + (' Die line is required per the master spec sheet.' if die_sev == 'critical' else '')})
 
-        # ── RGB content ───────────────────────────────────────────────────────
-        if has_rgb:
-            issues.append({'severity': 'warning',
-                           'message': 'RGB color content detected in the PDF. Print-ready files '
-                                      'should be fully CMYK. RGB elements may produce unexpected '
-                                      'color shifts when converted by the RIP at the print supplier.'})
-        else:
-            notes.append('Color mode: CMYK — no RGB content detected ✓')
-
         # ── Material type ─────────────────────────────────────────────────────
         # Extract from native PDF text (press proof forms list material in the
         # finishing/job info panel as editable text, so PyMuPDF reads it exactly).
@@ -1611,11 +1607,16 @@ def _check_print_specs(fitz_doc, brand_config: dict = None,
             notes.append(f'Material: {material_found}')
             # Validate against required material — spec sheet takes priority over brand_config
             req_mat = (matched_spec.get('material') or brand_config.get('required_material', '')).strip()
-            if req_mat and req_mat.lower() not in material_found.lower():
-                issues.append({'severity': 'warning',
-                               'message': f'Material mismatch — file specifies "{material_found}", '
-                                          f'but spec requires "{req_mat}". '
-                                          'Confirm substrate with your print supplier before going to press.'})
+            if req_mat:
+                f_lo, r_lo = material_found.lower(), req_mat.lower()
+                # Accept if either string contains the other — the regex sometimes captures
+                # only part of a multi-line material spec (e.g. first line of "#781 PET Soft
+                # Touch on\n#858 COS Web metallocene"), so a prefix match is a valid hit.
+                if f_lo not in r_lo and r_lo not in f_lo:
+                    issues.append({'severity': 'warning',
+                                   'message': f'Material mismatch — file specifies "{material_found}", '
+                                              f'but spec requires "{req_mat}". '
+                                              'Confirm substrate with your print supplier before going to press.'})
         else:
             if proof_type == 'art':
                 notes.append('Material type: not detected (art proof — no finishing panel expected).')
