@@ -276,13 +276,14 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
             raise FileNotFoundError(f'pdftoppm produced no PNG for {fname}')
         img_path = os.path.join(work_dir, candidates[0])
 
-    # ── Native PDF text extraction (PyMuPDF) — accurate for non-outlined text ──
+    # ── Native PDF text extraction + keep doc open for Check 7 ─────────────────
+    fitz_doc = None
     native_text = ''
     try:
         import fitz as _fitz
-        _doc = _fitz.open(pdf_path)
-        native_text = '\n'.join(_doc[i].get_text() for i in range(len(_doc)))
-        _doc.close()
+        fitz_doc = _fitz.open(pdf_path)
+        native_text = '\n'.join(fitz_doc[i].get_text() for i in range(len(fitz_doc)))
+        # Keep fitz_doc open — passed to _check_print_specs to avoid double parse
     except Exception:
         pass
 
@@ -327,9 +328,9 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
         checks = {
             'gtin':     _check_gtin(combined_text, fname, gtin_rows, barcode_gtins),
             'eyemark':  _check_eyemark(img, is_film, fname),
-            'spelling': _check_spelling_generic(combined_text, brand_name),
+            'spelling': _check_spelling(combined_text, brand_name=brand_name),
             'fda':      _check_fda_light(combined_text, fname),
-            'specs':    _check_print_specs(pdf_path, brand_config, matched_spec),
+            'specs':    _check_print_specs(fitz_doc, brand_config, matched_spec),
         }
         if is_film or effective_wind:
             checks['wind'] = _check_wind_direction(combined_text, effective_wind)
@@ -340,11 +341,18 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
             'gtin':     _check_gtin(combined_text, fname, gtin_rows, barcode_gtins),
             'nfp':      _check_nfp(combined_text),
             'eyemark':  _check_eyemark(img, is_film, fname),
-            'spelling': _check_spelling(combined_text, fname),
+            'spelling': _check_spelling(combined_text),
             'fda':      _check_fda(combined_text, fname),
-            'specs':    _check_print_specs(pdf_path, brand_config, matched_spec),
+            'specs':    _check_print_specs(fitz_doc, brand_config, matched_spec),
         }
         checks['wind'] = _check_wind_direction(combined_text, effective_wind)
+
+    # Close the PyMuPDF document now that all checks are done
+    if fitz_doc is not None:
+        try:
+            fitz_doc.close()
+        except Exception:
+            pass
 
     all_issues = [i for c in checks.values() for i in c.get('issues', [])]
     crit  = [i for i in all_issues if i['severity'] == 'critical']
@@ -709,10 +717,15 @@ _SPELLING_TIER3 = {
 }
 
 
-def _check_spelling(ocr_text: str, fname: str) -> dict:
+def _check_spelling(ocr_text: str, brand_name: str = 'ProDough') -> dict:
+    """Tiered spelling check. Pass brand_name='ProDough' (default) for ProDough mode,
+    or any other brand name for generic mode (skips ProDough-specific brand patterns).
+    """
     issues, notes = [], []
+    is_prodough = brand_name.strip().lower() == 'prodough'
 
-    for pattern, correction in _SPELLING_TIER1.items():
+    tier1 = _SPELLING_TIER1 if is_prodough else {k: v for k, v in _SPELLING_TIER1.items() if 'dough' not in k}
+    for pattern, correction in tier1.items():
         if re.search(pattern, ocr_text, re.IGNORECASE):
             issues.append({
                 'severity': 'critical',
@@ -742,55 +755,12 @@ def _check_spelling(ocr_text: str, fname: str) -> dict:
     if re.search(r'\bflavour\b', ocr_text, re.IGNORECASE):
         notes.append('[Tier 3] UK spelling "flavour" detected — US labels should use "flavor".')
 
-    notes.append(
-        'ProDough® wordmark: verify capital P, capital D, no space, and the ® symbol appear correctly. '
-        'Social handles (@prodoughshop) and website URLs are excluded from this check.'
-    )
-
-    return {'issues': issues, 'notes': notes}
-
-
-# ── Generic brand spelling check ─────────────────────────────────────────────
-
-def _check_spelling_generic(ocr_text: str, brand_name: str) -> dict:
-    """Tiered spelling check for generic/non-ProDough brands.
-    Uses the same tier dictionaries as the ProDough check, minus ProDough brand patterns.
-    """
-    issues, notes = [], []
-
-    # Tier 1: flavor name misspellings (skip the 'pro dough' brand pattern)
-    tier1_generic = {k: v for k, v in _SPELLING_TIER1.items() if 'dough' not in k}
-    for pattern, correction in tier1_generic.items():
-        if re.search(pattern, ocr_text, re.IGNORECASE):
-            issues.append({
-                'severity': 'critical',
-                'message': (
-                    f'[Tier 1 — Flavor] Misspelling detected: should be "{correction}". '
-                    'Verify on the actual artwork file.'
-                ),
-            })
-
-    for pattern, correction in _SPELLING_TIER2.items():
-        if re.search(pattern, ocr_text, re.IGNORECASE):
-            issues.append({
-                'severity': 'warning',
-                'message': (
-                    f'[Tier 2 — Call-Out/Claims] Possible misspelling: should be "{correction}". '
-                    'Verify on the actual artwork file.'
-                ),
-            })
-
-    for pattern, correction in _SPELLING_TIER3.items():
-        if re.search(pattern, ocr_text, re.IGNORECASE):
-            notes.append(
-                f'[Tier 3 — Body Text] Possible misspelling: should be "{correction}". '
-                'Verify on the actual artwork file.'
-            )
-
-    if re.search(r'\bflavour\b', ocr_text, re.IGNORECASE):
-        notes.append('[Tier 3] UK spelling "flavour" detected — US labels should use "flavor".')
-
-    if brand_name:
+    if is_prodough:
+        notes.append(
+            'ProDough® wordmark: verify capital P, capital D, no space, and the ® symbol appear correctly. '
+            'Social handles (@prodoughshop) and website URLs are excluded from this check.'
+        )
+    elif brand_name:
         notes.append(f"Verify brand name '{brand_name}' is spelled correctly throughout.")
 
     return {'issues': issues, 'notes': notes}
@@ -869,7 +839,7 @@ def _check_fda(ocr_text: str, fname: str) -> dict:
                             r'\bdietary\s*fiber\b', r'\b%\s*dv\b', r'%\s*daily\s*value',
                             r'\bserving\s*size\b', r'\bservings?\s*per\b']
         _nfp_row_hits = sum(1 for p in _nfp_row_signals if re.search(p, tl))
-        if not _has_nfp_text and not _has_nfp_numbers and _nfp_row_hits < 2:
+        if not _has_nfp_text and not _has_nfp_numbers and _nfp_row_hits == 0:
             issues.append({
                 'severity': 'warning',
                 'message': (
@@ -914,8 +884,8 @@ def _check_fda(ocr_text: str, fname: str) -> dict:
     is_whey_product  = any(re.search(p, fname.lower() + ' ' + tl)
                           for p in [r'\bwhey\b', r'protein\s+stick', r'protein\s+powder',
                                     r'\bstick\b', r'\bsticks\b', r'\bpouch\b', r'\bpouches\b'])
-    is_wheat_product = any(re.search(p, fname.lower() + ' ' + tl)
-                          for p in [r'\bpancake\b', r'\bdonut\b', r'\bflour\b', r'\bmix\b'])
+    is_wheat_product = any(re.search(p, fname.lower())
+                          for p in [r'\bpancake\b', r'\bdonut\b', r'\bflour\b', r'\bbreading\b'])
 
     # Milk evidence: explicit word, or milk-derived ingredients that OCR from outlined fonts
     _milk_in_ocr = bool(re.search(
@@ -980,7 +950,7 @@ def _check_fda(ocr_text: str, fname: str) -> dict:
     _has_net_wt = (
         bool(re.search(r'net\s*wt|net\s*weight', tl)) or
         bool(re.search(r'\b\d+\.?\d*\s*g\b', tl)) or
-        bool(re.search(r'\b\d+\.?\d*\s*oz\b', tl))
+        bool(re.search(r'\b\d+\.?\d*\s*(?:oz|lbs?|pounds?)\b', tl))
     )
     if not sparse and not _has_net_wt:
         issues.append({
@@ -992,7 +962,7 @@ def _check_fda(ocr_text: str, fname: str) -> dict:
         })
     elif re.search(r'net\s*wt|net\s*weight', tl):
         has_g  = bool(re.search(r'net\s*wt.{0,20}\d+\s*g\b', tl))
-        has_oz = bool(re.search(r'\d+\.?\d*\s*oz\b', tl))
+        has_oz = bool(re.search(r'\d+\.?\d*\s*(?:oz|lbs?|pounds?)\b', tl))
         if has_g and not has_oz:
             notes.append(
                 'Net weight appears in grams only. '
@@ -1089,15 +1059,29 @@ def _check_fda(ocr_text: str, fname: str) -> dict:
             )
 
     # ── Organic claim ─────────────────────────────────────────────────────────
-    if re.search(r'\borganic\b', tl):
+    # Only flag standalone label-level claims; ingredient qualifiers (e.g., "Organic Brown Rice
+    # Protein") are common in declarations and do not require the USDA seal.
+    _organic_claim_pats = [
+        r'\ball\s+organic\b', r'\b100%\s+organic\b', r'usda\s+organic',
+        r'certified\s+organic', r'made\s+with\s+organic', r'organic\s+ingredients?\b',
+    ]
+    _has_organic_claim = any(re.search(p, tl) for p in _organic_claim_pats)
+    if _has_organic_claim:
         if 'usda organic' not in tl and 'certified organic' not in tl:
             issues.append({
                 'severity': 'warning',
                 'message': (
-                    '"Organic" claim detected without apparent USDA Organic seal or "Certified Organic" language. '
-                    'Organic claims require USDA NOP certification (7 CFR Part 205).'
+                    '"Organic" label claim detected without apparent USDA Organic seal or '
+                    '"Certified Organic" language. Organic claims require USDA NOP certification '
+                    '(7 CFR Part 205).'
                 ),
             })
+    elif re.search(r'\borganic\b', tl):
+        notes.append(
+            '"Organic" word detected — likely as an ingredient qualifier '
+            '(e.g., "Organic Whey Protein"). If used as a front-panel label claim, '
+            'USDA NOP certification (7 CFR Part 205) is required.'
+        )
 
     # ── Nutrient content claims ───────────────────────────────────────────────
     if re.search(r'high\s+protein|excellent\s+source\s+of\s+protein', tl):
@@ -1222,7 +1206,7 @@ def _check_fda_light(ocr_text: str, fname: str) -> dict:
     _has_net_wt = (
         bool(re.search(r'net\s*wt|net\s*weight', tl)) or
         bool(re.search(r'\b\d+\.?\d*\s*g\b', tl)) or
-        bool(re.search(r'\b\d+\.?\d*\s*oz\b', tl))
+        bool(re.search(r'\b\d+\.?\d*\s*(?:oz|lbs?|pounds?)\b', tl))
     )
     if not sparse and not _has_net_wt:
         issues.append({
@@ -1234,7 +1218,7 @@ def _check_fda_light(ocr_text: str, fname: str) -> dict:
         })
     elif re.search(r'net\s*wt|net\s*weight', tl):
         has_g  = bool(re.search(r'net\s*wt.{0,20}\d+\s*g\b', tl))
-        has_oz = bool(re.search(r'\d+\.?\d*\s*oz\b', tl))
+        has_oz = bool(re.search(r'\d+\.?\d*\s*(?:oz|lbs?|pounds?)\b', tl))
         if has_g and not has_oz:
             notes.append(
                 'Net weight appears in grams only. '
@@ -1359,59 +1343,55 @@ _PROCESS_CS = frozenset([
 ])
 
 
-def _extract_spot_colors(doc) -> set:
-    """
-    Scan every xref object for /Separation and /DeviceN colorspace arrays
-    and return a set of human-readable spot color names.
+def _scan_pdf_structure(doc) -> tuple:
+    """Single O(N) xref pass — returns (spot_colors, ocg_names, has_rgb).
+    Replaces the three separate _extract_spot_colors / _get_ocg_names / RGB loops.
     """
     spots = set()
+    ocg_names = []
+    has_rgb = False
+
     for xref in range(1, doc.xref_length()):
         try:
             obj = doc.xref_object(xref, compressed=False)
         except Exception:
             continue
-        # /Separation /ColorName ...
+
+        # Spot / Pantone colors — /Separation and /DeviceN
         for m in re.finditer(r'/Separation\s+/([^\s/\[\]()<>{}]+)', obj):
             name = m.group(1)
             if name.lower() not in _PROCESS_CS:
                 spots.add(name)
-        # /DeviceN [/Color1 /Color2 ...] — pick non-process names
         for m in re.finditer(r'/DeviceN\s+\[([^\]]+)\]', obj):
             for nm in re.finditer(r'/([^\s/\[\]()<>{}]+)', m.group(1)):
                 name = nm.group(1)
                 if name.lower() not in _PROCESS_CS:
                     spots.add(name)
-    return spots
+
+        # Optional Content Groups (layers)
+        if '/Type /OCG' in obj:
+            m = re.search(r'/Name\s*\(([^)]+)\)', obj)
+            if not m:
+                m = re.search(r'/Name\s+<([^>]+)>', obj)
+            if m:
+                ocg_names.append(m.group(1))
+
+        # RGB content flag
+        if not has_rgb and ('/DeviceRGB' in obj or '/CalRGB' in obj):
+            has_rgb = True
+
+    return sorted(spots), ocg_names, has_rgb
 
 
-def _get_ocg_names(doc) -> list:
-    """Return Optional Content Group (layer) names from the document."""
-    names = []
-    try:
-        for xref in range(1, doc.xref_length()):
-            try:
-                obj = doc.xref_object(xref, compressed=False)
-            except Exception:
-                continue
-            if '/Type /OCG' in obj:
-                m = re.search(r'/Name\s*\(([^)]+)\)', obj)
-                if not m:
-                    m = re.search(r'/Name\s+<([^>]+)>', obj)  # hex string
-                if m:
-                    names.append(m.group(1))
-    except Exception:
-        pass
-    return names
-
-
-def _check_print_specs(pdf_path: str, brand_config: dict = None,
+def _check_print_specs(fitz_doc, brand_config: dict = None,
                        matched_spec: dict = None) -> dict:
     """
-    Read actual PDF vector data using PyMuPDF.
+    Read actual PDF vector data using an already-open PyMuPDF document.
     Checks dimensions, bleed, spot/Pantone colors, die lines, and RGB content.
     No OCR — all results are exact.
     If matched_spec is provided (from the Master SKU Spec Sheet), its values
     override brand_config for dimension/material/spot color validation.
+    fitz_doc is managed by the caller — this function does NOT close it.
     """
     issues, notes = [], []
     brand_config = brand_config or {}
@@ -1422,16 +1402,10 @@ def _check_print_specs(pdf_path: str, brand_config: dict = None,
     spot_colors = []
     mb_w = mb_h = tb_w = tb_h = bleed_mm = None
 
-    try:
-        import fitz
-    except ImportError:
-        return {'issues': [], 'notes': ['PDF structure check skipped — pymupdf not installed.']}
+    if fitz_doc is None:
+        return {'issues': [], 'notes': ['PDF structure check skipped — PyMuPDF not available.']}
 
-    try:
-        doc = fitz.open(pdf_path)
-    except Exception as e:
-        return {'issues': [{'severity': 'warning',
-                            'message': f'Could not open PDF for structure analysis: {e}'}], 'notes': []}
+    doc = fitz_doc
 
     try:
         page = doc[0]
@@ -1503,8 +1477,10 @@ def _check_print_specs(pdf_path: str, brand_config: dict = None,
             else:
                 notes.append(f'Dimensions match spec: {spec_w} × {spec_h} mm ✓')
 
+        # ── Single xref pass: spot colors, OCG layers, RGB flag ──────────────
+        spot_colors, ocg_names, has_rgb = _scan_pdf_structure(doc)
+
         # ── Spot / Pantone colors ─────────────────────────────────────────────
-        spot_colors = sorted(_extract_spot_colors(doc))
         if spot_colors:
             notes.append(f'Spot colors in file: {", ".join(spot_colors)}')
         else:
@@ -1517,7 +1493,6 @@ def _check_print_specs(pdf_path: str, brand_config: dict = None,
             spot_lower = {c.lower() for c in spot_colors}
             for req in req_spots:
                 if req.lower() not in spot_lower:
-                    # Partial match: any spot color contains the required name
                     if not any(req.lower() in c.lower() for c in spot_colors):
                         issues.append({'severity': 'warning',
                                        'message': f'Required spot color "{req}" (from spec sheet) '
@@ -1527,7 +1502,6 @@ def _check_print_specs(pdf_path: str, brand_config: dict = None,
         # ── Die line detection ────────────────────────────────────────────────
         die_spots  = [c for c in spot_colors
                       if any(kw in c.lower().replace('_', ' ') for kw in _DIELINE_KEYWORDS)]
-        ocg_names  = _get_ocg_names(doc)
         die_layers = [l for l in ocg_names
                       if any(kw in l.lower().replace('_', ' ') for kw in _DIELINE_KEYWORDS)]
 
@@ -1545,15 +1519,6 @@ def _check_print_specs(pdf_path: str, brand_config: dict = None,
                                       + (' Die line is required per the master spec sheet.' if die_sev == 'critical' else '')})
 
         # ── RGB content ───────────────────────────────────────────────────────
-        has_rgb = False
-        for xref in range(1, doc.xref_length()):
-            try:
-                obj = doc.xref_object(xref, compressed=False)
-                if '/DeviceRGB' in obj or '/CalRGB' in obj:
-                    has_rgb = True
-                    break
-            except Exception:
-                continue
         if has_rgb:
             issues.append({'severity': 'warning',
                            'message': 'RGB color content detected in the PDF. Print-ready files '
@@ -1622,8 +1587,6 @@ def _check_print_specs(pdf_path: str, brand_config: dict = None,
 
     except Exception as e:
         issues.append({'severity': 'warning', 'message': f'Print spec analysis error: {e}'})
-    finally:
-        doc.close()
 
     return {
         'issues': issues,
