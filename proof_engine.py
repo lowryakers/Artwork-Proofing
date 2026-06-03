@@ -791,16 +791,20 @@ def _check_fda(ocr_text: str, fname: str) -> dict:
         # (calories + protein both present → panel almost certainly exists even if
         #  "Nutrition Facts" header text was outlined and OCR-unreadable)
         _has_nfp_text    = 'nutrition facts' in tl or 'supplement facts' in tl
+        # Either word alone is strong signal — outlined text often drops the "Facts" header
+        # but OCR still reads nutritional values / row labels from the panel
         _has_nfp_numbers = (
-            bool(re.search(r'\bcalories?\b', tl)) and
+            bool(re.search(r'\bcalories?\b', tl)) or
             bool(re.search(r'\bprotein\b', tl))
         )
-        # Additional NFP signals: any two of these typical NFP row labels
+        # Any single typical NFP row label is sufficient evidence the panel exists
         _nfp_row_signals = [r'\btotal\s*fat\b', r'\bsodium\b', r'\bcarbohydrate\b',
                             r'\bdietary\s*fiber\b', r'\b%\s*dv\b', r'%\s*daily\s*value',
-                            r'\bserving\s*size\b', r'\bservings?\s*per\b']
+                            r'\bserving\s*size\b', r'\bservings?\s*per\b',
+                            r'\btotal\s*carb\b', r'\bsaturated\s*fat\b',
+                            r'\btrans\s*fat\b', r'\bcholesterol\b', r'\bsugars?\b']
         _nfp_row_hits = sum(1 for p in _nfp_row_signals if re.search(p, tl))
-        if not _has_nfp_text and not _has_nfp_numbers and _nfp_row_hits < 2:
+        if not _has_nfp_text and not _has_nfp_numbers and _nfp_row_hits == 0:
             issues.append({
                 'severity': 'warning',
                 'message': (
@@ -906,12 +910,11 @@ def _check_fda(ocr_text: str, fname: str) -> dict:
             })
 
     # ── Net weight ────────────────────────────────────────────────────────────
-    # Accept explicit "Net Wt" text OR any gram/oz measurement — the number almost
-    # always OCRs correctly even when the "Net Wt" label text itself is outlined.
+    # Accept "Net Wt" text OR any gram/oz/lb measurement — numbers usually OCR
+    # even when the "Net Wt" label is outlined.
     _has_net_wt = (
-        bool(re.search(r'net\s*wt|net\s*weight', tl)) or
-        bool(re.search(r'\b\d+\.?\d*\s*g\b', tl)) or
-        bool(re.search(r'\b\d+\.?\d*\s*oz\b', tl))
+        bool(re.search(r'net\s*wt\.?|net\s*weight', tl)) or
+        bool(re.search(r'\b\d+\.?\d*\s*(?:oz|lbs?|pounds?|kg|g)\b', tl))
     )
     if not sparse and not _has_net_wt:
         issues.append({
@@ -921,10 +924,11 @@ def _check_fda(ocr_text: str, fname: str) -> dict:
                 'Net quantity of contents is required (15 USC 1453 / 21 CFR 101.105). Verify manually.'
             ),
         })
-    elif re.search(r'net\s*wt|net\s*weight', tl):
-        has_g  = bool(re.search(r'net\s*wt.{0,20}\d+\s*g\b', tl))
-        has_oz = bool(re.search(r'\d+\.?\d*\s*oz\b', tl))
-        if has_g and not has_oz:
+    elif re.search(r'net\s*wt\.?|net\s*weight', tl):
+        has_g   = bool(re.search(r'net\s*wt.{0,20}\d+\s*g\b', tl))
+        has_oz  = bool(re.search(r'\d+\.?\d*\s*oz\b', tl))
+        has_lbs = bool(re.search(r'\d+\.?\d*\s*lbs?\b', tl))
+        if has_g and not has_oz and not has_lbs:
             notes.append(
                 'Net weight appears in grams only. '
                 'US regulations generally require both metric (g) and US customary (oz) units. '
@@ -1151,9 +1155,8 @@ def _check_fda_light(ocr_text: str, fname: str) -> dict:
 
     # ── Net weight ────────────────────────────────────────────────────────────
     _has_net_wt = (
-        bool(re.search(r'net\s*wt|net\s*weight', tl)) or
-        bool(re.search(r'\b\d+\.?\d*\s*g\b', tl)) or
-        bool(re.search(r'\b\d+\.?\d*\s*oz\b', tl))
+        bool(re.search(r'net\s*wt\.?|net\s*weight', tl)) or
+        bool(re.search(r'\b\d+\.?\d*\s*(?:oz|lbs?|pounds?|kg|g)\b', tl))
     )
     if not sparse and not _has_net_wt:
         issues.append({
@@ -1163,10 +1166,11 @@ def _check_fda_light(ocr_text: str, fname: str) -> dict:
                 'Net quantity of contents is required (15 USC 1453 / 21 CFR 101.105). Verify manually.'
             ),
         })
-    elif re.search(r'net\s*wt|net\s*weight', tl):
-        has_g  = bool(re.search(r'net\s*wt.{0,20}\d+\s*g\b', tl))
-        has_oz = bool(re.search(r'\d+\.?\d*\s*oz\b', tl))
-        if has_g and not has_oz:
+    elif re.search(r'net\s*wt\.?|net\s*weight', tl):
+        has_g   = bool(re.search(r'net\s*wt.{0,20}\d+\s*g\b', tl))
+        has_oz  = bool(re.search(r'\d+\.?\d*\s*oz\b', tl))
+        has_lbs = bool(re.search(r'\d+\.?\d*\s*lbs?\b', tl))
+        if has_g and not has_oz and not has_lbs:
             notes.append(
                 'Net weight appears in grams only. '
                 'US regulations generally require both metric (g) and US customary (oz) units. '
@@ -1223,8 +1227,8 @@ def _check_wind_direction(ocr_text: str, required_wind: str) -> dict:
     import re as _re
     detected_wind = None
 
-    # 1. Explicit "Wind N" (tight match — number right after keyword, no intervening text)
-    m = _re.search(r'\bwind\s*([1-8])\b', tl)
+    # 1. Explicit "Wind N" or "Winding N" or "Winding Direction: N"
+    m = _re.search(r'\bwind(?:ing)?\s*(?:direction\s*)?[:\-]?\s*([1-8])\b', tl)
     if m:
         detected_wind = m.group(1)
 
@@ -1445,15 +1449,26 @@ def _check_print_specs(pdf_path: str, brand_config: dict = None,
         req_spots_raw = matched_spec.get('spot_colors', '')
         if req_spots_raw:
             req_spots = [s.strip() for s in req_spots_raw.split(',') if s.strip()]
-            spot_lower = {c.lower() for c in spot_colors}
+
+            def _norm_pantone(name: str) -> str:
+                # Strip trailing Pantone finish suffix (C=coated, U=uncoated, M=matte, CP, EC, etc.)
+                return re.sub(r'\s+[CUMcum]{1,2}P?\s*$', '', name.strip()).strip().lower()
+
+            def _spot_matches(req: str, file_colors: list) -> bool:
+                req_n = _norm_pantone(req)
+                for c in file_colors:
+                    c_n = _norm_pantone(c)
+                    # Exact normalized match, or either side is a substring of the other
+                    if req_n == c_n or req_n in c_n or c_n in req_n:
+                        return True
+                return False
+
             for req in req_spots:
-                if req.lower() not in spot_lower:
-                    # Partial match: any spot color contains the required name
-                    if not any(req.lower() in c.lower() for c in spot_colors):
-                        issues.append({'severity': 'warning',
-                                       'message': f'Required spot color "{req}" (from spec sheet) '
-                                                  'not found in the PDF. Verify color setup with '
-                                                  'your designer before sending to print.'})
+                if not _spot_matches(req, spot_colors):
+                    issues.append({'severity': 'warning',
+                                   'message': f'Required spot color "{req}" (from spec sheet) '
+                                              'not found in the PDF. Verify color setup with '
+                                              'your designer before sending to print.'})
 
         # ── Die line detection ────────────────────────────────────────────────
         die_spots  = [c for c in spot_colors
@@ -1499,22 +1514,33 @@ def _check_print_specs(pdf_path: str, brand_config: dict = None,
         pdf_text = '\n'.join(doc[i].get_text() for i in range(len(doc)))
         material_found = None
 
-        # Match "Material Order: ..." or "Material: ..." lines
+        _MATERIAL_KWS = ['pet', 'opp', 'bopp', 'foil', 'metallocene', 'soft touch',
+                         'matte', 'gloss', 'kraft', 'paper', 'film', 'substrate',
+                         'label', 'liner', 'shrink', 'laminate']
+
+        def _looks_like_material(text: str) -> bool:
+            tl2 = text.lower()
+            return bool(re.search(r'#\d{3,4}', text)) or any(kw in tl2 for kw in _MATERIAL_KWS)
+
+        # First try an explicit material code like "#781 PET Soft Touch on #858..."
         m = re.search(
-            r'material\s*(?:order\s*)?[:\-]?\s*([^\n]{5,120})',
+            r'(#\d{3,4}[^\n]{5,80}(?:pet|opp|bopp|pe|pp|foil|metallocene|'
+            r'soft\s*touch|matte|gloss|kraft|paper)[^\n]{0,60})',
             pdf_text, re.IGNORECASE
         )
         if m:
-            material_found = m.group(1).strip().rstrip('.,;')
+            material_found = m.group(1).strip()
         else:
-            # Fallback: look for material codes like "#781 PET Soft Touch"
+            # Fallback: "Material Order: ..." or "Material: ..." lines
             m = re.search(
-                r'(#\d{3,4}[^\n]{5,80}(?:pet|opp|bopp|pe|pp|foil|metallocene|'
-                r'soft\s*touch|matte|gloss|kraft|paper)[^\n]{0,60})',
+                r'material\s*(?:order\s*)?[:\-]?\s*([^\n]{5,120})',
                 pdf_text, re.IGNORECASE
             )
             if m:
-                material_found = m.group(1).strip()
+                candidate = m.group(1).strip().rstrip('.,;')
+                # Only accept if it actually looks like a material (reject status stamps like "APPROVED")
+                if _looks_like_material(candidate):
+                    material_found = candidate
 
         if material_found:
             # Clean up: truncate if the regex grabbed too much surrounding text
