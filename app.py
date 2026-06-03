@@ -32,6 +32,7 @@ CHECK_LABELS = {
     'eyemark':  'Eyemark Contrast',
     'spelling': 'Spelling / Brand Name',
     'fda':      'FDA Audit Risk',
+    'wind':     'Wind Direction',
     'specs':    'Print Specs',
 }
 

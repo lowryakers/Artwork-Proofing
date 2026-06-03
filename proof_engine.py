@@ -222,8 +222,9 @@ _SPEC_GENERIC = {
 }
 
 
-def _match_spec_row(gtin_list: list, fname: str, spec_rows: list) -> dict:
-    """Match a spec row by GTIN first, then by filename keyword matching."""
+def _match_spec_row(gtin_list: list, fname: str, spec_rows: list,
+                    pdf_text: str = '') -> dict:
+    """Match a spec row by GTIN first, then by PDF text + filename keyword matching."""
     if not spec_rows:
         return {}
 
@@ -234,8 +235,9 @@ def _match_spec_row(gtin_list: list, fname: str, spec_rows: list) -> dict:
             if str(row.get('gtin', '')).strip() == gtin_str:
                 return row
 
-    # 2. Keyword match against filename
+    # 2. Keyword match — check PDF text first, fall back to filename
     fname_lower = fname.lower()
+    pdf_lower = pdf_text.lower()
     for row in spec_rows:
         flavor = str(row.get('flavor', '')).strip().lower()
         if not flavor:
@@ -244,7 +246,7 @@ def _match_spec_row(gtin_list: list, fname: str, spec_rows: list) -> dict:
         keywords = [w for w in flavor_words if w not in _SPEC_GENERIC and len(w) > 1]
         if not keywords:
             continue
-        if all(kw in fname_lower for kw in keywords):
+        if all(kw in pdf_lower or kw in fname_lower for kw in keywords):
             return row
 
     return {}
@@ -312,7 +314,7 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
     brand_mode = brand_config.get('brand_mode', 'prodough')
 
     # ── Match spec row from sheet ────────────────────────────────────────────
-    matched_spec = _match_spec_row(barcode_gtins, fname, spec_rows or [])
+    matched_spec = _match_spec_row(barcode_gtins, fname, spec_rows or [], combined_text)
 
     # Wind direction: form override > spec sheet > nothing
     effective_wind = brand_config.get('wind_direction', '').strip()
@@ -1219,13 +1221,10 @@ def _check_wind_direction(ocr_text: str, required_wind: str) -> dict:
 
     req_label = _WIND_LABELS[required_wind]
     tl = ocr_text.lower()
-    is_inwound = required_wind in ('5', '6', '7', '8')
-
-    import re as _re
     detected_wind = None
 
     # 1. Explicit "Wind N" (tight match — number right after keyword, no intervening text)
-    m = _re.search(r'\bwind\s*([1-8])\b', tl)
+    m = re.search(r'\bwind\s*([1-8])\b', tl)
     if m:
         detected_wind = m.group(1)
 
@@ -1243,14 +1242,14 @@ def _check_wind_direction(ocr_text: str, required_wind: str) -> dict:
             r'bottom.{0,30}?first.{0,15}?\b([1-8])\b',
         ]
         for pat in _DIR_PATTERNS:
-            m = _re.search(pat, tl, _re.DOTALL)
+            m = re.search(pat, tl, re.DOTALL)
             if m:
                 detected_wind = m.group(1)
                 break
 
     # 3. "Outwound N" / "Inwound N"
     if not detected_wind:
-        m = _re.search(r'\b(in|out)wound\s*([1-8])\b', tl)
+        m = re.search(r'\b(in|out)wound\s*([1-8])\b', tl)
         if m:
             detected_wind = m.group(2)
 
@@ -1353,6 +1352,9 @@ def _check_print_specs(pdf_path: str, brand_config: dict = None,
     matched_spec = matched_spec or {}
     proof_type = brand_config.get('proof_type', 'press')
     pts_to_mm = 25.4 / 72
+    # Initialize so the return dict is always well-formed even if an exception fires early
+    spot_colors = []
+    mb_w = mb_h = tb_w = tb_h = bleed_mm = None
 
     try:
         import fitz
@@ -1543,17 +1545,7 @@ def _check_print_specs(pdf_path: str, brand_config: dict = None,
             notes.append(f'Matched spec: {flavor_label}{sku_part}')
             if matched_spec.get('wind_direction'):
                 wd = matched_spec['wind_direction']
-                _WIND_LABELS_LOCAL = {
-                    '1': 'Wind 1 — Outwound, Across roll, Top first',
-                    '2': 'Wind 2 — Outwound, Across roll, Bottom first',
-                    '3': 'Wind 3 — Outwound, Around roll, Right side first',
-                    '4': 'Wind 4 — Outwound, Around roll, Left side first',
-                    '5': 'Wind 5 — Inwound, Across roll, Top first',
-                    '6': 'Wind 6 — Inwound, Across roll, Bottom first',
-                    '7': 'Wind 7 — Inwound, Around roll, Right side first',
-                    '8': 'Wind 8 — Inwound, Around roll, Left side first',
-                }
-                notes.append(f'Expected wind direction from spec sheet: {_WIND_LABELS_LOCAL.get(wd, wd)}')
+                notes.append(f'Expected wind direction from spec sheet: {_WIND_LABELS.get(wd, wd)}')
 
         # ── Page count ────────────────────────────────────────────────────────
         if len(doc) > 1:
@@ -1570,10 +1562,10 @@ def _check_print_specs(pdf_path: str, brand_config: dict = None,
     return {
         'issues': issues,
         'notes': notes,
-        'spot_colors': spot_colors if 'spot_colors' in dir() else [],
+        'spot_colors': spot_colors,
         'dimensions': {
-            'mediabox_mm': [mb_w, mb_h] if 'mb_w' in dir() else None,
-            'trimbox_mm':  [tb_w, tb_h] if tb_w else None,
+            'mediabox_mm': [mb_w, mb_h] if mb_w is not None else None,
+            'trimbox_mm':  [tb_w, tb_h] if tb_w is not None else None,
             'bleed_mm':    bleed_mm,
         },
     }
