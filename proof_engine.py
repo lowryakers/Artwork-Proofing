@@ -16,6 +16,7 @@ import json
 import subprocess
 import threading
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -141,28 +142,33 @@ load_jobs_from_disk()
 def _process_job(job_id: str, pdf_paths: list, gtin_rows: list, work_dir: str,
                  brand_config: dict = None, spec_rows: list = None):
     _update_job(job_id, status='running')
-    results = []
     total = len(pdf_paths)
+    results = [None] * total
+    completed = [0]  # mutable counter shared across threads
 
+    def _run_one(i: int, pdf_path: str):
+        fname = os.path.basename(pdf_path)
+        try:
+            return i, _proof_single(pdf_path, gtin_rows, work_dir,
+                                    brand_config=brand_config, spec_rows=spec_rows)
+        except Exception as exc:
+            return i, {
+                'filename': fname, 'error': str(exc), 'checks': {},
+                'severity': 'error', 'critical_count': 0,
+                'warning_count': 0, 'info_count': 0, 'img_web': None,
+            }
+
+    max_workers = min(total, max(1, (os.cpu_count() or 2)))
     try:
-        for i, pdf_path in enumerate(pdf_paths):
-            fname = os.path.basename(pdf_path)
-            _update_job(job_id, current_file=fname, progress=int(i / total * 90))
-            try:
-                result = _proof_single(pdf_path, gtin_rows, work_dir, brand_config=brand_config,
-                                       spec_rows=spec_rows)
-            except Exception as exc:
-                result = {
-                    'filename': fname,
-                    'error': str(exc),
-                    'checks': {},
-                    'severity': 'error',
-                    'critical_count': 0,
-                    'warning_count': 0,
-                    'info_count': 0,
-                    'img_web': None,
-                }
-            results.append(result)
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = {pool.submit(_run_one, i, p): i for i, p in enumerate(pdf_paths)}
+            for fut in as_completed(futures):
+                i, result = fut.result()
+                results[i] = result
+                completed[0] += 1
+                _update_job(job_id,
+                            current_file=f'{completed[0]} of {total} file{"s" if total > 1 else ""} done',
+                            progress=int(completed[0] / total * 90))
 
         summary = _build_summary(results)
         _update_job(job_id, status='done', progress=100,
@@ -260,10 +266,10 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
     fname = os.path.basename(pdf_path)
     stem = Path(pdf_path).stem
 
-    # ── Convert PDF → PNG ────────────────────────────────────────────────────
+    # ── Convert PDF → PNG at 200 DPI (36% fewer pixels than 250 DPI) ──────────
     img_prefix = os.path.join(work_dir, stem)
     subprocess.run(
-        ['pdftoppm', '-r', '250', '-png', '-singlefile', pdf_path, img_prefix],
+        ['pdftoppm', '-r', '200', '-png', '-singlefile', pdf_path, img_prefix],
         capture_output=True, check=True, timeout=120,
     )
     img_path = img_prefix + '.png'
@@ -287,16 +293,20 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
     except Exception:
         pass
 
-    # ── OCR (Tesseract) — catches outlined/converted text ────────────────────
+    # ── OCR (Tesseract) — skip when native text is rich enough (saves 2-4s) ──
+    # Print-ready PDFs often have all text converted to outlines; those return
+    # near-zero native text and need OCR.  Live-text PDFs return 100+ words
+    # and OCR would only add noise and latency.
     ocr_text = ''
-    try:
-        r = subprocess.run(
-            ['tesseract', img_path, 'stdout', '--oem', '3', '--psm', '3', '-l', 'eng'],
-            capture_output=True, text=True, timeout=120,
-        )
-        ocr_text = r.stdout
-    except Exception:
-        pass
+    if len(native_text.split()) < 100:
+        try:
+            r = subprocess.run(
+                ['tesseract', img_path, 'stdout', '--oem', '3', '--psm', '3', '-l', 'eng'],
+                capture_output=True, text=True, timeout=120,
+            )
+            ocr_text = r.stdout
+        except Exception:
+            pass
 
     # Merge: native text is authoritative where it exists; OCR fills the gaps
     combined_text = native_text + '\n' + ocr_text
@@ -309,8 +319,26 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
         except Exception:
             pass
 
-    # Scan barcode stripes directly from rendered image (primary GTIN source)
+    # Scan barcode stripes — primary GTIN source
     barcode_gtins = _scan_barcodes(img_path)
+    if not barcode_gtins:
+        # 200 DPI sometimes misses dense or small barcodes — retry at 350 DPI
+        hi_prefix = img_prefix + '_hirez'
+        try:
+            subprocess.run(
+                ['pdftoppm', '-r', '350', '-png', '-singlefile', pdf_path, hi_prefix],
+                capture_output=True, timeout=60,
+            )
+            hi_path = hi_prefix + '.png'
+            if not os.path.exists(hi_path):
+                cands = sorted(f for f in os.listdir(work_dir)
+                               if f.startswith(os.path.basename(hi_prefix)) and f.endswith('.png'))
+                if cands:
+                    hi_path = os.path.join(work_dir, cands[0])
+            if os.path.exists(hi_path):
+                barcode_gtins = _scan_barcodes(hi_path)
+        except Exception:
+            pass
 
     brand_mode = brand_config.get('brand_mode', 'prodough')
 

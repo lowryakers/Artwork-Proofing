@@ -167,14 +167,14 @@
 {% macro _file_result(r, job_id, idx, dismissals) %}
 <div class="row g-4">
 
-  <!-- Artwork image -->
-  <div class="col-lg-5">
-    <div class="card shadow-sm h-100">
-      <div class="card-header small fw-semibold bg-light py-2">Rendered Artwork (200 DPI)</div>
+  <!-- Artwork image — sticky so it stays visible while scrolling checks -->
+  <div class="col-lg-5 artwork-col">
+    <div class="card shadow-sm">
+      <div class="card-header small fw-semibold bg-light py-2">Rendered Artwork</div>
       <div class="card-body p-2 text-center bg-dark bg-opacity-10">
         {% if r.img_path %}
           <img src="{{ url_for('serve_image', job_id=job_id, filename=r.img_path | basename_filter) }}"
-               class="img-fluid rounded shadow-sm" style="max-height:640px;object-fit:contain"
+               class="img-fluid rounded shadow-sm" style="max-height:78vh;object-fit:contain"
                alt="{{ r.filename }}">
         {% else %}
           <div class="text-muted py-5">
@@ -191,8 +191,8 @@
       <div class="alert alert-danger"><strong>Processing error:</strong> {{ r.error }}</div>
     {% else %}
 
-    <!-- File header -->
-    <div class="d-flex align-items-center gap-2 mb-3">
+    <!-- File header + Issues-Only toggle -->
+    <div class="d-flex align-items-center gap-2 mb-3 flex-wrap">
       {{ _sev_icon(r.severity) }}
       <span class="fw-bold text-truncate">{{ r.filename }}</span>
       {% if r.severity == 'critical' %}
@@ -204,13 +204,25 @@
       {% elif r.severity == 'info' %}
         <span class="badge bg-info text-dark ms-auto">{{ r.info_count }} notes</span>
       {% endif %}
+      <button class="btn btn-outline-secondary btn-sm py-0 ms-1 filter-toggle"
+              onclick="toggleIssuesOnly(this)" title="Hide notes and passing checks">
+        <i class="bi bi-funnel me-1"></i>Issues Only
+      </button>
     </div>
 
+    <div class="checks-container">
     {{ _check_card('1','GTIN / Barcode',        'bi-upc-scan',           r.checks.gtin,     idx, r.filename, 'gtin',     dismissals) }}
+    {% if r.checks.get('nfp') is not none %}
     {{ _check_card('2','Front Call-Out vs NFP', 'bi-clipboard2-pulse',   r.checks.nfp,      idx, r.filename, 'nfp',      dismissals) }}
+    {% endif %}
     {{ _check_card('3','Eyemark Contrast',       'bi-eye',                r.checks.eyemark,  idx, r.filename, 'eyemark',  dismissals) }}
     {{ _check_card('4','Spelling / Brand Name', 'bi-spellcheck',         r.checks.spelling, idx, r.filename, 'spelling', dismissals) }}
     {{ _check_card('5','FDA Audit Risk',         'bi-shield-exclamation', r.checks.fda,      idx, r.filename, 'fda',      dismissals, always_open=true) }}
+    {% if r.checks.get('wind') is not none %}
+    {{ _check_card('6','Wind Direction',         'bi-arrow-repeat',       r.checks.wind,     idx, r.filename, 'wind',     dismissals) }}
+    {% endif %}
+    {{ _check_card('7','Print Specifications',  'bi-rulers',             r.checks.specs,    idx, r.filename, 'specs',    dismissals) }}
+    </div>
 
     <!-- Matched spec info -->
     {% if r.matched_spec %}
@@ -251,7 +263,7 @@
 {% set card_id = 'chk' ~ num ~ '_' ~ idx %}
 
 <div class="card mb-2 check-card
-  {% if crits %}border-danger{% elif warns %}border-warning{% else %}border-0{% endif %} shadow-sm">
+  {% if crits %}border-danger check-has-issues{% elif warns %}border-warning check-has-issues{% else %}border-0{% endif %} shadow-sm">
 
   <div class="card-header d-flex align-items-center gap-2 py-2
     {% if crits %}bg-danger bg-opacity-10{% elif warns %}bg-warning bg-opacity-10{% else %}bg-light{% endif %}"
@@ -292,7 +304,7 @@
       {% endfor %}
 
       {% if notes %}
-      <div class="text-muted mt-1">
+      <div class="check-notes text-muted mt-1">
         {% for n in notes %}
         <div class="d-flex gap-2 mb-1">
           <i class="bi bi-dot flex-shrink-0"></i><span>{{ n }}</span>
@@ -326,6 +338,16 @@
 
 
 {% block scripts %}
+<style>
+  /* Sticky artwork panel — image stays in view while scrolling check cards */
+  @media (min-width: 992px) {
+    .artwork-col { position: sticky; top: 1rem; align-self: flex-start; }
+  }
+  /* Issues-only filter — hide notes and clean cards when active */
+  .checks-container.issues-only .check-notes       { display: none !important; }
+  .checks-container.issues-only .check-card:not(.check-has-issues) { display: none !important; }
+  .filter-toggle.active { background: #212529; color: #fff; border-color: #212529; }
+</style>
 <script>
 const JOB_ID      = "{{ job_id }}";
 const INIT_STATUS = "{{ job.status }}";
@@ -386,7 +408,7 @@ function issueRows(issues, filename, checkKey) {
 
 function noteRows(notes) {
   if (!notes || !notes.length) return '';
-  return `<div class="text-muted mt-1">${notes.map(n =>
+  return `<div class="check-notes text-muted mt-1">${notes.map(n =>
     `<div class="d-flex gap-2 mb-1"><i class="bi bi-dot flex-shrink-0"></i><span>${esc(n)}</span></div>`
   ).join('')}</div>`;
 }
@@ -400,8 +422,9 @@ function checkCard(num, title, icon, check, uid, filename, checkKey, alwaysOpen)
   const infos  = issues.filter(i => i.severity === 'info');
   const id     = `jschk${num}_${uid}`;
 
+  const hasIssues = crits.length || warns.length;
   const hdrCls  = crits.length ? 'bg-danger bg-opacity-10' : warns.length ? 'bg-warning bg-opacity-10' : 'bg-light';
-  const bdrCls  = crits.length ? 'border-danger' : warns.length ? 'border-warning' : 'border-0';
+  const bdrCls  = crits.length ? 'border-danger check-has-issues' : warns.length ? 'border-warning check-has-issues' : 'border-0';
   const iconCls = crits.length ? 'text-danger' : warns.length ? 'text-warning' : 'text-secondary';
   const badge   = crits.length ? `<span class="badge bg-danger">${crits.length} critical</span>`
                 : warns.length ? `<span class="badge bg-warning text-dark">${warns.length} warnings</span>`
@@ -452,24 +475,36 @@ function fileResult(r, jobId, idx) {
   const imgFname = r.img_path ? r.img_path.split('/').pop() : null;
   const imgHtml  = imgFname
     ? `<img src="/image/${jobId}/${imgFname}" class="img-fluid rounded shadow-sm"
-            style="max-height:640px;object-fit:contain" alt="${esc(r.filename)}">`
+            style="max-height:78vh;object-fit:contain" alt="${esc(r.filename)}">`
     : `<div class="text-muted py-5"><i class="bi bi-image fs-1 d-block mb-2"></i>Image not available</div>`;
 
   const checks = r.checks || {};
   const uid    = `${jobId}_${idx}`;
+  const sevBadgeHtml = sevBadge(r);
+
+  let checksHtml = '';
+  checksHtml += checkCard('1','GTIN / Barcode',        'bi-upc-scan',           checks.gtin,     uid, r.filename, 'gtin',     false);
+  if (checks.nfp != null)
+    checksHtml += checkCard('2','Front Call-Out vs NFP','bi-clipboard2-pulse',   checks.nfp,      uid, r.filename, 'nfp',      false);
+  checksHtml += checkCard('3','Eyemark Contrast',       'bi-eye',                checks.eyemark,  uid, r.filename, 'eyemark',  false);
+  checksHtml += checkCard('4','Spelling / Brand Name', 'bi-spellcheck',         checks.spelling, uid, r.filename, 'spelling', false);
+  checksHtml += checkCard('5','FDA Audit Risk',         'bi-shield-exclamation', checks.fda,      uid, r.filename, 'fda',      true);
+  if (checks.wind != null)
+    checksHtml += checkCard('6','Wind Direction',       'bi-arrow-repeat',       checks.wind,     uid, r.filename, 'wind',     false);
+  checksHtml += checkCard('7','Print Specifications',  'bi-rulers',             checks.specs,    uid, r.filename, 'specs',    false);
 
   let content = r.error
     ? `<div class="alert alert-danger"><strong>Error:</strong> ${esc(r.error)}</div>`
-    : `<div class="d-flex align-items-center gap-2 mb-3">
+    : `<div class="d-flex align-items-center gap-2 mb-3 flex-wrap">
         ${sevIcon(r.severity)}
         <span class="fw-bold text-truncate">${esc(r.filename)}</span>
-        ${sevBadge(r)}
+        ${sevBadgeHtml}
+        <button class="btn btn-outline-secondary btn-sm py-0 ms-1 filter-toggle"
+                onclick="toggleIssuesOnly(this)" title="Hide notes and passing checks">
+          <i class="bi bi-funnel me-1"></i>Issues Only
+        </button>
       </div>
-      ${checkCard('1','GTIN / Barcode',        'bi-upc-scan',           checks.gtin,     uid, r.filename, 'gtin',     false)}
-      ${checkCard('2','Front Call-Out vs NFP', 'bi-clipboard2-pulse',   checks.nfp,      uid, r.filename, 'nfp',      false)}
-      ${checkCard('3','Eyemark Contrast',       'bi-eye',                checks.eyemark,  uid, r.filename, 'eyemark',  false)}
-      ${checkCard('4','Spelling / Brand Name', 'bi-spellcheck',         checks.spelling, uid, r.filename, 'spelling', false)}
-      ${checkCard('5','FDA Audit Risk',         'bi-shield-exclamation', checks.fda,      uid, r.filename, 'fda',      true)}
+      <div class="checks-container">${checksHtml}</div>
       ${r.ocr_preview ? `<div class="mt-2">
         <button class="btn btn-outline-secondary btn-sm" type="button"
                 data-bs-toggle="collapse" data-bs-target="#jsocr${idx}">
@@ -481,9 +516,9 @@ function fileResult(r, jobId, idx) {
         </div></div>` : ''}`;
 
   return `<div class="row g-4">
-    <div class="col-lg-5">
-      <div class="card shadow-sm h-100">
-        <div class="card-header small fw-semibold bg-light py-2">Rendered Artwork (200 DPI)</div>
+    <div class="col-lg-5 artwork-col">
+      <div class="card shadow-sm">
+        <div class="card-header small fw-semibold bg-light py-2">Rendered Artwork</div>
         <div class="card-body p-2 text-center bg-dark bg-opacity-10">${imgHtml}</div>
       </div>
     </div>
@@ -547,6 +582,17 @@ function buildReport(job) {
     (results[0] ? fileResult(results[0], job.id, 0) : '');
 }
 
+/* ── Issues-Only filter ── */
+function toggleIssuesOnly(btn) {
+  const container = btn.closest('.col-lg-7').querySelector('.checks-container');
+  if (!container) return;
+  const on = container.classList.toggle('issues-only');
+  btn.classList.toggle('active', on);
+  btn.innerHTML = on
+    ? '<i class="bi bi-funnel-fill me-1"></i>Show All'
+    : '<i class="bi bi-funnel me-1"></i>Issues Only';
+}
+
 /* ── Polling ── */
 if (INIT_STATUS !== 'done' && INIT_STATUS !== 'error') {
   const interval = setInterval(async () => {
@@ -554,7 +600,7 @@ if (INIT_STATUS !== 'done' && INIT_STATUS !== 'error') {
       const s = await (await fetch(`/api/status/${JOB_ID}`)).json();
       document.getElementById('pBar').style.width  = Math.max(5, s.progress) + '%';
       document.getElementById('pLabel').textContent = `Processing… ${s.progress}%`;
-      document.getElementById('pFile').textContent  = s.current_file ? `Current file: ${s.current_file}` : '';
+      document.getElementById('pFile').textContent  = s.current_file || '';
 
       if (s.status === 'done') {
         clearInterval(interval);
