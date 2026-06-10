@@ -963,17 +963,22 @@ def _check_fda(ocr_text: str, fname: str) -> dict:
         r'\bbeef\b|\bcollagen\b|\bbovine\b|\bplant\b|\bpea\s+protein\b|\brice\s+protein\b|\bvegan\b',
         fname_tl
     ))
-    is_wheat_product = any(re.search(p, fname.lower())
-                          for p in [r'\bpancake\b', r'\bdonut\b', r'\bflour\b', r'\bbreading\b'])
+    is_wheat_product = bool(re.search(
+        r'\bpancake\b|\bdonut\b|\bflour\b|\bbreading\b', fname.lower()))
+    # "pb" is ProDough's shorthand for peanut butter in filenames (e.g. chocolate_pb)
+    is_peanut_product = bool(re.search(r'\bpeanut\b|\bpb\b', fname.lower()))
+    _TREE_NUTS = r'\balmond\b|\bcashew\b|\bwalnut\b|\bpecan\b|\bhazelnut\b|\bpistachio\b|\bmacadamia\b'
+    is_tree_nut_product = bool(re.search(_TREE_NUTS, fname_tl))
 
-    # Milk evidence: explicit word, or milk-derived ingredients that OCR from outlined fonts
-    _milk_in_ocr = bool(re.search(
-        r'\bmilk\b|\bnon.fat\s+milk\b|\bmilk\s+powder\b|\bskim\s+milk\b|\bdairy\b|\bcasein\b', tl
-    ))
-    # If it's a whey/stick protein product, the product type implies milk is present.
-    # Only fire if NEITHER the filename NOR any OCR evidence suggests milk/whey.
-    # Filename containing "whey" identifies the product type but does NOT prove the
-    # allergen is declared on the label — only check OCR/native text for that.
+    # Allergen evidence in OCR/native text
+    _milk_in_ocr    = bool(re.search(
+        r'\bmilk\b|\bnon.fat\s+milk\b|\bmilk\s+powder\b|\bskim\s+milk\b|\bdairy\b|\bcasein\b', tl))
+    _peanut_in_ocr  = bool(re.search(r'\bpeanut\b', tl))
+    _tree_nut_in_ocr = bool(re.search(_TREE_NUTS + r'|\btree\s+nut\b', tl))
+
+    known_allergen_product = (is_whey_product or is_wheat_product or
+                              is_peanut_product or is_tree_nut_product)
+
     if is_whey_product and not is_non_dairy_protein and not _milk_in_ocr and 'whey' not in tl:
         issues.append({
             'severity': 'warning',
@@ -983,7 +988,7 @@ def _check_fda(ocr_text: str, fname: str) -> dict:
                 'Verify the allergen statement is present on the actual artwork.'
             ),
         })
-    elif is_wheat_product and 'wheat' not in tl:
+    if is_wheat_product and 'wheat' not in tl:
         issues.append({
             'severity': 'warning',
             'message': (
@@ -992,11 +997,29 @@ def _check_fda(ocr_text: str, fname: str) -> dict:
                 'Verify the allergen statement appears on the actual artwork.'
             ),
         })
-    elif not is_whey_product and not is_wheat_product and not is_non_dairy_protein and not has_allergen_stmt and not sparse:
+    if is_peanut_product and not _peanut_in_ocr:
         issues.append({
             'severity': 'warning',
             'message': (
-                'No allergen declaration (e.g., "Contains: Milk") detected via OCR. '
+                'Peanut butter product — "peanut" allergen declaration not detected via OCR. '
+                'FDA FALCPA (21 USC 343(w)) requires peanuts to be declared as a major food allergen. '
+                'Verify the allergen statement is present on the actual artwork.'
+            ),
+        })
+    if is_tree_nut_product and not _tree_nut_in_ocr:
+        issues.append({
+            'severity': 'warning',
+            'message': (
+                f'Tree nut product — nut allergen declaration not detected via OCR. '
+                'FDA FALCPA (21 USC 343(w)) requires tree nuts to be declared as a major food allergen. '
+                'Verify the allergen statement is present on the actual artwork.'
+            ),
+        })
+    if not known_allergen_product and not is_non_dairy_protein and not has_allergen_stmt and not sparse:
+        issues.append({
+            'severity': 'warning',
+            'message': (
+                'No allergen declaration (e.g., "Contains: Milk, Peanuts") detected via OCR. '
                 'FALCPA requires declaration of the 9 major allergens. Verify manually.'
             ),
         })
