@@ -953,9 +953,16 @@ def _check_fda(ocr_text: str, fname: str) -> dict:
     has_allergen_stmt = any(re.search(p, tl) for p in
                             [r'contains?:', r'\ballergen\b', r'allergy\s+info', r'may\s+contain'])
 
-    is_whey_product  = any(re.search(p, fname.lower() + ' ' + tl)
-                          for p in [r'\bwhey\b', r'protein\s+stick', r'protein\s+powder',
-                                    r'\bstick\b', r'\bsticks\b', r'\bpouch\b', r'\bpouches\b'])
+    fname_tl = fname.lower() + ' ' + tl
+    # Whey = dairy-derived → milk allergen required.
+    # Only trigger on explicit "whey" — packaging format words (stick, pouch, powder)
+    # match every protein product and cause false positives on beef/plant/collagen SKUs.
+    is_whey_product = bool(re.search(r'\bwhey\b', fname_tl))
+    # Beef collagen, bovine collagen, plant/pea/rice proteins are dairy-free.
+    is_non_dairy_protein = bool(re.search(
+        r'\bbeef\b|\bcollagen\b|\bbovine\b|\bplant\b|\bpea\s+protein\b|\brice\s+protein\b|\bvegan\b',
+        fname_tl
+    ))
     is_wheat_product = any(re.search(p, fname.lower())
                           for p in [r'\bpancake\b', r'\bdonut\b', r'\bflour\b', r'\bbreading\b'])
 
@@ -967,11 +974,11 @@ def _check_fda(ocr_text: str, fname: str) -> dict:
     # Only fire if NEITHER the filename NOR any OCR evidence suggests milk/whey.
     # Filename containing "whey" identifies the product type but does NOT prove the
     # allergen is declared on the label — only check OCR/native text for that.
-    if is_whey_product and not _milk_in_ocr and 'whey' not in tl:
+    if is_whey_product and not is_non_dairy_protein and not _milk_in_ocr and 'whey' not in tl:
         issues.append({
             'severity': 'warning',
             'message': (
-                'Whey/milk protein product — "milk" allergen declaration not detected via OCR. '
+                'Whey protein product — "milk" allergen declaration not detected via OCR. '
                 'FDA FALCPA (21 USC 343(w)) requires milk to be declared as a major food allergen. '
                 'Verify the allergen statement is present on the actual artwork.'
             ),
@@ -985,7 +992,7 @@ def _check_fda(ocr_text: str, fname: str) -> dict:
                 'Verify the allergen statement appears on the actual artwork.'
             ),
         })
-    elif not is_whey_product and not is_wheat_product and not has_allergen_stmt and not sparse:
+    elif not is_whey_product and not is_wheat_product and not is_non_dairy_protein and not has_allergen_stmt and not sparse:
         issues.append({
             'severity': 'warning',
             'message': (
