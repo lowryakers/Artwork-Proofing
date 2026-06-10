@@ -783,8 +783,30 @@ function buildReport(job) {
   return html;
 }
 
+/* ── Render helper ── */
+async function renderDone() {
+  try {
+    const job = await (await fetch(`/api/result/${JOB_ID}`)).json();
+    document.getElementById('loadingView').style.display = 'none';
+    document.getElementById('reportRoot').innerHTML = buildReport(job);
+    document.getElementById('resultsView').style.display = '';
+    document.querySelectorAll('.res-viewer-box').forEach(wireViewerBox);
+  } catch (err) {
+    document.getElementById('loadingView').style.display = 'none';
+    document.getElementById('errorMsg').textContent = 'Failed to load results: ' + err;
+    document.getElementById('errorView').style.display = '';
+  }
+}
+
 /* ── Polling ── */
-if (INIT_STATUS !== 'done' && INIT_STATUS !== 'error') {
+if (INIT_STATUS === 'done') {
+  // Job already finished before page loaded (common for small batches)
+  renderDone();
+} else if (INIT_STATUS === 'error') {
+  document.getElementById('loadingView').style.display = 'none';
+  document.getElementById('errorMsg').textContent = {{ job.error | tojson }} || 'Unknown error';
+  document.getElementById('errorView').style.display = '';
+} else {
   const interval = setInterval(async () => {
     try {
       const s = await (await fetch(`/api/status/${JOB_ID}`)).json();
@@ -795,19 +817,16 @@ if (INIT_STATUS !== 'done' && INIT_STATUS !== 'error') {
 
       if (s.status === 'done') {
         clearInterval(interval);
-        const job = await (await fetch(`/api/result/${JOB_ID}`)).json();
-        document.getElementById('loadingView').style.display = 'none';
-        document.getElementById('reportRoot').innerHTML = buildReport(job);
-        document.getElementById('resultsView').style.display = '';
-        // Wire up any viewer boxes that were just inserted
-        document.querySelectorAll('.res-viewer-box').forEach(wireViewerBox);
+        renderDone();
       } else if (s.status === 'error') {
         clearInterval(interval);
         document.getElementById('loadingView').style.display = 'none';
         document.getElementById('errorMsg').textContent = s.error || 'Unknown error';
         document.getElementById('errorView').style.display = '';
       }
-    } catch (_) {}
+    } catch (err) {
+      console.error('Status poll failed:', err);
+    }
   }, 1500);
 }
 </script>
