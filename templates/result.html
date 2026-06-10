@@ -788,8 +788,9 @@ if (INIT_STATUS !== 'done' && INIT_STATUS !== 'error') {
   const interval = setInterval(async () => {
     try {
       const s = await (await fetch(`/api/status/${JOB_ID}`)).json();
-      document.getElementById('pBar').style.width  = Math.max(5, s.progress) + '%';
-      document.getElementById('pLabel').textContent = `Processing… ${s.progress}%`;
+      const pct = (s.progress != null) ? s.progress : 0;
+      document.getElementById('pBar').style.width  = Math.max(5, pct) + '%';
+      document.getElementById('pLabel').textContent = `Processing… ${pct}%`;
       document.getElementById('pFile').textContent  = s.current_file || '';
 
       if (s.status === 'done') {

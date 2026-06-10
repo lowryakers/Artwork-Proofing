@@ -351,6 +351,8 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
         except Exception:
             pass
 
+    combined_text = native_text + '\n' + ocr_text
+
     brand_mode = brand_config.get('brand_mode', 'prodough')
 
     # ── Match spec row from sheet ────────────────────────────────────────────
