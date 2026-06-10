@@ -119,20 +119,35 @@
 </div>
 {% endif %}
 
-<!-- Dismiss tip + global filter bar -->
-<div class="d-flex align-items-center gap-3 mb-3 flex-wrap">
+<!-- Dismiss tip + filter bars -->
+<div class="d-flex align-items-start gap-3 mb-3 flex-wrap">
   <div class="alert alert-light border small d-flex align-items-center gap-2 mb-0 py-2 flex-grow-1">
     <i class="bi bi-check2-square text-secondary fs-5"></i>
     <span>Click <strong>Dismiss</strong> on any flag you've manually verified.
     Dismissed flags are excluded from the downloaded report.</span>
   </div>
-  <!-- Filter bar -->
-  <div class="d-flex align-items-center gap-2 flex-shrink-0">
-    <span class="text-muted small fw-semibold">Filter:</span>
-    <div class="btn-group btn-group-sm" id="filterBar" role="group">
-      <button type="button" class="btn btn-dark active" onclick="setFilter('all')">All</button>
-      <button type="button" class="btn btn-outline-dark" onclick="setFilter('issues')">Issues Only</button>
-      <button type="button" class="btn btn-outline-danger" onclick="setFilter('critical')">Critical</button>
+  <!-- Severity + check filters stacked -->
+  <div class="d-flex flex-column gap-1 flex-shrink-0">
+    <div class="d-flex align-items-center gap-2">
+      <span class="text-muted small fw-semibold" style="width:3.5rem">Severity:</span>
+      <div class="btn-group btn-group-sm" id="filterBar" role="group">
+        <button type="button" class="btn btn-dark active" onclick="setFilter('all')">All</button>
+        <button type="button" class="btn btn-outline-dark" onclick="setFilter('issues')">Issues Only</button>
+        <button type="button" class="btn btn-outline-danger" onclick="setFilter('critical')">Critical</button>
+      </div>
+    </div>
+    <div class="d-flex align-items-center gap-2">
+      <span class="text-muted small fw-semibold" style="width:3.5rem">Check:</span>
+      <div class="btn-group btn-group-sm" id="checkFilterBar" role="group">
+        <button type="button" class="btn btn-dark active" onclick="setCheckFilter('all')">All</button>
+        <button type="button" class="btn btn-outline-dark" onclick="setCheckFilter('gtin')">GTIN</button>
+        <button type="button" class="btn btn-outline-dark" onclick="setCheckFilter('nfp')">NFP</button>
+        <button type="button" class="btn btn-outline-dark" onclick="setCheckFilter('eyemark')">Eyemark</button>
+        <button type="button" class="btn btn-outline-dark" onclick="setCheckFilter('spelling')">Spelling</button>
+        <button type="button" class="btn btn-outline-dark" onclick="setCheckFilter('fda')">FDA</button>
+        <button type="button" class="btn btn-outline-dark" onclick="setCheckFilter('specs')">Print Specs</button>
+        <button type="button" class="btn btn-outline-dark" onclick="setCheckFilter('wind')">Wind Dir</button>
+      </div>
     </div>
   </div>
 </div>
@@ -318,7 +333,7 @@
 <div class="card mb-2 check-card
   {% if crits %}border-danger check-has-issues check-has-critical
   {% elif warns %}border-warning check-has-issues
-  {% else %}border-0{% endif %} shadow-sm">
+  {% else %}border-0{% endif %} shadow-sm" data-check="{{ check_key }}">
 
   <div class="card-header d-flex align-items-center gap-2 py-2
     {% if crits %}bg-danger bg-opacity-10{% elif warns %}bg-warning bg-opacity-10{% else %}bg-light{% endif %}"
@@ -394,11 +409,20 @@
   @media (min-width: 992px) {
     .artwork-col { position: sticky; top: 1rem; align-self: flex-start; }
   }
-  /* ── Global filter modes (set as data-filter on #reportRoot) ── */
+  /* ── Severity filter modes ── */
   #reportRoot[data-filter="issues"] .check-notes                         { display:none!important; }
   #reportRoot[data-filter="issues"] .check-card:not(.check-has-issues)   { display:none!important; }
   #reportRoot[data-filter="critical"] .check-notes                       { display:none!important; }
   #reportRoot[data-filter="critical"] .check-card:not(.check-has-critical){ display:none!important; }
+  /* ── Per-check filter ── */
+  #reportRoot[data-check-filter] .check-card                             { display:none!important; }
+  #reportRoot[data-check-filter="gtin"]     .check-card[data-check="gtin"]     { display:block!important; }
+  #reportRoot[data-check-filter="nfp"]      .check-card[data-check="nfp"]      { display:block!important; }
+  #reportRoot[data-check-filter="eyemark"]  .check-card[data-check="eyemark"]  { display:block!important; }
+  #reportRoot[data-check-filter="spelling"] .check-card[data-check="spelling"] { display:block!important; }
+  #reportRoot[data-check-filter="fda"]      .check-card[data-check="fda"]      { display:block!important; }
+  #reportRoot[data-check-filter="specs"]    .check-card[data-check="specs"]    { display:block!important; }
+  #reportRoot[data-check-filter="wind"]     .check-card[data-check="wind"]     { display:block!important; }
   /* ── Dismissed ── */
   .issue-row.dismissed { opacity:.45; text-decoration:line-through; }
 </style>
@@ -408,7 +432,7 @@ const INIT_STATUS = "{{ job.status }}";
 
 function esc(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 
-/* ── Global filter ── */
+/* ── Severity filter ── */
 function setFilter(mode) {
   const root = document.getElementById('reportRoot');
   if (!root) return;
@@ -423,6 +447,20 @@ function setFilter(mode) {
       b.classList.add(bMode === 'critical' ? 'btn-outline-danger' : 'btn-outline-dark');
       b.classList.remove('active');
     }
+  });
+}
+
+/* ── Per-check filter ── */
+function setCheckFilter(check) {
+  const root = document.getElementById('reportRoot');
+  if (!root) return;
+  if (check === 'all') root.removeAttribute('data-check-filter');
+  else root.setAttribute('data-check-filter', check);
+  document.querySelectorAll('#checkFilterBar button').forEach(b => {
+    const bCheck = b.getAttribute('onclick').match(/'(\w+)'/)?.[1];
+    b.classList.toggle('btn-dark', bCheck === check);
+    b.classList.toggle('active',   bCheck === check);
+    b.classList.toggle('btn-outline-dark', bCheck !== check);
   });
 }
 
@@ -614,6 +652,7 @@ function checkCard(num, title, icon, check, uid, filename, checkKey, alwaysOpen)
   const hdrCls  = crits.length ? 'bg-danger bg-opacity-10' : warns.length ? 'bg-warning bg-opacity-10' : 'bg-light';
   const bdrCls  = crits.length ? 'border-danger check-has-issues check-has-critical'
                 : warns.length ? 'border-warning check-has-issues' : 'border-0';
+  const checkAttr = checkKey ? ` data-check="${checkKey}"` : '';
   const iconCls = crits.length ? 'text-danger' : warns.length ? 'text-warning' : 'text-secondary';
   const badge   = crits.length ? `<span class="badge bg-danger">${crits.length} critical</span>`
                 : warns.length ? `<span class="badge bg-warning text-dark">${warns.length} warnings</span>`
@@ -623,7 +662,7 @@ function checkCard(num, title, icon, check, uid, filename, checkKey, alwaysOpen)
   if (check.found_gtins?.length) extras += `<div class="mt-2 text-muted">GTINs detected: <code>${check.found_gtins.join(', ')}</code></div>`;
   if (check.calories?.length)    extras += `<div class="mt-1 text-muted">Calories found: ${check.calories.join(', ')}</div>`;
   if (check.proteins?.length)    extras += `<div class="mt-1 text-muted">Protein (g) found: ${check.proteins.join(', ')}</div>`;
-  return `<div class="card mb-2 check-card ${bdrCls} shadow-sm">
+  return `<div class="card mb-2 check-card ${bdrCls} shadow-sm"${checkAttr}>
     <div class="card-header d-flex align-items-center gap-2 py-2 ${hdrCls}"
          data-bs-toggle="collapse" data-bs-target="#${id}" style="cursor:pointer">
       <i class="bi ${icon} ${iconCls}"></i>
@@ -720,17 +759,32 @@ function fileResult(r, jobId, idx) {
 }
 
 function filterBarHTML() {
-  return `<div class="d-flex align-items-center gap-3 mb-3 flex-wrap">
+  return `<div class="d-flex align-items-start gap-3 mb-3 flex-wrap">
     <div class="alert alert-light border small d-flex align-items-center gap-2 mb-0 py-2 flex-grow-1">
       <i class="bi bi-check2-square text-secondary fs-5"></i>
       <span>Click <strong>Dismiss</strong> on any flag you've manually verified. Dismissed flags are excluded from the downloaded report.</span>
     </div>
-    <div class="d-flex align-items-center gap-2 flex-shrink-0">
-      <span class="text-muted small fw-semibold">Filter:</span>
-      <div class="btn-group btn-group-sm" id="filterBar" role="group">
-        <button type="button" class="btn btn-dark active" onclick="setFilter('all')">All</button>
-        <button type="button" class="btn btn-outline-dark" onclick="setFilter('issues')">Issues Only</button>
-        <button type="button" class="btn btn-outline-danger" onclick="setFilter('critical')">Critical</button>
+    <div class="d-flex flex-column gap-1 flex-shrink-0">
+      <div class="d-flex align-items-center gap-2">
+        <span class="text-muted small fw-semibold" style="width:3.5rem">Severity:</span>
+        <div class="btn-group btn-group-sm" id="filterBar" role="group">
+          <button type="button" class="btn btn-dark active" onclick="setFilter('all')">All</button>
+          <button type="button" class="btn btn-outline-dark" onclick="setFilter('issues')">Issues Only</button>
+          <button type="button" class="btn btn-outline-danger" onclick="setFilter('critical')">Critical</button>
+        </div>
+      </div>
+      <div class="d-flex align-items-center gap-2">
+        <span class="text-muted small fw-semibold" style="width:3.5rem">Check:</span>
+        <div class="btn-group btn-group-sm" id="checkFilterBar" role="group">
+          <button type="button" class="btn btn-dark active" onclick="setCheckFilter('all')">All</button>
+          <button type="button" class="btn btn-outline-dark" onclick="setCheckFilter('gtin')">GTIN</button>
+          <button type="button" class="btn btn-outline-dark" onclick="setCheckFilter('nfp')">NFP</button>
+          <button type="button" class="btn btn-outline-dark" onclick="setCheckFilter('eyemark')">Eyemark</button>
+          <button type="button" class="btn btn-outline-dark" onclick="setCheckFilter('spelling')">Spelling</button>
+          <button type="button" class="btn btn-outline-dark" onclick="setCheckFilter('fda')">FDA</button>
+          <button type="button" class="btn btn-outline-dark" onclick="setCheckFilter('specs')">Print Specs</button>
+          <button type="button" class="btn btn-outline-dark" onclick="setCheckFilter('wind')">Wind Dir</button>
+        </div>
       </div>
     </div>
   </div>`;

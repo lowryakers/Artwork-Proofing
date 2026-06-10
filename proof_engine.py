@@ -335,13 +335,13 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
 
     print(f'[proof] [{fname}] barcode scan done — gtins={barcode_gtins}', flush=True, file=sys.stderr)
     # ── OCR (Tesseract) — synchronous ─────────────────────────────────────────
-    # Skip when native text already contains key label signals.
-    # Run on a 75%-scale copy (56% of pixels → ~40% faster OCR).
-    _label_signals = [
-        'nutrition facts', 'supplement facts', 'serving size', 'calories',
-        'ingredients', 'contains:', 'net wt', 'net weight',
-    ]
-    _native_has_label = any(sig in native_text.lower() for sig in _label_signals)
+    # Skip only when native text conclusively contains the NFP (both header and
+    # body present) — a single signal like "serving size" is not enough because
+    # native text is often partial on mixed outlined/unoutlined PDFs.
+    _native_lower = native_text.lower()
+    _nfp_header_in_native = 'nutrition facts' in _native_lower or 'supplement facts' in _native_lower
+    _nfp_body_in_native   = 'calories' in _native_lower or 'ingredients' in _native_lower
+    _native_has_label = _nfp_header_in_native and _nfp_body_in_native
 
     ocr_text = ''
     if _native_has_label:
@@ -883,6 +883,10 @@ def _check_fda(ocr_text: str, fname: str) -> dict:
 
     # ── Required label elements (absence-based — unreliable on outlined PDFs) ─
     # Only flag these if OCR has meaningful yield; otherwise they are noise.
+    # Pre-initialize so _nfp_confirmed below is always valid regardless of sparse.
+    _has_nfp_text    = False
+    _has_nfp_numbers = False
+    _nfp_row_hits    = 0
 
     if not sparse:
         # NFP: accept explicit text OR numerical signals that only appear inside an NFP
