@@ -293,46 +293,7 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
     except Exception:
         pass
 
-    # ── OCR (Tesseract) ────────────────────────────────────────────────────────
-    # Skip only when native text already contains key label signals.
-    # Run on a 75%-scale copy of the image (56% of pixels → ~40% faster OCR)
-    # without needing an extra pdftoppm call.
-    # Launched in a background thread so barcode work runs concurrently.
-    _label_signals = [
-        'nutrition facts', 'supplement facts', 'serving size', 'calories',
-        'ingredients', 'contains:', 'net wt', 'net weight',
-    ]
-    _native_has_label = any(sig in native_text.lower() for sig in _label_signals)
-
-    ocr_future = None
-    if not _native_has_label:
-        ocr_img_path = img_prefix + '_ocr.png'
-        try:
-            if PIL_AVAILABLE:
-                _tmp = Image.open(img_path)
-                _w, _h = _tmp.size
-                _tmp.resize((_w * 3 // 4, _h * 3 // 4), Image.LANCZOS).save(ocr_img_path)
-            else:
-                ocr_img_path = img_path
-        except Exception:
-            ocr_img_path = img_path
-
-        from concurrent.futures import ThreadPoolExecutor as _TPE
-        _ocr_pool = _TPE(max_workers=1)
-
-        def _run_ocr(path=ocr_img_path):
-            try:
-                r = subprocess.run(
-                    ['tesseract', path, 'stdout', '--oem', '1', '--psm', '11', '-l', 'eng'],
-                    capture_output=True, text=True, timeout=30,
-                )
-                return r.stdout
-            except Exception:
-                return ''
-
-        ocr_future = _ocr_pool.submit(_run_ocr)
-
-    # ── Load image + barcode scan (runs while OCR is in flight) ────────────────
+    # ── Load image + barcode scan ─────────────────────────────────────────────
     img = None
     if PIL_AVAILABLE:
         try:
@@ -343,7 +304,6 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
     barcode_gtins = _scan_barcodes(img_path)
     if not barcode_gtins:
         # 200 DPI sometimes misses dense/small barcodes — retry at 350 DPI.
-        # This runs while Tesseract is still working on the OCR image.
         hi_prefix = img_prefix + '_hirez'
         try:
             subprocess.run(
@@ -361,12 +321,33 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
         except Exception:
             pass
 
-    # ── Collect OCR result (join background thread) ───────────────────────────
+    # ── OCR (Tesseract) — synchronous ─────────────────────────────────────────
+    # Skip when native text already contains key label signals.
+    # Run on a 75%-scale copy (56% of pixels → ~40% faster OCR).
+    _label_signals = [
+        'nutrition facts', 'supplement facts', 'serving size', 'calories',
+        'ingredients', 'contains:', 'net wt', 'net weight',
+    ]
+    _native_has_label = any(sig in native_text.lower() for sig in _label_signals)
+
     ocr_text = ''
-    if ocr_future is not None:
-        ocr_text = ocr_future.result()
+    if not _native_has_label:
+        ocr_img_path = img_prefix + '_ocr.png'
         try:
-            _ocr_pool.shutdown(wait=False)
+            if PIL_AVAILABLE:
+                _tmp = Image.open(img_path)
+                _w, _h = _tmp.size
+                _tmp.resize((_w * 3 // 4, _h * 3 // 4), Image.LANCZOS).save(ocr_img_path)
+            else:
+                ocr_img_path = img_path
+        except Exception:
+            ocr_img_path = img_path
+        try:
+            r = subprocess.run(
+                ['tesseract', ocr_img_path, 'stdout', '--oem', '1', '--psm', '11', '-l', 'eng'],
+                capture_output=True, text=True, timeout=30,
+            )
+            ocr_text = r.stdout
         except Exception:
             pass
 
