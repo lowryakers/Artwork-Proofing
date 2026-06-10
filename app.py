@@ -318,9 +318,15 @@ def upload():
             flash(f'Could not read the uploaded GTIN file ({exc}) — falling back to synced sheet data.', 'warning')
 
     if not gtin_rows:
-        gtin_rows = _get_sheet_gtin_rows(force=True)  # always pull fresh data on each proof run
+        gtin_rows = _get_sheet_gtin_rows()  # use cache; background-refresh below
         if not gtin_rows and _sheet_cache.get('last_error'):
             flash(f'Google Sheet sync failed: {_sheet_cache["last_error"]}', 'danger')
+
+    # Kick off a background sheet refresh so the *next* proof run has fresh data
+    # without blocking this one on a network round-trip.
+    if _load_sheet_config().get('sheet_url'):
+        import threading as _t
+        _t.Thread(target=_get_sheet_gtin_rows, kwargs={'force': True}, daemon=True).start()
 
     if not gtin_rows:
         flash(

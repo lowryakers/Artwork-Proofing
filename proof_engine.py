@@ -308,8 +308,8 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
     if not _native_has_label:
         try:
             r = subprocess.run(
-                ['tesseract', img_path, 'stdout', '--oem', '3', '--psm', '3', '-l', 'eng'],
-                capture_output=True, text=True, timeout=120,
+                ['tesseract', img_path, 'stdout', '--oem', '1', '--psm', '3', '-l', 'eng'],
+                capture_output=True, text=True, timeout=30,
             )
             ocr_text = r.stdout
         except Exception:
