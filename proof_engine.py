@@ -141,24 +141,31 @@ load_jobs_from_disk()
 
 def _process_job(job_id: str, pdf_paths: list, gtin_rows: list, work_dir: str,
                  brand_config: dict = None, spec_rows: list = None):
+    import sys
     _update_job(job_id, status='running')
     total = len(pdf_paths)
     results = [None] * total
     completed = [0]  # mutable counter shared across threads
+    print(f'[proof] job {job_id} starting — {total} file(s)', flush=True, file=sys.stderr)
 
     def _run_one(i: int, pdf_path: str):
         fname = os.path.basename(pdf_path)
+        print(f'[proof] [{fname}] starting', flush=True, file=sys.stderr)
         try:
-            return i, _proof_single(pdf_path, gtin_rows, work_dir,
-                                    brand_config=brand_config, spec_rows=spec_rows)
+            result = _proof_single(pdf_path, gtin_rows, work_dir,
+                                   brand_config=brand_config, spec_rows=spec_rows)
+            print(f'[proof] [{fname}] done — severity={result.get("severity")}', flush=True, file=sys.stderr)
+            return i, result
         except Exception as exc:
+            import traceback
+            print(f'[proof] [{fname}] ERROR: {exc}\n{traceback.format_exc()}', flush=True, file=sys.stderr)
             return i, {
                 'filename': fname, 'error': str(exc), 'checks': {},
                 'severity': 'error', 'critical_count': 0,
                 'warning_count': 0, 'info_count': 0, 'img_web': None,
             }
 
-    max_workers = min(total, max(1, (os.cpu_count() or 2)))
+    max_workers = min(total, max(1, min(3, (os.cpu_count() or 2))))
     try:
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
             futures = {pool.submit(_run_one, i, p): i for i, p in enumerate(pdf_paths)}
@@ -262,16 +269,19 @@ def _match_spec_row(gtin_list: list, fname: str, spec_rows: list,
 
 def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
                   brand_config: dict = None, spec_rows: list = None) -> dict:
+    import sys
     brand_config = brand_config or {}
     fname = os.path.basename(pdf_path)
     stem = Path(pdf_path).stem
 
     # ── Convert PDF → PNG at 200 DPI (36% fewer pixels than 250 DPI) ──────────
     img_prefix = os.path.join(work_dir, stem)
+    print(f'[proof] [{fname}] pdftoppm 200dpi start', flush=True, file=sys.stderr)
     subprocess.run(
         ['pdftoppm', '-r', '200', '-png', '-singlefile', pdf_path, img_prefix],
         capture_output=True, check=True, timeout=120,
     )
+    print(f'[proof] [{fname}] pdftoppm 200dpi done', flush=True, file=sys.stderr)
     img_path = img_prefix + '.png'
     if not os.path.exists(img_path):
         candidates = sorted(
@@ -294,6 +304,7 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
         pass
 
     # ── Load image + barcode scan ─────────────────────────────────────────────
+    print(f'[proof] [{fname}] barcode scan start', flush=True, file=sys.stderr)
     img = None
     if PIL_AVAILABLE:
         try:
@@ -304,6 +315,7 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
     barcode_gtins = _scan_barcodes(img_path)
     if not barcode_gtins:
         # 200 DPI sometimes misses dense/small barcodes — retry at 350 DPI.
+        print(f'[proof] [{fname}] no barcode at 200dpi, retrying at 350dpi', flush=True, file=sys.stderr)
         hi_prefix = img_prefix + '_hirez'
         try:
             subprocess.run(
@@ -321,6 +333,7 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
         except Exception:
             pass
 
+    print(f'[proof] [{fname}] barcode scan done — gtins={barcode_gtins}', flush=True, file=sys.stderr)
     # ── OCR (Tesseract) — synchronous ─────────────────────────────────────────
     # Skip when native text already contains key label signals.
     # Run on a 75%-scale copy (56% of pixels → ~40% faster OCR).
@@ -331,6 +344,10 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
     _native_has_label = any(sig in native_text.lower() for sig in _label_signals)
 
     ocr_text = ''
+    if _native_has_label:
+        print(f'[proof] [{fname}] OCR skipped (label signals in native text)', flush=True, file=sys.stderr)
+    else:
+        print(f'[proof] [{fname}] OCR start', flush=True, file=sys.stderr)
     if not _native_has_label:
         ocr_img_path = img_prefix + '_ocr.png'
         try:
@@ -348,8 +365,9 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
                 capture_output=True, text=True, timeout=30,
             )
             ocr_text = r.stdout
-        except Exception:
-            pass
+        except Exception as _ocr_err:
+            print(f'[proof] [{fname}] OCR error: {_ocr_err}', flush=True, file=sys.stderr)
+        print(f'[proof] [{fname}] OCR done — {len(ocr_text)} chars', flush=True, file=sys.stderr)
 
     combined_text = native_text + '\n' + ocr_text
 
