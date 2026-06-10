@@ -535,20 +535,25 @@ def _check_gtin(ocr_text: str, fname: str, gtin_rows: list,
                 keywords = [w for w in flavor_words if w not in _GENERIC and len(w) > 1]
                 if not keywords:
                     continue  # nothing meaningful to match against
-                # Match against PDF text content (OCR + native), fall back to filename
+                # Match against PDF text content (OCR + native), fall back to filename.
+                # Require at least half the flavor keywords to match — multi-word flavor
+                # descriptors (e.g. "frosted vanilla", "pumpkin spice") often have the
+                # primary word in the filename while the modifier is only in the artwork.
                 fname_lower = fname.lower()
                 matched = [kw for kw in keywords if kw in pdf_text_lower or kw in fname_lower]
-                if len(matched) < len(keywords):
+                required = (len(keywords) + 1) // 2  # ceil(N/2) — majority threshold
+                if len(matched) < required:
                     missing = [kw for kw in keywords if kw not in pdf_text_lower and kw not in fname_lower]
                     issues.append({
                         'severity': 'warning',
                         'message': (
                             f'GTIN {gtin} is listed under "{expected_flavor}" in the master list, '
-                            f'but the keyword(s) "{", ".join(missing)}" were not found in the artwork text '
-                            f'or filename. Confirm this is the correct SKU.'
+                            f'but only {len(matched)} of {len(keywords)} identifying keyword(s) '
+                            f'("{", ".join(missing)}" missing) were found. '
+                            f'Confirm this is the correct SKU.'
                         ),
                     })
-                # If all keywords matched, the flavor lines up — no issue raised
+                # If majority of keywords matched, the flavor lines up — no issue raised
             else:
                 issues.append({
                     'severity': 'warning',
@@ -1543,14 +1548,26 @@ def _check_print_specs(fitz_doc, brand_config: dict = None,
                 (abs(tb_w - spec_w) <= tol and abs(tb_h - spec_h) <= tol) or
                 (abs(tb_w - spec_h) <= tol and abs(tb_h - spec_w) <= tol)
             )
-            if not fits:
-                issues.append({'severity': 'critical',
-                               'message': f'Dimension mismatch — trim size is '
-                                          f'{tb_w} × {tb_h} mm, '
-                                          f'spec requires {spec_w} × {spec_h} mm (±2 mm). '
-                                          'Verify the artwork size with your print supplier before going to press.'})
-            else:
+            if fits:
                 notes.append(f'Dimensions match spec: {spec_w} × {spec_h} mm ✓')
+            else:
+                # Check if TrimBox is a multi-panel die-cut layout — the TrimBox captures
+                # all panels unfolded (e.g. front+back+gusset), while the spec stores the
+                # finished panel size. A >2× scale difference indicates a layout sheet.
+                scale = max(tb_w / spec_w, tb_h / spec_h,
+                            tb_w / spec_h, tb_h / spec_w)
+                if scale > 2.0:
+                    notes.append(
+                        f'File TrimBox ({tb_w} × {tb_h} mm) is a multi-panel layout — '
+                        f'spec finished size is {spec_w} × {spec_h} mm. '
+                        'Verify overall layout dimensions with your print supplier.'
+                    )
+                else:
+                    issues.append({'severity': 'critical',
+                                   'message': f'Dimension mismatch — trim size is '
+                                              f'{tb_w} × {tb_h} mm, '
+                                              f'spec requires {spec_w} × {spec_h} mm (±2 mm). '
+                                              'Verify the artwork size with your print supplier before going to press.'})
         elif spec_w and spec_h and not tb_w:
             notes.append(f'Spec dimensions ({spec_w} × {spec_h} mm) not verified — '
                          'no TrimBox in file. Add a TrimBox to enable dimension checking.')
