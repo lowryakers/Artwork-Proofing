@@ -1528,24 +1528,28 @@ def _check_print_specs(fitz_doc, brand_config: dict = None,
                              'Add a TrimBox before submitting press-ready files.')
 
         # Compare against expected spec dimensions (spec sheet overrides brand_config)
+        # Only compare when TrimBox is present — without it, we only have the MediaBox
+        # (full page including bleed/margins), which is always larger than the die cut area
+        # and would produce false mismatches on virtually every file.
         spec_w = matched_spec.get('trim_width_mm') or brand_config.get('spec_width_mm')
         spec_h = matched_spec.get('trim_length_mm') or matched_spec.get('trim_height_mm') or brand_config.get('spec_height_mm')
-        dim_ref = (tb_w, tb_h) if tb_w else (mb_w, mb_h)
-        dim_label = 'trim' if tb_w else 'page'
-        if spec_w and spec_h and dim_ref[0]:
+        if spec_w and spec_h and tb_w and tb_h:
             tol = 2.0  # mm
             fits = (
-                (abs(dim_ref[0] - spec_w) <= tol and abs(dim_ref[1] - spec_h) <= tol) or
-                (abs(dim_ref[0] - spec_h) <= tol and abs(dim_ref[1] - spec_w) <= tol)
+                (abs(tb_w - spec_w) <= tol and abs(tb_h - spec_h) <= tol) or
+                (abs(tb_w - spec_h) <= tol and abs(tb_h - spec_w) <= tol)
             )
             if not fits:
                 issues.append({'severity': 'critical',
-                               'message': f'Dimension mismatch — {dim_label} size is '
-                                          f'{dim_ref[0]} × {dim_ref[1]} mm, '
+                               'message': f'Dimension mismatch — trim size is '
+                                          f'{tb_w} × {tb_h} mm, '
                                           f'spec requires {spec_w} × {spec_h} mm (±2 mm). '
                                           'Verify the artwork size with your print supplier before going to press.'})
             else:
                 notes.append(f'Dimensions match spec: {spec_w} × {spec_h} mm ✓')
+        elif spec_w and spec_h and not tb_w:
+            notes.append(f'Spec dimensions ({spec_w} × {spec_h} mm) not verified — '
+                         'no TrimBox in file. Add a TrimBox to enable dimension checking.')
 
         # ── Single xref pass: spot colors, OCG layers, RGB flag ──────────────
         spot_colors, ocg_names, has_rgb = _scan_pdf_structure(doc)
