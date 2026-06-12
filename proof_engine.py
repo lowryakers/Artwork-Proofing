@@ -936,8 +936,15 @@ def _check_fda(ocr_text: str, fname: str) -> dict:
     # ── Allergen declaration ───────────────────────────────────────────────────
     # "Contains:" is the FALCPA-required declaration. "Allergy Warning" / "may contain"
     # are voluntary cross-contact advisories — they do NOT satisfy the FALCPA requirement.
-    # Accept "contains" with or without colon — OCR frequently drops punctuation.
-    has_contains_stmt = bool(re.search(r'\bcontains?\b', tl))
+    # Require "contains" immediately followed by a known allergen word so that
+    # ingredient phrases like "contains less than 2% of..." don't give false passes.
+    _ALLERGEN_WORDS = (
+        r'milk|dairy|whey|wheat|peanut|soy|egg|fish|shellfish|'
+        r'tree\s*nut|sesame|almond|cashew|walnut|pecan|hazelnut|pistachio|macadamia'
+    )
+    has_contains_stmt = bool(re.search(
+        r'\bcontains?\s*[:.]?\s*(?:' + _ALLERGEN_WORDS + r')', tl
+    ))
     has_advisory      = bool(re.search(
         r'\ballergy\b|\ballergen\b|allergy\s+info|allergy\s+warning|may\s+contain', tl
     ))
@@ -1002,29 +1009,39 @@ def _check_fda(ocr_text: str, fname: str) -> dict:
             ),
         })
 
-    # For UNKNOWN allergen products only: verify a "Contains:" declaration exists.
-    # For known allergen products (whey/wheat/peanut/tree nut), if the allergen
-    # ingredient was found in OCR we trust the declaration is present — "Contains:"
-    # text is often in small/outlined font that OCR misses on print-ready PDFs.
-    if not sparse and not is_non_dairy_protein and not has_contains_stmt and not known_allergen_product:
-        if has_advisory:
+    # For ALL products: if no allergen declaration is found, flag it.
+    # For known allergen products where the allergen ingredient was found in OCR
+    # (i.e. specific_allergen_flagged=False because allergen IS readable), we still
+    # require an explicit "Contains: [allergen]" declaration — this is the actual check.
+    if not sparse and not is_non_dairy_protein and not has_contains_stmt:
+        if known_allergen_product and not specific_allergen_flagged:
             issues.append({
                 'severity': 'critical',
                 'message': (
-                    'Cross-contact advisory detected (e.g., "Allergy Warning" / "Made in a facility...") '
-                    'but no "Contains:" allergen declaration found. The advisory does NOT satisfy FALCPA — '
-                    'a "Contains: [allergens]" statement is still required. Add the declaration.'
+                    'Allergen declaration "Contains: Milk / Wheat / Peanuts / Tree Nuts" '
+                    'not detected via OCR. FALCPA requires an explicit "Contains:" statement. '
+                    'Verify the declaration is present and readable on the artwork.'
                 ),
             })
-        else:
-            issues.append({
-                'severity': 'critical',
-                'message': (
-                    'No allergen declaration (e.g., "Contains: Milk, Peanuts") detected. '
-                    'FALCPA requires declaration of the 9 major allergens. '
-                    'Verify the "Contains:" statement is present on the artwork.'
-                ),
-            })
+        elif not known_allergen_product:
+            if has_advisory:
+                issues.append({
+                    'severity': 'critical',
+                    'message': (
+                        'Cross-contact advisory detected (e.g., "Allergy Warning" / "Made in a facility...") '
+                        'but no "Contains:" allergen declaration found. The advisory does NOT satisfy FALCPA — '
+                        'a "Contains: [allergens]" statement is still required. Add the declaration.'
+                    ),
+                })
+            else:
+                issues.append({
+                    'severity': 'critical',
+                    'message': (
+                        'No allergen declaration (e.g., "Contains: Milk, Peanuts") detected. '
+                        'FALCPA requires declaration of the 9 major allergens. '
+                        'Verify the "Contains:" statement is present on the artwork.'
+                    ),
+                })
 
     # ── Manufacturer / distributor info ───────────────────────────────────────
     # Multi-signal: any ONE of these is sufficient evidence of a manufacturer block.
