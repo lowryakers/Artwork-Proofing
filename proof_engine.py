@@ -718,7 +718,7 @@ _MISSPELLINGS = {
     r'\brasberry\b':             'raspberry',
     r'\braspbery\b':             'raspberry',
     r'\bprotien\b':              'protein',
-    r'\bingrediant':             'ingredient',
+    r'\bingrediant\b':           'ingredient',
     r'\bartifical\b':            'artificial',
     r'\bnatrual\b':              'natural',
     r'\bexellent\b':             'excellent',
@@ -867,7 +867,7 @@ def _check_fda(ocr_text: str, fname: str) -> dict:
     # ── Required label elements (absence-based — unreliable on outlined PDFs) ─
     # Only flag these if OCR has meaningful yield; otherwise they are noise.
 
-    # Initialize here so they're always defined — used again below in _nfp_confirmed
+    # Initialize here so they're always defined — used inside the 'if not sparse' block below
     _has_nfp_text    = False
     _has_nfp_numbers = False
     _nfp_row_hits    = 0
@@ -1415,11 +1415,10 @@ def _check_wind_direction(ocr_text: str, required_wind: str) -> dict:
 
     req_label = _WIND_LABELS[required_wind]
     tl = ocr_text.lower()
-    import re as _re
     detected_wind = None
 
     # 1. Explicit "Wind N" or "Winding N" or "Winding Direction: N"
-    m = _re.search(r'\bwind(?:ing)?\s*(?:direction\s*)?[:\-]?\s*([1-8])\b', tl)
+    m = re.search(r'\bwind(?:ing)?\s*(?:direction\s*)?[:\-]?\s*([1-8])\b', tl)
     if m:
         detected_wind = m.group(1)
 
@@ -1437,14 +1436,14 @@ def _check_wind_direction(ocr_text: str, required_wind: str) -> dict:
             r'bottom.{0,30}?first.{0,15}?\b([1-8])\b',
         ]
         for pat in _DIR_PATTERNS:
-            m = _re.search(pat, tl, _re.DOTALL)
+            m = re.search(pat, tl, re.DOTALL)
             if m:
                 detected_wind = m.group(1)
                 break
 
     # 3. "Outwound N" / "Inwound N"
     if not detected_wind:
-        m = _re.search(r'\b(in|out)wound\s*([1-8])\b', tl)
+        m = re.search(r'\b(in|out)wound\s*([1-8])\b', tl)
         if m:
             detected_wind = m.group(2)
 
@@ -1779,17 +1778,7 @@ def _check_print_specs(pdf_path: str, brand_config: dict = None,
             notes.append(f'Matched spec: {flavor_label}{sku_part}')
             if matched_spec.get('wind_direction'):
                 wd = matched_spec['wind_direction']
-                _WIND_LABELS_LOCAL = {
-                    '1': 'Wind 1 — Outwound, Across roll, Top first',
-                    '2': 'Wind 2 — Outwound, Across roll, Bottom first',
-                    '3': 'Wind 3 — Outwound, Around roll, Right side first',
-                    '4': 'Wind 4 — Outwound, Around roll, Left side first',
-                    '5': 'Wind 5 — Inwound, Across roll, Top first',
-                    '6': 'Wind 6 — Inwound, Across roll, Bottom first',
-                    '7': 'Wind 7 — Inwound, Around roll, Right side first',
-                    '8': 'Wind 8 — Inwound, Around roll, Left side first',
-                }
-                notes.append(f'Expected wind direction from spec sheet: {_WIND_LABELS_LOCAL.get(wd, wd)}')
+                notes.append(f'Expected wind direction from spec sheet: {_WIND_LABELS.get(wd, wd)}')
 
         # ── Page count ────────────────────────────────────────────────────────
         if len(doc) > 1:
