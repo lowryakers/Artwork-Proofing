@@ -945,30 +945,44 @@ def _check_fda(ocr_text: str, fname: str) -> dict:
     has_contains_stmt = bool(re.search(
         r'\bcontains?\s*[:.]?\s*(?:' + _ALLERGEN_WORDS + r')', tl
     ))
-    has_advisory      = bool(re.search(
+    has_advisory = bool(re.search(
         r'\ballergy\b|\ballergen\b|allergy\s+info|allergy\s+warning|may\s+contain', tl
     ))
 
     fname_tl = fname.lower() + ' ' + tl
-    is_whey_product  = bool(re.search(r'\bwhey\b', fname_tl))
-    is_non_dairy_protein = bool(re.search(
+
+    # Filename-based product-type signals (primary: filename is authoritative for product type)
+    is_whey_product     = bool(re.search(r'\bwhey\b', fname_tl))
+    is_non_dairy_milk   = bool(re.search(  # only suppresses the milk-specific check
         r'\bbeef\b|\bcollagen\b|\bbovine\b|\bplant\b|\bpea\s+protein\b|\brice\s+protein\b|\bvegan\b',
         fname_tl))
-    is_wheat_product = bool(re.search(r'\bpancake\b|\bdonut\b|\bflour\b|\bbreading\b', fname.lower()))
-    is_peanut_product = bool(re.search(r'\bpeanut\b|\bpb\b', fname.lower()))
+    is_wheat_product    = bool(re.search(r'\bpancake\b|\bdonut\b|\bflour\b|\bbreading\b', fname.lower()))
+    is_peanut_product   = bool(re.search(r'\bpeanut\b|\bpb\b', fname.lower()))
     _TREE_NUTS = r'\balmond\b|\bcashew\b|\bwalnut\b|\bpecan\b|\bhazelnut\b|\bpistachio\b|\bmacadamia\b'
     is_tree_nut_product = bool(re.search(_TREE_NUTS, fname_tl))
 
-    _milk_in_ocr    = bool(re.search(
-        r'\bmilk\b|\bnon.fat\s+milk\b|\bmilk\s+powder\b|\bskim\s+milk\b|\bdairy\b|\bcasein\b', tl))
-    _peanut_in_ocr  = bool(re.search(r'\bpeanut\b', tl))
-    _tree_nut_in_ocr = bool(re.search(_TREE_NUTS + r'|\btree\s+nut\b', tl))
+    # Per-allergen OCR presence
+    _milk_in_ocr      = bool(re.search(r'\bmilk\b|\bnon.fat\s+milk\b|\bmilk\s+powder\b|\bskim\s+milk\b|\bdairy\b|\bcasein\b', tl))
+    _peanut_in_ocr    = bool(re.search(r'\bpeanut\b', tl))
+    _tree_nut_in_ocr  = bool(re.search(_TREE_NUTS + r'|\btree\s+nut\b', tl))
+    _soy_in_ocr       = bool(re.search(r'\bsoy(?:bean)?\b|\bsoy\s+lecithin\b', tl))
+    _egg_in_ocr       = bool(re.search(r'\begg\b|\begg\s+white\b|\balbumin\b', tl))
+    _fish_in_ocr      = bool(re.search(r'\bfish\b|\bsalmon\b|\btuna\b|\bpollock\b|\bcod\b|\btilapia\b', tl))
+    _shellfish_in_ocr = bool(re.search(r'\bshrimp\b|\bcrab\b|\blobster\b|\bscallop\b|\bclam\b|\bshellfish\b', tl))
+    _sesame_in_ocr    = bool(re.search(r'\bsesame\b|\btahini\b', tl))
+    _wheat_in_ocr     = bool(re.search(r'\bwheat\b|\bgluten\b', tl))
 
-    known_allergen_product = (is_whey_product or is_wheat_product or is_peanut_product
-                              or is_tree_nut_product)
+    # Any of the 9 FALCPA major allergens found anywhere in OCR text
+    _any_allergen_in_ocr = (
+        _milk_in_ocr or _peanut_in_ocr or _tree_nut_in_ocr or _soy_in_ocr or
+        _egg_in_ocr or _fish_in_ocr or _shellfish_in_ocr or _sesame_in_ocr or _wheat_in_ocr
+    )
 
+    # ── Step 1: Filename-based checks ─────────────────────────────────────────
+    # When the filename identifies a known allergen product but OCR can't find
+    # the corresponding allergen ingredient — flag that as a critical miss.
     specific_allergen_flagged = False
-    if is_whey_product and not is_non_dairy_protein and not _milk_in_ocr and 'whey' not in tl:
+    if is_whey_product and not is_non_dairy_milk and not _milk_in_ocr and 'whey' not in tl:
         specific_allergen_flagged = True
         issues.append({
             'severity': 'critical',
@@ -978,12 +992,12 @@ def _check_fda(ocr_text: str, fname: str) -> dict:
                 'Verify the allergen declaration is present on the artwork.'
             ),
         })
-    elif is_wheat_product and 'wheat' not in tl:
+    elif is_wheat_product and not _wheat_in_ocr:
         specific_allergen_flagged = True
         issues.append({
             'severity': 'critical',
             'message': (
-                'Wheat-containing product — "wheat" allergen not detected. '
+                'Wheat-containing product — "wheat" allergen not detected in OCR. '
                 'FALCPA requires a "Contains: Wheat" statement. '
                 'Verify the allergen declaration appears on the artwork.'
             ),
@@ -993,7 +1007,7 @@ def _check_fda(ocr_text: str, fname: str) -> dict:
         issues.append({
             'severity': 'critical',
             'message': (
-                'Peanut product — "peanut" allergen not detected. '
+                'Peanut product — "peanut" allergen not detected in OCR. '
                 'FALCPA requires a "Contains: Peanuts" statement. '
                 'Verify the allergen declaration appears on the artwork.'
             ),
@@ -1003,45 +1017,38 @@ def _check_fda(ocr_text: str, fname: str) -> dict:
         issues.append({
             'severity': 'critical',
             'message': (
-                'Tree nut product — tree nut allergen not detected. '
+                'Tree nut product — tree nut allergen not detected in OCR. '
                 'FALCPA requires a "Contains: Tree Nuts" statement. '
                 'Verify the allergen declaration appears on the artwork.'
             ),
         })
 
-    # For ALL products: if no allergen declaration is found, flag it.
-    # For known allergen products where the allergen ingredient was found in OCR
-    # (i.e. specific_allergen_flagged=False because allergen IS readable), we still
-    # require an explicit "Contains: [allergen]" declaration — this is the actual check.
-    if not sparse and not is_non_dairy_protein and not has_contains_stmt:
-        if known_allergen_product and not specific_allergen_flagged:
+    # ── Step 2: Contains: declaration check for ALL products ──────────────────
+    # If any FALCPA major allergen is found in OCR (from ingredient list), the
+    # product MUST have an explicit "Contains: [allergen]" statement.
+    # This check runs regardless of product type — not just filename-identified ones.
+    # If no allergen is found in OCR at all, we can't determine allergen status
+    # (could be allergen-free product), so only flag advisory mismatches.
+    if not sparse and not specific_allergen_flagged and not has_contains_stmt:
+        if _any_allergen_in_ocr:
             issues.append({
                 'severity': 'critical',
                 'message': (
-                    'Allergen declaration "Contains: Milk / Wheat / Peanuts / Tree Nuts" '
-                    'not detected via OCR. FALCPA requires an explicit "Contains:" statement. '
+                    'Allergen ingredients detected in product text but no "Contains: [allergen]" '
+                    'declaration found. FALCPA requires an explicit "Contains:" statement '
+                    'whenever a major allergen is present. '
                     'Verify the declaration is present and readable on the artwork.'
                 ),
             })
-        elif not known_allergen_product:
-            if has_advisory:
-                issues.append({
-                    'severity': 'critical',
-                    'message': (
-                        'Cross-contact advisory detected (e.g., "Allergy Warning" / "Made in a facility...") '
-                        'but no "Contains:" allergen declaration found. The advisory does NOT satisfy FALCPA — '
-                        'a "Contains: [allergens]" statement is still required. Add the declaration.'
-                    ),
-                })
-            else:
-                issues.append({
-                    'severity': 'critical',
-                    'message': (
-                        'No allergen declaration (e.g., "Contains: Milk, Peanuts") detected. '
-                        'FALCPA requires declaration of the 9 major allergens. '
-                        'Verify the "Contains:" statement is present on the artwork.'
-                    ),
-                })
+        elif has_advisory:
+            issues.append({
+                'severity': 'critical',
+                'message': (
+                    'Cross-contact advisory detected (e.g., "Allergy Warning" / "Made in a facility...") '
+                    'but no "Contains:" allergen declaration found. The advisory does NOT satisfy FALCPA — '
+                    'a "Contains: [allergens]" statement is still required. Add the declaration.'
+                ),
+            })
 
     # ── Manufacturer / distributor info ───────────────────────────────────────
     # Multi-signal: any ONE of these is sufficient evidence of a manufacturer block.
@@ -1083,14 +1090,12 @@ def _check_fda(ocr_text: str, fname: str) -> dict:
     # Accept explicit "Net Wt" text OR any weight measurement. Also accept unit-only
     # patterns (e.g. "lb" / "oz" without a preceding number) — outlined display text
     # often OCRs partially, returning the unit but not the number.
-    _nfp_confirmed = _has_nfp_text or _has_nfp_numbers or _nfp_row_hits >= 1
     _has_net_wt = (
         bool(re.search(r'net\s*wt\.?|net\s*weight', tl)) or
         bool(re.search(r'\b\d+\.?\d*\s*(?:oz|lbs?|pounds?|kg|g)\b', tl)) or
         bool(re.search(r'\b(?:oz|lbs?|pounds?)\b', tl))
     )
-    # Suppress: if NFP is confirmed, a net weight declaration is almost certainly present.
-    if not sparse and not _has_net_wt and not _nfp_confirmed:
+    if not sparse and not _has_net_wt:
         issues.append({
             'severity': 'warning',
             'message': (
