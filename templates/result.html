@@ -145,8 +145,10 @@
         <button type="button" class="btn btn-outline-dark" onclick="setCheckFilter('eyemark')">Eyemark</button>
         <button type="button" class="btn btn-outline-dark" onclick="setCheckFilter('spelling')">Spelling</button>
         <button type="button" class="btn btn-outline-dark" onclick="setCheckFilter('fda')">FDA</button>
+        {% if job.brand_config.get('proof_type', 'press') == 'press' %}
         <button type="button" class="btn btn-outline-dark" onclick="setCheckFilter('specs')">Print Specs</button>
         <button type="button" class="btn btn-outline-dark" onclick="setCheckFilter('wind')">Wind Dir</button>
+        {% endif %}
       </div>
     </div>
   </div>
@@ -429,6 +431,7 @@
 <script>
 const JOB_ID      = "{{ job_id }}";
 const INIT_STATUS = "{{ job.status }}";
+const PROOF_TYPE  = "{{ job.brand_config.get('proof_type', 'press') }}";
 
 function esc(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 
@@ -835,8 +838,9 @@ function filterBarHTML() {
           <button type="button" class="btn btn-outline-dark" onclick="setCheckFilter('eyemark')">Eyemark</button>
           <button type="button" class="btn btn-outline-dark" onclick="setCheckFilter('spelling')">Spelling</button>
           <button type="button" class="btn btn-outline-dark" onclick="setCheckFilter('fda')">FDA</button>
+          ${PROOF_TYPE === 'press' ? `
           <button type="button" class="btn btn-outline-dark" onclick="setCheckFilter('specs')">Print Specs</button>
-          <button type="button" class="btn btn-outline-dark" onclick="setCheckFilter('wind')">Wind Dir</button>
+          <button type="button" class="btn btn-outline-dark" onclick="setCheckFilter('wind')">Wind Dir</button>` : ''}
         </div>
       </div>
     </div>

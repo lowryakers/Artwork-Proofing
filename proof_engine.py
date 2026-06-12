@@ -557,8 +557,11 @@ def _check_nfp(ocr_text: str) -> dict:
                 ),
             })
 
-    cal_hits = re.findall(r'calories\s+(\d+)|(\d+)\s+calories', tl)
-    calories = sorted({int(a or b) for a, b in cal_hits if 30 <= int(a or b) <= 800})
+    # Only match "Calories NNN" (NFP format) — the reverse "NNN calories" form
+    # also catches preparation-instruction text like "provides 300 calories when mixed with milk"
+    # and generates false positives on powder products.
+    cal_hits = re.findall(r'calories\s+(\d+)', tl)
+    calories = sorted({int(c) for c in cal_hits if 30 <= int(c) <= 800})
 
     prot_hits = re.findall(r'protein\s+(\d+)\s*g|(\d+)\s*g\s+protein', tl)
     proteins = sorted({int(a or b) for a, b in prot_hits if 0 < int(a or b) < 120})
@@ -567,7 +570,13 @@ def _check_nfp(ocr_text: str) -> dict:
 
     # Dual-column NFPs ("Amount per serving" + "As Prepared") legitimately show
     # two different calorie/protein values — don't flag as a mismatch.
-    has_dual_column = bool(re.search(r'as\s+prepared|when\s+prepared|with\s+milk', tl))
+    # Also suppress when preparation/directions text is present (powder products).
+    has_dual_column = bool(re.search(
+        r'as\s+prepared|when\s+prepared|with\s+(?:whole\s+|2%\s+|skim\s+)?milk|'
+        r'prepared\s+with|per\s+serving\s+prepared|with\s+water|mix(?:ed)?\s+with|'
+        r'directions|serving\s+suggestion|prepared\s+product',
+        tl
+    ))
 
     if len(set(calories)) > 1 and not has_dual_column:
         diff = max(calories) - min(calories)
@@ -805,17 +814,22 @@ _DISCLAIMER_TAIL_RE = re.compile(
 # ── Check 5: FDA compliance ───────────────────────────────────────────────────
 
 _DISEASE_CLAIM_PATTERNS = [
-    (r'\btreat[s]?\b.{0,40}(disease|disorder|condition|syndrome)',
+    # Negative lookahead blocks the FDA disclaimer "treat, cure, or prevent any disease"
+    # (where "treat" is immediately followed by ", cure" or ", or prevent")
+    (r'\btreat[s]?\b(?!\s*[,;.]?\s*(?:cure|prevent|or\s+prevent)).{0,40}(?:disease|disorder|condition|syndrome)',
      'disease treatment claim — prohibited on food/supplement labels without FDA approval'),
-    (r'\bcure[s]?\b.{0,40}(disease|disorder|cancer|diabetes)',
+    # "cure" in the disclaimer is always followed by ", or prevent" — exclude that
+    (r'\bcure[s]?\b(?!\s*[,;.]?\s*(?:or\s+)?prevent).{0,40}(?:disease|disorder|cancer|diabetes)',
      'disease cure claim — prohibited without FDA approval'),
-    (r'\bprevent[s]?\b.{0,40}(disease|cancer|diabetes|heart disease|stroke)',
+    # Only match specific named diseases, not "any disease" (the disclaimer wording)
+    (r'\bprevent[s]?\b.{0,30}(?:cancer\b|diabetes\b|heart\s+disease\b|stroke\b)',
      'disease prevention claim — prohibited without FDA approval (or an approved health claim)'),
-    (r'lower[s]?\s+(your\s+)?cholesterol\b',
+    (r'lower[s]?\s+(?:your\s+)?cholesterol\b',
      '"lowers cholesterol" — authorized health claim requiring specific FDA-approved language (21 CFR 101.75)'),
-    (r'reduc[es]+\s+.{0,20}risk\s+of\s+(cancer|diabetes|heart|stroke)',
+    (r'reduc[es]+\s+.{0,20}risk\s+of\s+(?:cancer|diabetes|heart|stroke)',
      'disease risk-reduction claim — requires an FDA-approved health claim (21 CFR 101.14)'),
-    (r'\bdiagnose[s]?\b.{0,30}(disease|disorder)',
+    # "diagnose" in the disclaimer is always followed by ", treat" — exclude that
+    (r'\bdiagnose[s]?\b(?!\s*[,;.]?\s*(?:treat|cure|prevent)).{0,30}(?:disease|disorder)',
      'diagnostic claim — prohibited on food/supplement labels'),
 ]
 
@@ -851,6 +865,11 @@ def _check_fda(ocr_text: str, fname: str) -> dict:
 
     # ── Required label elements (absence-based — unreliable on outlined PDFs) ─
     # Only flag these if OCR has meaningful yield; otherwise they are noise.
+
+    # Initialize here so they're always defined — used again below in _nfp_confirmed
+    _has_nfp_text    = False
+    _has_nfp_numbers = False
+    _nfp_row_hits    = 0
 
     if not sparse:
         # NFP: accept explicit text OR numerical signals that only appear inside an NFP
@@ -940,16 +959,19 @@ def _check_fda(ocr_text: str, fname: str) -> dict:
     known_allergen_product = (is_whey_product or is_wheat_product or is_peanut_product
                               or is_tree_nut_product)
 
+    specific_allergen_flagged = False
     if is_whey_product and not is_non_dairy_protein and not _milk_in_ocr and 'whey' not in tl:
+        specific_allergen_flagged = True
         issues.append({
             'severity': 'critical',
             'message': (
-                'Whey/milk protein product — "milk" allergen declaration not detected. '
+                'Whey/milk protein product — "milk" allergen not detected in OCR. '
                 'FALCPA requires a "Contains: Milk" statement. '
                 'Verify the allergen declaration is present on the artwork.'
             ),
         })
     elif is_wheat_product and 'wheat' not in tl:
+        specific_allergen_flagged = True
         issues.append({
             'severity': 'critical',
             'message': (
@@ -959,6 +981,7 @@ def _check_fda(ocr_text: str, fname: str) -> dict:
             ),
         })
     elif is_peanut_product and not _peanut_in_ocr:
+        specific_allergen_flagged = True
         issues.append({
             'severity': 'critical',
             'message': (
@@ -968,6 +991,7 @@ def _check_fda(ocr_text: str, fname: str) -> dict:
             ),
         })
     elif is_tree_nut_product and not _tree_nut_in_ocr:
+        specific_allergen_flagged = True
         issues.append({
             'severity': 'critical',
             'message': (
@@ -976,25 +1000,40 @@ def _check_fda(ocr_text: str, fname: str) -> dict:
                 'Verify the allergen declaration appears on the artwork.'
             ),
         })
-    if not known_allergen_product and not is_non_dairy_protein and not has_contains_stmt and not sparse:
-        if has_advisory:
+
+    # For known allergen products where the allergen ingredient WAS found in OCR,
+    # still verify a "Contains:" declaration exists — FALCPA requires it explicitly
+    # even when the allergen already appears in the ingredient list.
+    if not sparse and not is_non_dairy_protein and not has_contains_stmt:
+        if known_allergen_product and not specific_allergen_flagged:
             issues.append({
                 'severity': 'critical',
                 'message': (
-                    'Cross-contact advisory detected (e.g., "Allergy Warning" / "Made in a facility...") '
-                    'but no "Contains:" allergen declaration found. The advisory does NOT satisfy FALCPA — '
-                    'a "Contains: [allergens]" statement is still required. Add the declaration.'
+                    'Allergen declaration "Contains: ..." not detected. '
+                    'FALCPA requires an explicit "Contains: [allergen]" statement even when '
+                    'allergens are listed in the ingredients. '
+                    'Verify the declaration is present on the artwork.'
                 ),
             })
-        else:
-            issues.append({
-                'severity': 'critical',
-                'message': (
-                    'No allergen declaration (e.g., "Contains: Milk, Peanuts") detected. '
-                    'FALCPA requires declaration of the 9 major allergens. '
-                    'Verify the "Contains:" statement is present on the artwork.'
-                ),
-            })
+        elif not known_allergen_product:
+            if has_advisory:
+                issues.append({
+                    'severity': 'critical',
+                    'message': (
+                        'Cross-contact advisory detected (e.g., "Allergy Warning" / "Made in a facility...") '
+                        'but no "Contains:" allergen declaration found. The advisory does NOT satisfy FALCPA — '
+                        'a "Contains: [allergens]" statement is still required. Add the declaration.'
+                    ),
+                })
+            else:
+                issues.append({
+                    'severity': 'critical',
+                    'message': (
+                        'No allergen declaration (e.g., "Contains: Milk, Peanuts") detected. '
+                        'FALCPA requires declaration of the 9 major allergens. '
+                        'Verify the "Contains:" statement is present on the artwork.'
+                    ),
+                })
 
     # ── Manufacturer / distributor info ───────────────────────────────────────
     # Multi-signal: any ONE of these is sufficient evidence of a manufacturer block.

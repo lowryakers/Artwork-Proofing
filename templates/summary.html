@@ -230,67 +230,6 @@
 </div>
 {% endif %}
 
-<!-- FDA section — only files with active issues (clean files excluded) -->
-{# Group FDA issues by unique message to avoid repeated identical lines #}
-{% set fda_by_message = {} %}
-{% set fda_file_count = namespace(with_issues=0, clean=0) %}
-{% for r in results %}
-  {% if not r.error and r.checks.fda %}
-    {% set active_fda = [] %}
-    {% for issue in r.checks.fda.get('issues', []) %}
-      {% set dkey = r.filename ~ '|fda|' ~ loop.index0 %}
-      {% if not dismissals.get(dkey, false) %}
-        {% set _ = active_fda.append(issue) %}
-      {% endif %}
-    {% endfor %}
-    {% if active_fda %}
-      {% set fda_file_count.with_issues = fda_file_count.with_issues + 1 %}
-      {% for issue in active_fda %}
-        {% if issue.message not in fda_by_message %}
-          {% set _ = fda_by_message.update({issue.message: {'severity': issue.severity, 'files': []}}) %}
-        {% endif %}
-        {% set _ = fda_by_message[issue.message].files.append(r.filename) %}
-      {% endfor %}
-    {% else %}
-      {% set fda_file_count.clean = fda_file_count.clean + 1 %}
-    {% endif %}
-  {% endif %}
-{% endfor %}
-
-{% if fda_by_message %}
-<div class="card shadow-sm mb-4 border-danger">
-  <div class="card-header fw-semibold bg-danger bg-opacity-10 text-danger py-2">
-    <i class="bi bi-shield-exclamation me-1"></i>FDA Audit Risk — {{ fda_file_count.with_issues }} file{{ 's' if fda_file_count.with_issues != 1 }} with issues
-    {% if fda_file_count.clean > 0 %}
-    <span class="text-muted fw-normal ms-2">({{ fda_file_count.clean }} clean)</span>
-    {% endif %}
-  </div>
-  <div class="card-body p-0">
-    {% for message, info in fda_by_message.items() %}
-    <div class="border-bottom px-3 py-2">
-      <div class="d-flex gap-2 mb-1 small p-2 rounded
-        {% if info.severity == 'critical' %}bg-danger bg-opacity-10
-        {% elif info.severity == 'warning' %}bg-warning bg-opacity-10
-        {% else %}bg-info bg-opacity-10{% endif %}">
-        <i class="bi
-          {% if info.severity == 'critical' %}bi-x-circle-fill text-danger
-          {% elif info.severity == 'warning' %}bi-exclamation-triangle-fill text-warning
-          {% else %}bi-info-circle-fill text-info{% endif %}
-          flex-shrink-0 mt-1"></i>
-        <div>
-          <div>{{ message }}</div>
-          <div class="text-muted mt-1">
-            <strong>{{ info.files | length }} file{{ 's' if info.files | length != 1 }}:</strong>
-            {{ info.files | join(', ') }}
-          </div>
-        </div>
-      </div>
-    </div>
-    {% endfor %}
-  </div>
-</div>
-{% endif %}
-
 <!-- Footer note -->
 <div class="alert alert-secondary small mt-2 no-print">
   <i class="bi bi-info-circle me-1"></i>
