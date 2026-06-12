@@ -1138,13 +1138,20 @@ def _check_fda(ocr_text: str, fname: str) -> dict:
             )
 
     # ── Organic claim ─────────────────────────────────────────────────────────
-    if re.search(r'\borganic\b', tl):
+    # Only flag front-panel label claims, not ingredient qualifiers like
+    # "Organic Brown Rice Flour" which are common and don't require the USDA seal.
+    _organic_claim_pats = [
+        r'\ball\s+organic\b', r'\b100%\s+organic\b', r'usda\s+organic',
+        r'certified\s+organic', r'made\s+with\s+organic', r'organic\s+ingredients?\b',
+    ]
+    if any(re.search(p, tl) for p in _organic_claim_pats):
         if 'usda organic' not in tl and 'certified organic' not in tl:
             issues.append({
                 'severity': 'warning',
                 'message': (
-                    '"Organic" claim detected without apparent USDA Organic seal or "Certified Organic" language. '
-                    'Organic claims require USDA NOP certification (7 CFR Part 205).'
+                    '"Organic" label claim detected without apparent USDA Organic seal or '
+                    '"Certified Organic" language. Organic claims require USDA NOP certification '
+                    '(7 CFR Part 205).'
                 ),
             })
 
@@ -1336,8 +1343,6 @@ def _check_wind_direction(ocr_text: str, required_wind: str) -> dict:
 
     req_label = _WIND_LABELS[required_wind]
     tl = ocr_text.lower()
-    is_inwound = required_wind in ('5', '6', '7', '8')
-
     import re as _re
     detected_wind = None
 
@@ -1729,9 +1734,9 @@ def _check_print_specs(pdf_path: str, brand_config: dict = None,
     return {
         'issues': issues,
         'notes': notes,
-        'spot_colors': spot_colors if 'spot_colors' in dir() else [],
+        'spot_colors': spot_colors if 'spot_colors' in locals() else [],
         'dimensions': {
-            'mediabox_mm': [mb_w, mb_h] if 'mb_w' in dir() else None,
+            'mediabox_mm': [mb_w, mb_h] if 'mb_w' in locals() else None,
             'trimbox_mm':  [tb_w, tb_h] if tb_w else None,
             'bleed_mm':    bleed_mm,
         },
