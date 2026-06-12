@@ -486,6 +486,7 @@ def history():
     return render_template('history.html', jobs=jobs)
 
 
+
 # ── API ───────────────────────────────────────────────────────────────────────
 
 @app.route('/api/status/<job_id>')
