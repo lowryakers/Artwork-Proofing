@@ -482,9 +482,11 @@ def _check_gtin(ocr_text: str, fname: str, gtin_rows: list,
                 if not keywords:
                     continue  # nothing meaningful to match against
 
-                # Expand abbreviations in filename before matching
+                # Expand abbreviations in filename before matching.
+                # Replace underscores/hyphens with spaces first so \b word boundaries
+                # work correctly (regex treats _ as a word character).
                 fname_lower = fname.lower()
-                fname_expanded = fname_lower
+                fname_expanded = re.sub(r'[_\-]+', ' ', fname_lower)
                 for abbr, expansion in _ABBREVS.items():
                     fname_expanded = re.sub(r'\b' + re.escape(abbr) + r'\b', expansion, fname_expanded)
 
@@ -563,7 +565,11 @@ def _check_nfp(ocr_text: str) -> dict:
 
     nw_hits = re.findall(r'net\s*wt\.?\s*([\d.]+)\s*g', tl)
 
-    if len(set(calories)) > 1:
+    # Dual-column NFPs ("Amount per serving" + "As Prepared") legitimately show
+    # two different calorie/protein values — don't flag as a mismatch.
+    has_dual_column = bool(re.search(r'as\s+prepared|when\s+prepared|with\s+milk', tl))
+
+    if len(set(calories)) > 1 and not has_dual_column:
         diff = max(calories) - min(calories)
         if diff > 5:
             issues.append({
@@ -574,7 +580,7 @@ def _check_nfp(ocr_text: str) -> dict:
                 ),
             })
 
-    if len(set(proteins)) > 1:
+    if len(set(proteins)) > 1 and not has_dual_column:
         if max(proteins) - min(proteins) > 1:
             issues.append({
                 'severity': 'warning',
@@ -782,10 +788,17 @@ def _check_spelling_generic(ocr_text: str, brand_name: str) -> dict:
 
 # ── Module-level FDA regex (shared between _check_fda and _check_fda_light) ───
 
+# Primary disclaimer pattern (well-formatted text)
 _DISCLAIMER_RE = re.compile(
     r'(?:this\s+)?statement[s]?\s+ha(?:s|ve)\s+not\s+been\s+evaluated'
     r'.{0,400}?'
     r'not\s+intended\s+to\s+diagnose.{0,120}disease',
+    re.IGNORECASE | re.DOTALL,
+)
+# Fallback: catch OCR-garbled disclaimer — the second sentence alone is distinctive
+_DISCLAIMER_TAIL_RE = re.compile(
+    r'not\s+intended\s+to\s+diagnose[,.]?\s*treat[,.]?\s*cure[,.]?\s*'
+    r'(?:or\s+)?prevent\s+any\s+disease',
     re.IGNORECASE | re.DOTALL,
 )
 
@@ -1061,14 +1074,16 @@ def _check_fda(ocr_text: str, fname: str) -> dict:
     # Strip the required FDA disclaimer before scanning — it contains "treat",
     # "cure", "diagnose", and "prevent any disease" which would otherwise
     # trigger false positives on every label that correctly includes the disclaimer.
-    disclaimer_present = bool(_DISCLAIMER_RE.search(tl))
+    # Use both primary and fallback patterns — OCR frequently garbles the first
+    # sentence ("These statements have not been evaluated...") but reads the second
+    # ("not intended to diagnose, treat, cure, or prevent any disease") clearly.
+    disclaimer_present = bool(_DISCLAIMER_RE.search(tl)) or bool(_DISCLAIMER_TAIL_RE.search(tl))
     tl_no_disclaimer = _DISCLAIMER_RE.sub('', tl)
+    tl_no_disclaimer = _DISCLAIMER_TAIL_RE.sub('', tl_no_disclaimer)
 
     if disclaimer_present:
         notes.append(
-            'FDA required disclaimer detected — "This statement has not been evaluated by the FDA. '
-            'This product is not intended to diagnose, treat, cure, or prevent any disease." '
-            'Disclaimer text is excluded from disease claim scanning.'
+            'FDA required disclaimer detected — disclaimer text excluded from disease claim scanning.'
         )
 
     for pattern, description in _DISEASE_CLAIM_PATTERNS:
@@ -1234,14 +1249,13 @@ def _check_fda_light(ocr_text: str, fname: str) -> dict:
         )
 
     # ── Disease claims ────────────────────────────────────────────────────────
-    disclaimer_present = bool(_DISCLAIMER_RE.search(tl))
+    disclaimer_present = bool(_DISCLAIMER_RE.search(tl)) or bool(_DISCLAIMER_TAIL_RE.search(tl))
     tl_no_disclaimer = _DISCLAIMER_RE.sub('', tl)
+    tl_no_disclaimer = _DISCLAIMER_TAIL_RE.sub('', tl_no_disclaimer)
 
     if disclaimer_present:
         notes.append(
-            'FDA required disclaimer detected — "This statement has not been evaluated by the FDA. '
-            'This product is not intended to diagnose, treat, cure, or prevent any disease." '
-            'Disclaimer text is excluded from disease claim scanning.'
+            'FDA required disclaimer detected — disclaimer text excluded from disease claim scanning.'
         )
 
     for pattern, description in _DISEASE_CLAIM_PATTERNS:
