@@ -463,6 +463,34 @@ def result(job_id):
     return render_template('result.html', job=job, job_id=job_id, verify_map=verify_map)
 
 
+@app.route('/debug/ocr/<job_id>/<path:filename>')
+def debug_ocr(job_id, filename):
+    """Show the raw OCR text extracted from a specific file in a job."""
+    job = proof_engine.get_job(job_id)
+    if not job:
+        return 'Job not found', 404
+    for r in job.get('results', []):
+        if r.get('filename') == filename:
+            ocr = r.get('ocr_text', '(not stored)')
+            return f'<pre style="white-space:pre-wrap;font-size:13px;padding:1rem">' \
+                   f'FILE: {filename}\nJOB: {job_id}\nOCR LENGTH: {len(ocr)} chars\n\n' \
+                   f'{"="*60}\n{ocr}\n{"="*60}</pre>'
+    return f'File {filename!r} not found in job {job_id}', 404
+
+
+@app.route('/debug/ocr/<job_id>')
+def debug_ocr_list(job_id):
+    """List all files in a job with links to their OCR text."""
+    job = proof_engine.get_job(job_id)
+    if not job:
+        return 'Job not found', 404
+    links = ''.join(
+        f'<li><a href="/debug/ocr/{job_id}/{r["filename"]}">{r["filename"]}</a></li>'
+        for r in job.get('results', []) if not r.get('error')
+    )
+    return f'<ul>{links}</ul>'
+
+
 @app.route('/viewer/<job_id>')
 def viewer(job_id):
     return redirect(url_for('result', job_id=job_id))

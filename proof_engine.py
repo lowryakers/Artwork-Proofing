@@ -366,6 +366,7 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
         'img_path': img_path,
         'img_web': img_path,
         'ocr_preview': combined_text[:3000],
+        'ocr_text': combined_text,
         'checks': checks,
         'severity': severity,
         'critical_count': len(crit),
@@ -1110,30 +1111,36 @@ def _check_fda(ocr_text: str, fname: str) -> dict:
         )
 
     # ── Disease claims ────────────────────────────────────────────────────────
-    # Strip the required FDA disclaimer before scanning — it contains "treat",
-    # "cure", "diagnose", and "prevent any disease" which would otherwise
-    # trigger false positives on every label that correctly includes the disclaimer.
-    # Use both primary and fallback patterns — OCR frequently garbles the first
-    # sentence ("These statements have not been evaluated...") but reads the second
-    # ("not intended to diagnose, treat, cure, or prevent any disease") clearly.
-    disclaimer_present = bool(_DISCLAIMER_RE.search(tl)) or bool(_DISCLAIMER_TAIL_RE.search(tl))
-    tl_no_disclaimer = _DISCLAIMER_RE.sub('', tl)
-    tl_no_disclaimer = _DISCLAIMER_TAIL_RE.sub('', tl_no_disclaimer)
+    # Detect the FDA required disclaimer in full or any OCR-garbled fragment.
+    # When detected, skip disease claim scanning entirely — the disclaimer by
+    # definition means the label is NOT making disease claims. Scanning after
+    # stripping is unreliable because OCR can drop words (e.g. "treat any disease"
+    # without "cure" still triggers the pattern even after partial stripping).
+    _disclaimer_fragments = [
+        _DISCLAIMER_RE,
+        _DISCLAIMER_TAIL_RE,
+        re.compile(r'not\s+intended\s+to\s+(?:diagnose|treat|cure|prevent)', re.IGNORECASE),
+        re.compile(r'has\s+not\s+been\s+evaluated\s+by', re.IGNORECASE),
+        re.compile(r'these\s+statements?\s+ha(?:s|ve)\s+not\s+been\s+evaluated', re.IGNORECASE),
+        re.compile(r'food\s+and\s+drug\s+administration', re.IGNORECASE),
+    ]
+    disclaimer_present = any(p.search(tl) for p in _disclaimer_fragments)
 
     if disclaimer_present:
         notes.append(
-            'FDA required disclaimer detected — disclaimer text excluded from disease claim scanning.'
+            'FDA required disclaimer detected — disease claim scanning skipped '
+            '(the disclaimer indicates no disease claims are being made).'
         )
-
-    for pattern, description in _DISEASE_CLAIM_PATTERNS:
-        if re.search(pattern, tl_no_disclaimer):
-            issues.append({
-                'severity': 'critical',
-                'message': (
-                    f'Potential unauthorized disease claim detected: {description}. '
-                    'Unapproved disease claims are prohibited (21 CFR 101.14 / FD&C Act 403(r)).'
-                ),
-            })
+    else:
+        for pattern, description in _DISEASE_CLAIM_PATTERNS:
+            if re.search(pattern, tl, re.IGNORECASE):
+                issues.append({
+                    'severity': 'critical',
+                    'message': (
+                        f'Potential unauthorized disease claim detected: {description}. '
+                        'Unapproved disease claims are prohibited (21 CFR 101.14 / FD&C Act 403(r)).'
+                    ),
+                })
 
     # ── Structure/function claims + disclaimer ────────────────────────────────
     sf_found = [p for p in _SF_CLAIM_PATTERNS if re.search(p, tl)]
