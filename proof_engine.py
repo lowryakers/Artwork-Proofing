@@ -495,13 +495,37 @@ def _check_nfp(ocr_text: str) -> dict:
     issues, notes = [], []
     tl = ocr_text.lower()
 
-    has_nfp = 'nutrition facts' in tl or 'supplement facts' in tl
+    # Use multi-signal detection — outlined-text PDFs often OCR row labels/numbers
+    # even when the "Nutrition Facts" header text doesn't render. Avoid false flags
+    # on sparse (all-outlined) files where nothing OCRs at all.
+    sparse = _ocr_is_sparse(ocr_text)
+
+    _nfp_row_signals = [r'\btotal\s*fat\b', r'\bsodium\b', r'\bcarbohydrate\b',
+                        r'\bdietary\s*fiber\b', r'\b%\s*dv\b', r'%\s*daily\s*value',
+                        r'\bserving\s*size\b', r'\bservings?\s*per\b',
+                        r'\btotal\s*carb\b', r'\bsaturated\s*fat\b',
+                        r'\btrans\s*fat\b', r'\bcholesterol\b', r'\bsugars?\b']
+
+    has_nfp_header  = 'nutrition facts' in tl or 'supplement facts' in tl
+    has_nfp_numbers = bool(re.search(r'\bcalories?\b', tl)) or bool(re.search(r'\bprotein\b', tl))
+    nfp_row_hits    = sum(1 for p in _nfp_row_signals if re.search(p, tl))
+    has_nfp         = has_nfp_header or has_nfp_numbers or nfp_row_hits >= 1
+
     if not has_nfp:
-        notes.append(
-            'Nutrition Facts (or Supplement Facts) panel not detected via OCR. '
-            'Print-ready PDFs with text converted to outlines will not OCR — '
-            'verify manually that the NFP is present and correctly formatted.'
-        )
+        if sparse:
+            notes.append(
+                'Nutrition Facts panel could not be verified via OCR — text appears to be converted '
+                'to outlines (standard for print-ready files). Verify the NFP is present directly on '
+                'the artwork.'
+            )
+        else:
+            issues.append({
+                'severity': 'warning',
+                'message': (
+                    'Nutrition Facts (or Supplement Facts) panel not detected via OCR. '
+                    'Verify the NFP is present and correctly formatted on the artwork.'
+                ),
+            })
 
     cal_hits = re.findall(r'calories\s+(\d+)|(\d+)\s+calories', tl)
     calories = sorted({int(a or b) for a, b in cal_hits if 30 <= int(a or b) <= 800})
@@ -541,6 +565,7 @@ def _check_nfp(ocr_text: str) -> dict:
 
     return {
         'has_nfp': has_nfp,
+        'has_nfp_header': has_nfp_header,
         'calories': calories,
         'proteins': proteins,
         'net_weights': nw_hits,
@@ -1429,14 +1454,26 @@ def _check_print_specs(pdf_path: str, brand_config: dict = None,
                 (abs(dim_ref[0] - spec_w) <= tol and abs(dim_ref[1] - spec_h) <= tol) or
                 (abs(dim_ref[0] - spec_h) <= tol and abs(dim_ref[1] - spec_w) <= tol)
             )
-            if not fits:
-                issues.append({'severity': 'critical',
-                               'message': f'Dimension mismatch — {dim_label} size is '
-                                          f'{dim_ref[0]} × {dim_ref[1]} mm, '
-                                          f'spec requires {spec_w} × {spec_h} mm (±2 mm). '
-                                          'Verify the artwork size with your print supplier before going to press.'})
-            else:
+            if fits:
                 notes.append(f'Dimensions match spec: {spec_w} × {spec_h} mm ✓')
+            else:
+                # ≥1.9× scale difference indicates a multi-panel flat/die-cut layout where
+                # the TrimBox captures all panels unfolded (front+back+gusset) while the spec
+                # stores the finished single-panel size. Flag as a note, not a critical error.
+                scale = max(dim_ref[0] / spec_w, dim_ref[1] / spec_h,
+                            dim_ref[0] / spec_h, dim_ref[1] / spec_w)
+                if scale >= 1.9:
+                    notes.append(
+                        f'File {dim_label} size ({dim_ref[0]} × {dim_ref[1]} mm) appears to be a '
+                        f'multi-panel layout — spec finished size is {spec_w} × {spec_h} mm. '
+                        'Verify overall layout dimensions with your print supplier.'
+                    )
+                else:
+                    issues.append({'severity': 'critical',
+                                   'message': f'Dimension mismatch — {dim_label} size is '
+                                              f'{dim_ref[0]} × {dim_ref[1]} mm, '
+                                              f'spec requires {spec_w} × {spec_h} mm (±2 mm). '
+                                              'Verify the artwork size with your print supplier before going to press.'})
 
         # ── Spot / Pantone colors ─────────────────────────────────────────────
         spot_colors = sorted(_extract_spot_colors(doc))
@@ -1448,11 +1485,19 @@ def _check_print_specs(pdf_path: str, brand_config: dict = None,
         # Validate required spot colors from spec sheet
         req_spots_raw = matched_spec.get('spot_colors', '')
         if req_spots_raw:
-            req_spots = [s.strip() for s in req_spots_raw.split(',') if s.strip()]
+            # Filter out blank/placeholder values like "PMS --", "--", "-", "N/A", "TBD"
+            _PLACEHOLDER = re.compile(r'^[-–—]+$|^n/?a$|^tbd$|^none$|^pms\s*[-–—]+$', re.I)
+            req_spots = [
+                s.strip() for s in req_spots_raw.split(',')
+                if s.strip() and not _PLACEHOLDER.match(s.strip())
+            ]
 
             def _norm_pantone(name: str) -> str:
-                # Strip trailing Pantone finish suffix (C=coated, U=uncoated, M=matte, CP, EC, etc.)
-                return re.sub(r'\s+[CUMcum]{1,2}P?\s*$', '', name.strip()).strip().lower()
+                # Normalize prefix: "PANTONE" and "PMS" both reduced to just the number/name
+                n = re.sub(r'^(pantone|pms)\s*', '', name.strip(), flags=re.I)
+                # Strip trailing finish suffix (C=coated, U=uncoated, M=matte, CP, EC, etc.)
+                n = re.sub(r'\s+[CUMcum]{1,2}P?\s*$', '', n).strip()
+                return n.lower()
 
             def _spot_matches(req: str, file_colors: list) -> bool:
                 req_n = _norm_pantone(req)
