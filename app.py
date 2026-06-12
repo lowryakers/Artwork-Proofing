@@ -16,14 +16,9 @@ app = Flask(__name__)
 app.secret_key = os.environ.get('SECRET_KEY', 'prodough-proof-site-2024-local')
 app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024  # 500 MB
 
-# Build version — captured once at startup so it's always available
-try:
-    _GIT_SHA = subprocess.check_output(
-        ['git', 'rev-parse', '--short', 'HEAD'], cwd=os.path.dirname(__file__),
-        stderr=subprocess.DEVNULL
-    ).decode().strip()
-except Exception:
-    _GIT_SHA = 'unknown'
+# Railway injects RAILWAY_GIT_COMMIT_SHA automatically at runtime
+_raw_sha = os.environ.get('RAILWAY_GIT_COMMIT_SHA', '')
+_GIT_SHA = _raw_sha[:7] if _raw_sha else 'unknown'
 
 _DEPLOY_TIME = datetime.now().strftime('%Y-%m-%d %H:%M UTC')
 
