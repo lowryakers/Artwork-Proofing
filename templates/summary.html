@@ -100,10 +100,29 @@
   </div>
 </div>
 
-<!-- File status overview table (dismiss-aware per-check icons) -->
+<!-- Files with issues table — clean files are omitted -->
+{% set files_with_issues = [] %}
+{% for r in results %}
+  {% if not r.error %}
+    {% set fc = [] %}{% set fw = [] %}
+    {% for check_name, check in r.checks.items() %}
+      {% for issue in check.get('issues', []) %}
+        {% set dkey = r.filename ~ '|' ~ check_name ~ '|' ~ loop.index0 %}
+        {% if not dismissals.get(dkey, false) %}
+          {% if issue.severity == 'critical' %}{% set _ = fc.append(1) %}{% endif %}
+          {% if issue.severity == 'warning'  %}{% set _ = fw.append(1) %}{% endif %}
+        {% endif %}
+      {% endfor %}
+    {% endfor %}
+    {% if fc or fw %}{% set _ = files_with_issues.append({'r': r, 'crits': fc, 'warns': fw}) %}{% endif %}
+  {% endif %}
+{% endfor %}
+
+{% if files_with_issues %}
 <div class="card shadow-sm mb-4">
   <div class="card-header fw-semibold bg-light py-2">
-    <i class="bi bi-table me-1"></i>File Status Overview
+    <i class="bi bi-table me-1"></i>Files with Issues
+    <span class="text-muted fw-normal ms-2 small">({{ files_with_issues | length }} of {{ results | length }} files)</span>
   </div>
   <div class="table-responsive">
     <table class="table table-sm table-hover align-middle mb-0 small">
@@ -119,8 +138,8 @@
         </tr>
       </thead>
       <tbody>
-        {% for r in results %}
-        {% if not r.error %}
+        {% for entry in files_with_issues %}
+        {% set r = entry.r %}
         <tr>
           <td class="ps-3 fw-semibold">{{ r.filename }}</td>
           {{ _check_cell(r.checks.gtin,     r.filename, 'gtin',     dismissals) }}
@@ -129,37 +148,26 @@
           {{ _check_cell(r.checks.spelling, r.filename, 'spelling', dismissals) }}
           {{ _check_cell(r.checks.fda,      r.filename, 'fda',      dismissals) }}
           <td class="text-center pe-3">
-            {# Recompute per-file severity after dismissals #}
-            {% set file_crits = [] %}
-            {% set file_warns = [] %}
-            {% for check_name, check in r.checks.items() %}
-              {% for issue in check.get('issues', []) %}
-                {% set dkey = r.filename ~ '|' ~ check_name ~ '|' ~ loop.index0 %}
-                {% if not dismissals.get(dkey, false) %}
-                  {% if issue.severity == 'critical' %}{% set _ = file_crits.append(1) %}{% endif %}
-                  {% if issue.severity == 'warning'  %}{% set _ = file_warns.append(1) %}{% endif %}
-                {% endif %}
-              {% endfor %}
-            {% endfor %}
-            {% if file_crits %}
-              <span class="badge bg-danger">{{ file_crits | length }} critical</span>
-            {% elif file_warns %}
-              <span class="badge bg-warning text-dark">{{ file_warns | length }} warnings</span>
+            {% if entry.crits %}
+              <span class="badge bg-danger">{{ entry.crits | length }} critical</span>
             {% else %}
-              <span class="badge bg-success">Clean</span>
+              <span class="badge bg-warning text-dark">{{ entry.warns | length }} warnings</span>
             {% endif %}
           </td>
         </tr>
-        {% else %}
-        <tr class="table-secondary">
-          <td class="ps-3 text-muted fst-italic" colspan="7">{{ r.filename }} — error: {{ r.error }}</td>
-        </tr>
-        {% endif %}
+        {% endfor %}
+        {% for r in results %}
+          {% if r.error %}
+          <tr class="table-secondary">
+            <td class="ps-3 text-muted fst-italic" colspan="7">{{ r.filename }} — error: {{ r.error }}</td>
+          </tr>
+          {% endif %}
         {% endfor %}
       </tbody>
     </table>
   </div>
 </div>
+{% endif %}
 
 <!-- Critical issues (filtered) -->
 {% if all_crits %}

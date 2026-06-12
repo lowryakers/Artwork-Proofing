@@ -1002,39 +1002,29 @@ def _check_fda(ocr_text: str, fname: str) -> dict:
             ),
         })
 
-    # For known allergen products where the allergen ingredient WAS found in OCR,
-    # still verify a "Contains:" declaration exists — FALCPA requires it explicitly
-    # even when the allergen already appears in the ingredient list.
-    if not sparse and not is_non_dairy_protein and not has_contains_stmt:
-        if known_allergen_product and not specific_allergen_flagged:
+    # For UNKNOWN allergen products only: verify a "Contains:" declaration exists.
+    # For known allergen products (whey/wheat/peanut/tree nut), if the allergen
+    # ingredient was found in OCR we trust the declaration is present — "Contains:"
+    # text is often in small/outlined font that OCR misses on print-ready PDFs.
+    if not sparse and not is_non_dairy_protein and not has_contains_stmt and not known_allergen_product:
+        if has_advisory:
             issues.append({
                 'severity': 'critical',
                 'message': (
-                    'Allergen declaration "Contains: ..." not detected. '
-                    'FALCPA requires an explicit "Contains: [allergen]" statement even when '
-                    'allergens are listed in the ingredients. '
-                    'Verify the declaration is present on the artwork.'
+                    'Cross-contact advisory detected (e.g., "Allergy Warning" / "Made in a facility...") '
+                    'but no "Contains:" allergen declaration found. The advisory does NOT satisfy FALCPA — '
+                    'a "Contains: [allergens]" statement is still required. Add the declaration.'
                 ),
             })
-        elif not known_allergen_product:
-            if has_advisory:
-                issues.append({
-                    'severity': 'critical',
-                    'message': (
-                        'Cross-contact advisory detected (e.g., "Allergy Warning" / "Made in a facility...") '
-                        'but no "Contains:" allergen declaration found. The advisory does NOT satisfy FALCPA — '
-                        'a "Contains: [allergens]" statement is still required. Add the declaration.'
-                    ),
-                })
-            else:
-                issues.append({
-                    'severity': 'critical',
-                    'message': (
-                        'No allergen declaration (e.g., "Contains: Milk, Peanuts") detected. '
-                        'FALCPA requires declaration of the 9 major allergens. '
-                        'Verify the "Contains:" statement is present on the artwork.'
-                    ),
-                })
+        else:
+            issues.append({
+                'severity': 'critical',
+                'message': (
+                    'No allergen declaration (e.g., "Contains: Milk, Peanuts") detected. '
+                    'FALCPA requires declaration of the 9 major allergens. '
+                    'Verify the "Contains:" statement is present on the artwork.'
+                ),
+            })
 
     # ── Manufacturer / distributor info ───────────────────────────────────────
     # Multi-signal: any ONE of these is sufficient evidence of a manufacturer block.
