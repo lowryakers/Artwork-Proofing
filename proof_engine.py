@@ -868,69 +868,120 @@ def _check_fda(ocr_text: str, fname: str) -> dict:
         )
 
     # ── Allergen declaration ───────────────────────────────────────────────────
-    has_allergen_stmt = any(re.search(p, tl) for p in
-                            [r'contains?:', r'\ballergen\b', r'allergy\s+info', r'may\s+contain'])
-
-    is_whey_product  = any(re.search(p, fname.lower() + ' ' + tl)
-                          for p in [r'\bwhey\b', r'protein\s+stick', r'protein\s+powder',
-                                    r'\bstick\b', r'\bsticks\b', r'\bpouch\b', r'\bpouches\b'])
-    is_wheat_product = any(re.search(p, fname.lower() + ' ' + tl)
-                          for p in [r'\bpancake\b', r'\bdonut\b', r'\bflour\b', r'\bmix\b'])
-
-    # Milk evidence: explicit word, or milk-derived ingredients that OCR from outlined fonts
-    _milk_in_ocr = bool(re.search(
-        r'\bmilk\b|\bnon.fat\s+milk\b|\bmilk\s+powder\b|\bskim\s+milk\b|\bdairy\b|\bcasein\b', tl
+    # "Contains:" is the FALCPA-required declaration. "Allergy Warning" / "may contain"
+    # are voluntary cross-contact advisories — they do NOT satisfy the FALCPA requirement.
+    has_contains_stmt = bool(re.search(r'contains?:', tl))
+    has_advisory      = bool(re.search(
+        r'\ballergy\b|\ballergen\b|allergy\s+info|allergy\s+warning|may\s+contain', tl
     ))
-    # If it's a whey/stick protein product, the product type implies milk is present.
-    # Only fire if NEITHER the filename NOR any OCR evidence suggests milk/whey.
-    if is_whey_product and not _milk_in_ocr and 'whey' not in tl and 'whey' not in fname.lower():
+
+    fname_tl = fname.lower() + ' ' + tl
+    is_whey_product  = bool(re.search(r'\bwhey\b', fname_tl))
+    is_non_dairy_protein = bool(re.search(
+        r'\bbeef\b|\bcollagen\b|\bbovine\b|\bplant\b|\bpea\s+protein\b|\brice\s+protein\b|\bvegan\b',
+        fname_tl))
+    is_wheat_product = bool(re.search(r'\bpancake\b|\bdonut\b|\bflour\b|\bbreading\b', fname.lower()))
+    is_peanut_product = bool(re.search(r'\bpeanut\b|\bpb\b', fname.lower()))
+    _TREE_NUTS = r'\balmond\b|\bcashew\b|\bwalnut\b|\bpecan\b|\bhazelnut\b|\bpistachio\b|\bmacadamia\b'
+    is_tree_nut_product = bool(re.search(_TREE_NUTS, fname_tl))
+
+    _milk_in_ocr    = bool(re.search(
+        r'\bmilk\b|\bnon.fat\s+milk\b|\bmilk\s+powder\b|\bskim\s+milk\b|\bdairy\b|\bcasein\b', tl))
+    _peanut_in_ocr  = bool(re.search(r'\bpeanut\b', tl))
+    _tree_nut_in_ocr = bool(re.search(_TREE_NUTS + r'|\btree\s+nut\b', tl))
+
+    known_allergen_product = (is_whey_product or is_wheat_product or is_peanut_product
+                              or is_tree_nut_product)
+
+    if is_whey_product and not is_non_dairy_protein and not _milk_in_ocr and 'whey' not in tl:
         issues.append({
-            'severity': 'warning',
+            'severity': 'critical',
             'message': (
-                'Whey/milk protein product — "milk" allergen declaration not detected via OCR. '
-                'FDA FALCPA (21 USC 343(w)) requires milk to be declared as a major food allergen. '
-                'Verify the allergen statement is present on the actual artwork.'
+                'Whey/milk protein product — "milk" allergen declaration not detected. '
+                'FALCPA requires a "Contains: Milk" statement. '
+                'Verify the allergen declaration is present on the artwork.'
             ),
         })
     elif is_wheat_product and 'wheat' not in tl:
         issues.append({
-            'severity': 'warning',
+            'severity': 'critical',
             'message': (
-                'Wheat-containing product type — "wheat" allergen not detected via OCR. '
-                'FALCPA requires wheat to be declared as a major food allergen (21 USC 343(w)). '
-                'Verify the allergen statement appears on the actual artwork.'
+                'Wheat-containing product — "wheat" allergen not detected. '
+                'FALCPA requires a "Contains: Wheat" statement. '
+                'Verify the allergen declaration appears on the artwork.'
             ),
         })
-    elif not is_whey_product and not is_wheat_product and not has_allergen_stmt and not sparse:
+    elif is_peanut_product and not _peanut_in_ocr:
         issues.append({
-            'severity': 'warning',
+            'severity': 'critical',
             'message': (
-                'No allergen declaration (e.g., "Contains: Milk") detected via OCR. '
-                'FALCPA requires declaration of the 9 major allergens. Verify manually.'
+                'Peanut product — "peanut" allergen not detected. '
+                'FALCPA requires a "Contains: Peanuts" statement. '
+                'Verify the allergen declaration appears on the artwork.'
             ),
         })
+    elif is_tree_nut_product and not _tree_nut_in_ocr:
+        issues.append({
+            'severity': 'critical',
+            'message': (
+                'Tree nut product — tree nut allergen not detected. '
+                'FALCPA requires a "Contains: Tree Nuts" statement. '
+                'Verify the allergen declaration appears on the artwork.'
+            ),
+        })
+    if not known_allergen_product and not is_non_dairy_protein and not has_contains_stmt and not sparse:
+        if has_advisory:
+            issues.append({
+                'severity': 'critical',
+                'message': (
+                    'Cross-contact advisory detected (e.g., "Allergy Warning" / "Made in a facility...") '
+                    'but no "Contains:" allergen declaration found. The advisory does NOT satisfy FALCPA — '
+                    'a "Contains: [allergens]" statement is still required. Add the declaration.'
+                ),
+            })
+        else:
+            issues.append({
+                'severity': 'critical',
+                'message': (
+                    'No allergen declaration (e.g., "Contains: Milk, Peanuts") detected. '
+                    'FALCPA requires declaration of the 9 major allergens. '
+                    'Verify the "Contains:" statement is present on the artwork.'
+                ),
+            })
 
     # ── Manufacturer / distributor info ───────────────────────────────────────
+    # Multi-signal: any ONE of these is sufficient evidence of a manufacturer block.
+    # OCR frequently garbles small bottom-of-label text, so cast a wide net.
     if not sparse:
-        _mfr_indicators = [
+        _mfr_phrases = [
             'manufactured by', 'distributed by', 'produced by', 'manufactured for',
-            'distributed for', 'packed by', 'bottled by',
-            'llc', 'inc.', 'corp.', 'company', 'co.', 'group', 'enterprises',
-            'nutrition', 'foods', 'labs', 'ops', 'industries', 'international',
+            'distributed for', 'packed by', 'bottled by', 'made by',
         ]
-        has_mfr_text = any(ind in tl for ind in _mfr_indicators)
-        has_zip      = bool(re.search(r'\b\d{5}\b', ocr_text))
-        has_street   = bool(re.search(
+        _mfr_entity_words = [
+            'llc', 'inc.', 'inc', 'corp.', 'corp', 'company', 'co.',
+            'group', 'enterprises', 'nutrition', 'foods', 'labs', 'ops',
+            'industries', 'international', 'brands', 'holdings',
+        ]
+        _US_STATES = (
+            r'\b(AL|AK|AZ|AR|CA|CO|CT|DE|FL|GA|HI|ID|IL|IN|IA|KS|KY|LA|ME|MD|'
+            r'MA|MI|MN|MS|MO|MT|NE|NV|NH|NJ|NM|NY|NC|ND|OH|OK|OR|PA|RI|SC|SD|'
+            r'TN|TX|UT|VT|VA|WA|WV|WI|WY)\b'
+        )
+        has_mfr_phrase = any(ind in tl for ind in _mfr_phrases)
+        has_entity     = any(ind in tl for ind in _mfr_entity_words)
+        has_zip        = bool(re.search(r'\b\d{5}\b', ocr_text))
+        has_state_zip  = bool(re.search(_US_STATES + r'\s*\d{5}', ocr_text))
+        has_street     = bool(re.search(
             r'\b\d+\s+[NSEW]\.?\s+\d+|\b\d+\s+\w+\s+(st|ave|blvd|dr|rd|ln|way|pkwy|court|ct)\b', tl
         ))
 
-        if not (has_mfr_text or has_zip or has_street):
+        _mfr_signals = sum([has_mfr_phrase, has_entity, has_zip, has_state_zip, has_street])
+        if _mfr_signals == 0:
             issues.append({
                 'severity': 'warning',
                 'message': (
                     'Manufacturer or distributor name/address not detected via OCR. '
-                    '21 CFR 101.5 requires the name and place of business of the manufacturer, packer, '
-                    'or distributor. Verify it appears on the actual artwork.'
+                    'Verify the manufacturer name and place of business appear on the artwork.'
                 ),
             })
 
