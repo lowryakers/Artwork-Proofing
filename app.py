@@ -2,18 +2,36 @@ import os
 import io
 import json
 import re
+import subprocess
 import time
 import urllib.request
 import openpyxl
 from datetime import datetime
 from flask import (Flask, render_template, request, redirect,
-                   url_for, flash, jsonify, send_file)
+                   url_for, flash, jsonify, send_file, g)
 
 import proof_engine
 
 app = Flask(__name__)
 app.secret_key = os.environ.get('SECRET_KEY', 'prodough-proof-site-2024-local')
 app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024  # 500 MB
+
+# Build version — captured once at startup so it's always available
+try:
+    _GIT_SHA = subprocess.check_output(
+        ['git', 'rev-parse', '--short', 'HEAD'], cwd=os.path.dirname(__file__),
+        stderr=subprocess.DEVNULL
+    ).decode().strip()
+except Exception:
+    _GIT_SHA = 'unknown'
+
+_DEPLOY_TIME = datetime.now().strftime('%Y-%m-%d %H:%M UTC')
+
+
+@app.before_request
+def _inject_version():
+    g.git_sha     = _GIT_SHA
+    g.deploy_time = _DEPLOY_TIME
 
 BASE_DIR              = os.path.dirname(os.path.abspath(__file__))
 UPLOAD_DIR            = os.path.join(BASE_DIR, 'uploads')
@@ -516,6 +534,11 @@ def history():
 
 
 # ── API ───────────────────────────────────────────────────────────────────────
+
+@app.route('/version')
+def version():
+    return jsonify({'sha': _GIT_SHA, 'deployed': _DEPLOY_TIME})
+
 
 @app.route('/api/status/<job_id>')
 def api_status(job_id):
