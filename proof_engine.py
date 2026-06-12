@@ -333,16 +333,19 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
     else:
         # ProDough mode
         is_film = _is_film_rollstock(fname, combined_text)
+        proof_type = brand_config.get('proof_type', 'press')
         checks = {
             'gtin':     _check_gtin(combined_text, fname, gtin_rows, barcode_gtins),
             'nfp':      _check_nfp(combined_text),
             'eyemark':  _check_eyemark(img, is_film, fname),
             'spelling': _check_spelling(combined_text, fname),
             'fda':      _check_fda(combined_text, fname),
-            'specs':    _check_print_specs(pdf_path, brand_config, matched_spec),
         }
-        if effective_wind:
-            checks['wind'] = _check_wind_direction(combined_text, effective_wind)
+        # Print Specs and Wind Direction are press-proof checks — skip for art proofs
+        if proof_type != 'art':
+            checks['specs'] = _check_print_specs(pdf_path, brand_config, matched_spec)
+            if effective_wind:
+                checks['wind'] = _check_wind_direction(combined_text, effective_wind)
 
     all_issues = [i for c in checks.values() for i in c.get('issues', [])]
     crit  = [i for i in all_issues if i['severity'] == 'critical']
@@ -456,6 +459,18 @@ def _check_gtin(ocr_text: str, fname: str, gtin_rows: list,
             'plant', 'based', 'vegan',
             'the', 'a', 'an', 'and', 'of', 'with', 'for', 'to',
         }
+        # Common abbreviations found in filenames — expand before keyword matching
+        _ABBREVS = {
+            'pb':   'peanut butter',
+            'choc': 'chocolate',
+            'van':  'vanilla',
+            'straw': 'strawberry',
+            'lem':  'lemon',
+            'cinn': 'cinnamon',
+            'bday': 'birthday',
+            'btrscotch': 'butterscotch',
+        }
+
         for gtin in found:
             if gtin in gtin_lookup:
                 expected_flavor = gtin_lookup[gtin]
@@ -466,20 +481,33 @@ def _check_gtin(ocr_text: str, fname: str, gtin_rows: list,
                 keywords = [w for w in flavor_words if w not in _GENERIC and len(w) > 1]
                 if not keywords:
                     continue  # nothing meaningful to match against
-                # Match against PDF text content (OCR + native), fall back to filename
+
+                # Expand abbreviations in filename before matching
                 fname_lower = fname.lower()
-                matched = [kw for kw in keywords if kw in pdf_text_lower or kw in fname_lower]
-                if len(matched) < len(keywords):
-                    missing = [kw for kw in keywords if kw not in pdf_text_lower and kw not in fname_lower]
+                fname_expanded = fname_lower
+                for abbr, expansion in _ABBREVS.items():
+                    fname_expanded = re.sub(r'\b' + re.escape(abbr) + r'\b', expansion, fname_expanded)
+
+                matched = [kw for kw in keywords
+                           if kw in pdf_text_lower or kw in fname_lower or kw in fname_expanded]
+                required = (len(keywords) + 1) // 2  # majority threshold — ceil(N/2)
+                if len(matched) < required:
+                    missing = [kw for kw in keywords
+                               if kw not in pdf_text_lower and kw not in fname_lower and kw not in fname_expanded]
+                    # 0 of N matched → almost certainly the wrong SKU → critical
+                    # Some matched → possible mismatch or OCR gap → warning
+                    sev = 'critical' if len(matched) == 0 else 'warning'
                     issues.append({
-                        'severity': 'warning',
+                        'severity': sev,
                         'message': (
                             f'GTIN {gtin} is listed under "{expected_flavor}" in the master list, '
-                            f'but the keyword(s) "{", ".join(missing)}" were not found in the artwork text '
-                            f'or filename. Confirm this is the correct SKU.'
+                            f'but only {len(matched)} of {len(keywords)} identifying keyword(s) '
+                            f'("{", ".join(missing)}" missing) were found. '
+                            + ('This barcode appears to be for a different SKU — verify before printing.'
+                               if sev == 'critical' else 'Confirm this is the correct SKU.')
                         ),
                     })
-                # If all keywords matched, the flavor lines up — no issue raised
+                # Majority matched — flavor lines up, no issue raised
             else:
                 issues.append({
                     'severity': 'warning',
@@ -844,10 +872,15 @@ def _check_fda(ocr_text: str, fname: str) -> dict:
         _ingredient_signals = [
             r'\bingredient',
             r'\bwhey\b', r'\blecithin\b', r'\bstevia\b', r'\bsucralose\b',
-            r'\bsunflower\b', r'\bcitric\s+acid\b', r'\bsoy\b', r'\bxanthan\b',
+            r'\bsunflower\b', r'\bcitric\s+acid\b', r'\bxanthan\b',
             r'\bnatural\s+flavor', r'\bartificial\s+flavor',
             r'\bmilk\s+powder\b', r'\bnon.fat\s+milk\b', r'\bskim\s+milk\b',
-            r'\bcocoa\b', r'\bsalt\b', r'\bpotassium\b', r'\bvitamin\b',
+            r'\bcocoa\b', r'\bpotassium\b', r'\bvitamin\b',
+            r'\bprotein\s+isolate\b', r'\bprotein\s+concentrate\b',
+            r'\bmct\s+oil\b', r'\bguar\s+gum\b', r'\bsea\s+salt\b',
+            r'\bmonk\s+fruit\b', r'\bstevia\s+leaf\b', r'\bcoconut\s+(milk|powder|flour|oil)\b',
+            r'\bcinnamon\b', r'\btumeric\b|\bturmeric\b',
+            r'\bless\s+than\s+\d', r'\bcontains\s+less\s+than\b',
         ]
         _has_ingredients = any(re.search(p, tl) for p in _ingredient_signals)
         if not _has_ingredients:
@@ -870,7 +903,8 @@ def _check_fda(ocr_text: str, fname: str) -> dict:
     # ── Allergen declaration ───────────────────────────────────────────────────
     # "Contains:" is the FALCPA-required declaration. "Allergy Warning" / "may contain"
     # are voluntary cross-contact advisories — they do NOT satisfy the FALCPA requirement.
-    has_contains_stmt = bool(re.search(r'contains?:', tl))
+    # Accept "contains" with or without colon — OCR frequently drops punctuation.
+    has_contains_stmt = bool(re.search(r'\bcontains?\b', tl))
     has_advisory      = bool(re.search(
         r'\ballergy\b|\ballergen\b|allergy\s+info|allergy\s+warning|may\s+contain', tl
     ))
@@ -986,18 +1020,22 @@ def _check_fda(ocr_text: str, fname: str) -> dict:
             })
 
     # ── Net weight ────────────────────────────────────────────────────────────
-    # Accept "Net Wt" text OR any gram/oz/lb measurement — numbers usually OCR
-    # even when the "Net Wt" label is outlined.
+    # Accept explicit "Net Wt" text OR any weight measurement. Also accept unit-only
+    # patterns (e.g. "lb" / "oz" without a preceding number) — outlined display text
+    # often OCRs partially, returning the unit but not the number.
+    _nfp_confirmed = _has_nfp_text or _has_nfp_numbers or _nfp_row_hits >= 1
     _has_net_wt = (
         bool(re.search(r'net\s*wt\.?|net\s*weight', tl)) or
-        bool(re.search(r'\b\d+\.?\d*\s*(?:oz|lbs?|pounds?|kg|g)\b', tl))
+        bool(re.search(r'\b\d+\.?\d*\s*(?:oz|lbs?|pounds?|kg|g)\b', tl)) or
+        bool(re.search(r'\b(?:oz|lbs?|pounds?)\b', tl))
     )
-    if not sparse and not _has_net_wt:
+    # Suppress: if NFP is confirmed, a net weight declaration is almost certainly present.
+    if not sparse and not _has_net_wt and not _nfp_confirmed:
         issues.append({
             'severity': 'warning',
             'message': (
                 'No "Net Wt" declaration or weight measurement detected. '
-                'Net quantity of contents is required (15 USC 1453 / 21 CFR 101.105). Verify manually.'
+                'Verify the net weight appears on the artwork.'
             ),
         })
     elif re.search(r'net\s*wt\.?|net\s*weight', tl):
