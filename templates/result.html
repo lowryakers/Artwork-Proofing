@@ -104,20 +104,6 @@
   </div>
 </div>
 
-<!-- FDA critical callout -->
-{% if s.fda_critical_issues %}
-<div class="alert alert-danger mb-4">
-  <h6 class="alert-heading fw-bold mb-2">
-    <i class="bi bi-shield-exclamation me-2"></i>FDA Audit Risk — Critical Flags
-  </h6>
-  <p class="small mb-2">These would likely be flagged in an FDA inspection. Resolve before going to print.</p>
-  <ul class="mb-0 small">
-    {% for item in s.fda_critical_issues %}
-    <li><strong>{{ item.file }}</strong> — {{ item.message }}</li>
-    {% endfor %}
-  </ul>
-</div>
-{% endif %}
 
 <!-- Dismiss tip + filter bars -->
 <div class="d-flex align-items-start gap-3 mb-3 flex-wrap">
@@ -859,15 +845,6 @@ function summaryCards(s) {
   </div>`;
 }
 
-function fdaAlert(s) {
-  const fda = s.fda_critical_issues || [];
-  if (!fda.length) return '';
-  return `<div class="alert alert-danger mb-4">
-    <h6 class="alert-heading fw-bold mb-2"><i class="bi bi-shield-exclamation me-2"></i>FDA Audit Risk — Critical Flags</h6>
-    <p class="small mb-2">These would likely be flagged in an FDA inspection. Resolve before going to print.</p>
-    <ul class="mb-0 small">${fda.map(i => `<li><strong>${esc(i.file)}</strong> — ${esc(i.message)}</li>`).join('')}</ul>
-  </div>`;
-}
 
 function buildReport(job) {
   const results = job.results || [];
@@ -892,7 +869,7 @@ function buildReport(job) {
     body = results[0] ? fileResult(results[0], job.id, 0) : '';
   }
 
-  const html = hdr + summaryCards(job.summary) + fdaAlert(job.summary) + filterBarHTML() + body;
+  const html = hdr + summaryCards(job.summary) + filterBarHTML() + body;
   return html;
 }
 
