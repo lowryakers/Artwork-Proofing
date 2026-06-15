@@ -349,6 +349,25 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
             raise FileNotFoundError(f'pdftoppm produced no PNG for {fname}')
         img_path = os.path.join(work_dir, candidates[0])
 
+    # ── Load image + preprocess for OCR ─────────────────────────────────────
+    # Load first so we can enhance before running Tesseract
+    img = None
+    img_for_ocr = img_path  # default: use raw PNG if PIL unavailable
+    if PIL_AVAILABLE:
+        try:
+            from PIL import ImageEnhance, ImageFilter
+            img = Image.open(img_path).convert('RGB')
+            # Grayscale + contrast boost + sharpen → significantly improves
+            # Tesseract accuracy on small label text and mixed backgrounds
+            _gray = img.convert('L')
+            _gray = ImageEnhance.Contrast(_gray).enhance(1.8)
+            _gray = ImageEnhance.Sharpness(_gray).enhance(2.5)
+            _enhanced_path = img_prefix + '_ocr.png'
+            _gray.save(_enhanced_path)
+            img_for_ocr = _enhanced_path
+        except Exception:
+            pass
+
     # ── Native PDF text extraction (PyMuPDF) — accurate for non-outlined text ──
     native_text = ''
     try:
@@ -359,27 +378,33 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
     except Exception:
         pass
 
-    # ── OCR (Tesseract) — catches outlined/converted text ────────────────────
+    # ── OCR pass 1: PSM 3 (auto page segmentation) — main text extraction ────
     ocr_text = ''
     try:
         r = subprocess.run(
-            ['tesseract', img_path, 'stdout', '--oem', '3', '--psm', '3', '-l', 'eng'],
+            ['tesseract', img_for_ocr, 'stdout', '--oem', '3', '--psm', '3', '-l', 'eng'],
             capture_output=True, text=True, timeout=120,
         )
         ocr_text = r.stdout
     except Exception:
         pass
 
-    # Merge: native text is authoritative where it exists; OCR fills the gaps
-    combined_text = native_text + '\n' + ocr_text
+    # ── OCR pass 2: PSM 11 (sparse text) — catches isolated text that PSM 3 ──
+    # misses due to multi-column layouts. In two-column labels (NFP left,
+    # ingredients right), PSM 3 stops at the NFP column bottom and misses
+    # the ingredient tail including "Contains: Milk" declarations.
+    ocr_sparse = ''
+    try:
+        r2 = subprocess.run(
+            ['tesseract', img_for_ocr, 'stdout', '--oem', '3', '--psm', '11', '-l', 'eng'],
+            capture_output=True, text=True, timeout=90,
+        )
+        ocr_sparse = r2.stdout
+    except Exception:
+        pass
 
-    # ── Load image for visual checks ─────────────────────────────────────────
-    img = None
-    if PIL_AVAILABLE:
-        try:
-            img = Image.open(img_path).convert('RGB')
-        except Exception:
-            pass
+    # Merge: native text is authoritative; PSM 3 fills the gaps; PSM 11 supplements
+    combined_text = native_text + '\n' + ocr_text + '\n' + ocr_sparse
 
     # Scan barcode stripes directly from rendered image (primary GTIN source)
     barcode_gtins = _scan_barcodes(img_path)
@@ -1023,11 +1048,18 @@ def _check_fda(ocr_text: str, fname: str) -> dict:
     has_contains_stmt = bool(re.search(
         r'\bcontains?\s*[:.;,\-]?\s*(?:' + _ALLERGEN_WORDS + r')', tl
     ))
-    # Fallback: "contains" within 6 non-letter characters of allergen word —
+    # Fallback 1: "contains" within 6 non-letter characters of allergen word —
     # catches OCR artifacts like "contains|milk", "contains—milk", stray glyphs, etc.
     if not has_contains_stmt:
         has_contains_stmt = bool(re.search(
             r'\bcontains?[^a-z]{0,6}(?:' + _ALLERGEN_WORDS + r')', tl
+        ))
+    # Fallback 2: match "ontains: [allergen]" (without leading "C") —
+    # multi-column label layouts cause Tesseract to corrupt the "C" in "Contains"
+    # with adjacent NFP column text (e.g., OCR reads "r|30 ontains: Milk")
+    if not has_contains_stmt:
+        has_contains_stmt = bool(re.search(
+            r'\bontains?\s*[:.;,\-]?\s*(?:' + _ALLERGEN_WORDS + r')', tl
         ))
     has_advisory = bool(re.search(
         r'\ballergy\b|\ballergen\b|allergy\s+info|allergy\s+warning|may\s+contain', tl

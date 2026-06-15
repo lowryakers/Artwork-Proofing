@@ -1,12 +1,21 @@
 FROM python:3.11-slim
 
-# Install poppler (pdftoppm) and tesseract OCR
+# Install system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     poppler-utils \
     tesseract-ocr \
     tesseract-ocr-eng \
     libzbar0 \
+    curl \
     && rm -rf /var/lib/apt/lists/*
+
+# Replace standard Tesseract English model with tessdata_best (~94MB) for
+# significantly better accuracy on small label text and complex layouts
+RUN TESSDATA=$(find /usr/share/tesseract-ocr -name tessdata -type d | head -1) \
+    && curl -fsSL \
+       https://github.com/tesseract-ocr/tessdata_best/raw/main/eng.traineddata \
+       -o "${TESSDATA}/eng.traineddata" \
+    || echo "WARNING: tessdata_best download failed — using standard model"
 
 WORKDIR /app
 
