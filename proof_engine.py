@@ -54,6 +54,7 @@ def create_job(filenames: list, brand_config: dict = None) -> str:
             'summary': {},
             'error': None,
             'dismissals': {},
+            'confirmations': {},
             'brand_config': brand_config or {},
         }
     return job_id
@@ -77,10 +78,85 @@ def set_dismissal(job_id: str, filename: str, check_name: str,
         key = f"{filename}|{check_name}|{issue_index}"
         if dismissed:
             _jobs[job_id]['dismissals'][key] = True
+            _jobs[job_id].setdefault('confirmations', {}).pop(key, None)
         else:
             _jobs[job_id]['dismissals'].pop(key, None)
     _save_job_to_disk(job_id)
+    _append_feedback_log(job_id, filename, check_name, issue_index, 'dismissed' if dismissed else 'unreviewed')
     return True
+
+
+def set_confirmation(job_id: str, filename: str, check_name: str,
+                     issue_index: int, confirmed: bool) -> bool:
+    with _jobs_lock:
+        if job_id not in _jobs:
+            return False
+        key = f"{filename}|{check_name}|{issue_index}"
+        if confirmed:
+            _jobs[job_id].setdefault('confirmations', {})[key] = True
+            _jobs[job_id].get('dismissals', {}).pop(key, None)
+        else:
+            _jobs[job_id].setdefault('confirmations', {}).pop(key, None)
+    _save_job_to_disk(job_id)
+    _append_feedback_log(job_id, filename, check_name, issue_index, 'confirmed' if confirmed else 'unreviewed')
+    return True
+
+
+def _append_feedback_log(job_id: str, filename: str, check_name: str,
+                         issue_index: int, action: str):
+    """Persist confirm/dismiss decisions for learning analysis."""
+    log_file = os.path.join(_UPLOAD_DIR, 'feedback_log.json')
+    entry = {
+        'timestamp': datetime.now().isoformat(),
+        'action': action,
+        'job_id': job_id,
+        'filename': filename,
+        'check': check_name,
+        'issue_index': issue_index,
+    }
+    try:
+        if os.path.exists(log_file):
+            with open(log_file) as f:
+                data = json.load(f)
+        else:
+            data = {'entries': []}
+        data['entries'].append(entry)
+        with open(log_file, 'w') as f:
+            json.dump(data, f)
+    except Exception:
+        pass
+
+
+def get_feedback_patterns() -> list:
+    """Return patterns from feedback log — frequent dismissals suggest false positives."""
+    log_file = os.path.join(_UPLOAD_DIR, 'feedback_log.json')
+    if not os.path.exists(log_file):
+        return []
+    try:
+        with open(log_file) as f:
+            data = json.load(f)
+        entries = data.get('entries', [])
+    except Exception:
+        return []
+
+    from collections import Counter
+    dismissed = Counter(e['check'] for e in entries if e.get('action') == 'dismissed')
+    confirmed = Counter(e['check'] for e in entries if e.get('action') == 'confirmed')
+    _labels = {
+        'gtin': 'GTIN / Barcode', 'nfp': 'NFP', 'eyemark': 'Eyemark',
+        'spelling': 'Spelling', 'fda': 'FDA Audit Risk',
+        'wind': 'Wind Direction', 'specs': 'Print Specs',
+    }
+    patterns = []
+    for check, count in dismissed.items():
+        if count >= 3:
+            patterns.append({
+                'check': check,
+                'label': _labels.get(check, check),
+                'dismissed': count,
+                'confirmed': confirmed.get(check, 0),
+            })
+    return sorted(patterns, key=lambda x: x['dismissed'], reverse=True)
 
 
 def _update_job(job_id: str, **kwargs):
@@ -260,7 +336,7 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
     # ── Convert PDF → PNG ────────────────────────────────────────────────────
     img_prefix = os.path.join(work_dir, stem)
     subprocess.run(
-        ['pdftoppm', '-r', '250', '-png', '-singlefile', pdf_path, img_prefix],
+        ['pdftoppm', '-r', '300', '-png', '-singlefile', pdf_path, img_prefix],
         capture_output=True, check=True, timeout=120,
     )
     img_path = img_prefix + '.png'
@@ -942,9 +1018,17 @@ def _check_fda(ocr_text: str, fname: str) -> dict:
         r'milk|dairy|whey|wheat|peanut|soy|egg|fish|shellfish|'
         r'tree\s*nut|sesame|almond|cashew|walnut|pecan|hazelnut|pistachio|macadamia'
     )
+    # Primary: standard "Contains: [allergen]" — accept colon, semicolon, comma, dash, or nothing
+    # (OCR commonly misreads colons as semicolons or drops them entirely)
     has_contains_stmt = bool(re.search(
-        r'\bcontains?\s*[:.]?\s*(?:' + _ALLERGEN_WORDS + r')', tl
+        r'\bcontains?\s*[:.;,\-]?\s*(?:' + _ALLERGEN_WORDS + r')', tl
     ))
+    # Fallback: "contains" within 6 non-letter characters of allergen word —
+    # catches OCR artifacts like "contains|milk", "contains—milk", stray glyphs, etc.
+    if not has_contains_stmt:
+        has_contains_stmt = bool(re.search(
+            r'\bcontains?[^a-z]{0,6}(?:' + _ALLERGEN_WORDS + r')', tl
+        ))
     has_advisory = bool(re.search(
         r'\ballergy\b|\ballergen\b|allergy\s+info|allergy\s+warning|may\s+contain', tl
     ))

@@ -2,10 +2,11 @@
 {% block title %}Full Summary — {{ job_id }} — ProDough Proof{% endblock %}
 
 {% block content %}
-{% set results    = job.results %}
-{% set dismissals = job.get('dismissals', {}) %}
+{% set results       = job.results %}
+{% set dismissals    = job.get('dismissals', {}) %}
+{% set confirmations = job.get('confirmations', {}) %}
 
-{# ── Pre-compute filtered issue lists (respects dismissals) ── #}
+{# ── Pre-compute filtered issue lists (respects dismissals; confirmed items still appear) ── #}
 {% set all_crits = [] %}
 {% set all_warns = [] %}
 {% for r in results %}
@@ -15,9 +16,9 @@
         {% set dkey = r.filename ~ '|' ~ check_name ~ '|' ~ loop.index0 %}
         {% if not dismissals.get(dkey, false) %}
           {% if issue.severity == 'critical' %}
-            {% set _ = all_crits.append({'file': r.filename, 'check': check_name, 'message': issue.message}) %}
+            {% set _ = all_crits.append({'file': r.filename, 'check': check_name, 'message': issue.message, 'confirmed': confirmations.get(dkey, false)}) %}
           {% elif issue.severity == 'warning' %}
-            {% set _ = all_warns.append({'file': r.filename, 'check': check_name, 'message': issue.message}) %}
+            {% set _ = all_warns.append({'file': r.filename, 'check': check_name, 'message': issue.message, 'confirmed': confirmations.get(dkey, false)}) %}
           {% endif %}
         {% endif %}
       {% endfor %}
@@ -26,6 +27,7 @@
 {% endfor %}
 
 {% set dismissed_count = dismissals | length %}
+{% set confirmed_count = confirmations | length %}
 {% set clean_files = results | selectattr('severity', 'in', ['clean', 'info']) | list %}
 
 <!-- Header -->
@@ -34,8 +36,11 @@
     <h4 class="mb-0 fw-bold"><i class="bi bi-clipboard2-check me-2"></i>Full Proof Summary</h4>
     <div class="text-muted small">
       Job {{ job_id }} &bull; {{ job.created[:19].replace('T',' ') }} &bull; {{ results | length }} file{{ 's' if results | length != 1 }}
+      {% if confirmed_count > 0 %}
+      &bull; <span class="text-success fw-semibold">{{ confirmed_count }} confirmed</span>
+      {% endif %}
       {% if dismissed_count > 0 %}
-      &bull; <span class="text-muted">{{ dismissed_count }} flag{{ 's' if dismissed_count != 1 }} dismissed</span>
+      &bull; <span class="text-muted">{{ dismissed_count }} dismissed</span>
       {% endif %}
     </div>
   </div>
@@ -187,10 +192,13 @@
       </thead>
       <tbody>
         {% for item in all_crits %}
-        <tr>
+        <tr {% if item.confirmed %}class="table-success"{% endif %}>
           <td class="ps-3 fw-semibold align-top">{{ item.file }}</td>
           <td class="text-muted align-top">{{ _check_label(item.check) }}</td>
-          <td class="pe-3 align-top">{{ item.message }}</td>
+          <td class="pe-3 align-top">
+            {{ item.message }}
+            {% if item.confirmed %}<span class="badge bg-success ms-1">Confirmed</span>{% endif %}
+          </td>
         </tr>
         {% endfor %}
       </tbody>
@@ -217,10 +225,13 @@
       </thead>
       <tbody>
         {% for item in all_warns %}
-        <tr>
+        <tr {% if item.confirmed %}class="table-success"{% endif %}>
           <td class="ps-3 fw-semibold align-top">{{ item.file }}</td>
           <td class="text-muted align-top">{{ _check_label(item.check) }}</td>
-          <td class="pe-3 align-top">{{ item.message }}</td>
+          <td class="pe-3 align-top">
+            {{ item.message }}
+            {% if item.confirmed %}<span class="badge bg-success ms-1">Confirmed</span>{% endif %}
+          </td>
         </tr>
         {% endfor %}
       </tbody>
@@ -233,8 +244,32 @@
 <div class="alert alert-success d-flex align-items-center gap-2 mb-4">
   <i class="bi bi-check-circle-fill fs-4"></i>
   <span><strong>No open issues.</strong>
-  {% if dismissed_count > 0 %}{{ dismissed_count }} flag{{ 's' if dismissed_count != 1 }} were reviewed and dismissed.{% endif %}
+  {% if confirmed_count > 0 %}{{ confirmed_count }} issue{{ 's' if confirmed_count != 1 }} confirmed and addressed. {% endif %}
+  {% if dismissed_count > 0 %}{{ dismissed_count }} flag{{ 's' if dismissed_count != 1 }} dismissed as false positives. {% endif %}
   All files are ready to proceed.</span>
+</div>
+{% endif %}
+
+<!-- Learning insights (shown when patterns emerge from confirm/dismiss history) -->
+{% if feedback_patterns is defined and feedback_patterns %}
+<div class="card shadow-sm mb-4 border-warning no-print">
+  <div class="card-header fw-semibold bg-warning bg-opacity-10 py-2">
+    <i class="bi bi-lightbulb-fill text-warning me-1"></i>Learning Insights
+    <span class="text-muted fw-normal ms-2 small">Based on your review history</span>
+  </div>
+  <div class="card-body py-2 small">
+    {% for p in feedback_patterns %}
+    <div class="d-flex align-items-start gap-2 mb-2">
+      <i class="bi bi-exclamation-circle text-warning flex-shrink-0 mt-1"></i>
+      <span>
+        <strong>{{ p.label }}</strong> has been dismissed <strong>{{ p.dismissed }}</strong> time{{ 's' if p.dismissed != 1 }}
+        as a false positive across proof jobs.
+        {% if p.confirmed %} ({{ p.confirmed }} confirmed as real.){% endif %}
+        Consider reviewing the detection logic for this check.
+      </span>
+    </div>
+    {% endfor %}
+  </div>
 </div>
 {% endif %}
 

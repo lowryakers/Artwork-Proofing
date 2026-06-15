@@ -45,7 +45,8 @@
 
 {% macro _report(job) %}
 {% set s = job.summary %}
-{% set dismissals = job.get('dismissals', {}) %}
+{% set dismissals     = job.get('dismissals', {}) %}
+{% set confirmations  = job.get('confirmations', {}) %}
 
 <!-- Header row -->
 <div class="d-flex align-items-center gap-2 mb-4 flex-wrap">
@@ -109,8 +110,11 @@
 <div class="d-flex align-items-start gap-3 mb-3 flex-wrap">
   <div class="alert alert-light border small d-flex align-items-center gap-2 mb-0 py-2 flex-grow-1">
     <i class="bi bi-check2-square text-secondary fs-5"></i>
-    <span>Click <strong>Dismiss</strong> on any flag you've manually verified.
-    Dismissed flags are excluded from the downloaded report.</span>
+    <span>
+      <strong>Confirm</strong> flags that are real issues to fix.
+      <strong>Dismiss</strong> flags that are false positives.
+      Dismissed flags are excluded from the report; confirmed flags are highlighted.
+    </span>
   </div>
   <!-- Severity + check filters stacked -->
   <div class="d-flex flex-column gap-1 flex-shrink-0">
@@ -156,12 +160,12 @@
 <div class="tab-content">
   {% for r in job.results %}
   <div class="tab-pane fade {% if loop.first %}show active{% endif %}" id="fp{{ loop.index0 }}">
-    {{ _file_result(r, job.id, loop.index0, dismissals) }}
+    {{ _file_result(r, job.id, loop.index0, dismissals, confirmations) }}
   </div>
   {% endfor %}
 </div>
 {% else %}
-  {% for r in job.results %}{{ _file_result(r, job.id, loop.index0, dismissals) }}{% endfor %}
+  {% for r in job.results %}{{ _file_result(r, job.id, loop.index0, dismissals, confirmations) }}{% endfor %}
 {% endif %}
 {% endmacro %}
 
@@ -175,7 +179,7 @@
 {% endmacro %}
 
 
-{% macro _file_result(r, job_id, idx, dismissals) %}
+{% macro _file_result(r, job_id, idx, dismissals, confirmations={}) %}
 {% set verify_items = verify_map.get(r.filename, []) if verify_map is defined else [] %}
 <div class="row g-4">
 
@@ -239,17 +243,17 @@
     </div>
 
     <div class="checks-container">
-    {{ _check_card('1','GTIN / Barcode',        'bi-upc-scan',           r.checks.gtin,     idx, r.filename, 'gtin',     dismissals) }}
+    {{ _check_card('1','GTIN / Barcode',        'bi-upc-scan',           r.checks.gtin,     idx, r.filename, 'gtin',     dismissals, confirmations) }}
     {% if r.checks.get('nfp') is not none %}
-    {{ _check_card('2','Front Call-Out vs NFP', 'bi-clipboard2-pulse',   r.checks.nfp,      idx, r.filename, 'nfp',      dismissals) }}
+    {{ _check_card('2','Front Call-Out vs NFP', 'bi-clipboard2-pulse',   r.checks.nfp,      idx, r.filename, 'nfp',      dismissals, confirmations) }}
     {% endif %}
-    {{ _check_card('3','Eyemark Contrast',       'bi-eye',                r.checks.eyemark,  idx, r.filename, 'eyemark',  dismissals) }}
-    {{ _check_card('4','Spelling / Brand Name', 'bi-spellcheck',         r.checks.spelling, idx, r.filename, 'spelling', dismissals) }}
-    {{ _check_card('5','FDA Audit Risk',         'bi-shield-exclamation', r.checks.fda,      idx, r.filename, 'fda',      dismissals, always_open=true) }}
+    {{ _check_card('3','Eyemark Contrast',       'bi-eye',                r.checks.eyemark,  idx, r.filename, 'eyemark',  dismissals, confirmations) }}
+    {{ _check_card('4','Spelling / Brand Name', 'bi-spellcheck',         r.checks.spelling, idx, r.filename, 'spelling', dismissals, confirmations) }}
+    {{ _check_card('5','FDA Audit Risk',         'bi-shield-exclamation', r.checks.fda,      idx, r.filename, 'fda',      dismissals, confirmations, always_open=true) }}
     {% if r.checks.get('wind') is not none %}
-    {{ _check_card('6','Wind Direction',         'bi-arrow-repeat',       r.checks.wind,     idx, r.filename, 'wind',     dismissals) }}
+    {{ _check_card('6','Wind Direction',         'bi-arrow-repeat',       r.checks.wind,     idx, r.filename, 'wind',     dismissals, confirmations) }}
     {% endif %}
-    {{ _check_card('7','Print Specifications',  'bi-rulers',             r.checks.specs,    idx, r.filename, 'specs',    dismissals) }}
+    {{ _check_card('7','Print Specifications',  'bi-rulers',             r.checks.specs,    idx, r.filename, 'specs',    dismissals, confirmations) }}
     </div>
 
     <!-- Manual verify items -->
@@ -309,7 +313,7 @@
 {% endmacro %}
 
 
-{% macro _check_card(num, title, icon, check, idx, filename, check_key, dismissals, always_open=false) %}
+{% macro _check_card(num, title, icon, check, idx, filename, check_key, dismissals, confirmations={}, always_open=false) %}
 {% if not check %}{% set check = {} %}{% endif %}
 {% set issues = check.get('issues', []) %}
 {% set notes  = check.get('notes',  []) %}
@@ -344,20 +348,30 @@
       {% set iidx = loop.index0 %}
       {% set dkey = filename ~ '|' ~ check_key ~ '|' ~ iidx %}
       {% set dismissed = dismissals.get(dkey, false) %}
-      <div class="d-flex gap-2 mb-2 p-2 rounded sev-{{ issue.severity }} issue-row{{ ' dismissed' if dismissed }}"
+      {% set confirmed = confirmations.get(dkey, false) %}
+      <div class="d-flex gap-2 mb-2 p-2 rounded sev-{{ issue.severity }} issue-row{{ ' dismissed' if dismissed }}{{ ' confirmed' if confirmed }}"
            data-filename="{{ filename }}" data-check="{{ check_key }}" data-idx="{{ iidx }}">
         <i class="bi
-          {% if issue.severity == 'critical' %}bi-x-circle-fill text-danger
+          {% if confirmed %}bi-check-circle-fill text-success
+          {% elif issue.severity == 'critical' %}bi-x-circle-fill text-danger
           {% elif issue.severity == 'warning' %}bi-exclamation-triangle-fill text-warning
           {% else %}bi-info-circle-fill text-info{% endif %}
           flex-shrink-0 mt-1"></i>
         <span class="flex-grow-1">{{ issue.message }}</span>
-        <button class="btn btn-sm btn-outline-secondary py-0 px-2 flex-shrink-0 dismiss-btn"
-                title="{{ 'Restore this flag' if dismissed else 'Mark as reviewed — excluded from report' }}"
-                onclick="toggleDismiss(this, event)">
-          <i class="bi {{ 'bi-arrow-counterclockwise' if dismissed else 'bi-check2' }}"></i>
-          {{ 'Restore' if dismissed else 'Dismiss' }}
-        </button>
+        <div class="d-flex gap-1 flex-shrink-0">
+          <button class="btn btn-sm btn-outline-secondary py-0 px-2 dismiss-btn"
+                  title="{{ 'Restore this flag' if dismissed else 'False positive — exclude from report' }}"
+                  onclick="toggleDismiss(this, event)">
+            <i class="bi {{ 'bi-arrow-counterclockwise' if dismissed else 'bi-x-lg' }}"></i>
+            {{ 'Restore' if dismissed else 'Dismiss' }}
+          </button>
+          <button class="btn btn-sm {{ 'btn-success' if confirmed else 'btn-outline-success' }} py-0 px-2 confirm-btn"
+                  title="{{ 'Remove confirmation' if confirmed else 'Real issue — mark as confirmed' }}"
+                  onclick="toggleConfirm(this, event)">
+            <i class="bi {{ 'bi-check-circle-fill' if confirmed else 'bi-check-circle' }}"></i>
+            {{ 'Confirmed' if confirmed else 'Confirm' }}
+          </button>
+        </div>
       </div>
       {% endfor %}
 
@@ -413,6 +427,11 @@
   #reportRoot[data-check-filter="wind"]     .check-card[data-check="wind"]     { display:block!important; }
   /* ── Dismissed ── */
   .issue-row.dismissed { opacity:.45; text-decoration:line-through; }
+  /* ── Confirmed ── */
+  .issue-row.confirmed { border-left:3px solid #198754; background:rgba(25,135,84,.08); }
+  /* Hide dismiss when confirmed, hide confirm when dismissed */
+  .issue-row.confirmed .dismiss-btn { display:none!important; }
+  .issue-row.dismissed .confirm-btn { display:none!important; }
 </style>
 <script>
 const JOB_ID      = "{{ job_id }}";
@@ -523,14 +542,51 @@ async function toggleDismiss(btn, event) {
     if (!resp.ok) return;
     if (!isDismissed) {
       row.classList.add('dismissed');
+      row.classList.remove('confirmed');
+      const icon = row.querySelector('i.flex-shrink-0');
+      if (icon) { icon.className = icon.className.replace(/bi-\S+/, 'bi-x-lg').replace('text-success','').replace('text-danger','').replace('text-warning',''); }
       btn.innerHTML = '<i class="bi bi-arrow-counterclockwise"></i> Restore';
       btn.title = 'Restore this flag';
     } else {
       row.classList.remove('dismissed');
-      btn.innerHTML = '<i class="bi bi-check2"></i> Dismiss';
-      btn.title = 'Mark as reviewed — excluded from report';
+      btn.innerHTML = '<i class="bi bi-x-lg"></i> Dismiss';
+      btn.title = 'False positive — exclude from report';
     }
   } catch (e) { console.error('Dismiss failed', e); }
+}
+
+/* ── Confirm ── */
+async function toggleConfirm(btn, event) {
+  event.stopPropagation();
+  const row      = btn.closest('.issue-row');
+  const filename = row.dataset.filename;
+  const check    = row.dataset.check;
+  const idx      = parseInt(row.dataset.idx);
+  const isConfirmed = row.classList.contains('confirmed');
+  try {
+    const resp = await fetch(`/api/confirm/${JOB_ID}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ filename, check, index: idx, confirmed: !isConfirmed }),
+    });
+    if (!resp.ok) return;
+    if (!isConfirmed) {
+      row.classList.add('confirmed');
+      row.classList.remove('dismissed');
+      const icon = row.querySelector('i.flex-shrink-0');
+      if (icon) { icon.className = 'bi bi-check-circle-fill text-success flex-shrink-0 mt-1'; }
+      btn.classList.replace('btn-outline-success', 'btn-success');
+      btn.innerHTML = '<i class="bi bi-check-circle-fill"></i> Confirmed';
+      btn.title = 'Remove confirmation';
+    } else {
+      row.classList.remove('confirmed');
+      const icon = row.querySelector('i.flex-shrink-0');
+      if (icon) { icon.className = 'bi bi-x-circle-fill text-danger flex-shrink-0 mt-1'; }
+      btn.classList.replace('btn-success', 'btn-outline-success');
+      btn.innerHTML = '<i class="bi bi-check-circle"></i> Confirm';
+      btn.title = 'Real issue — mark as confirmed';
+    }
+  } catch (e) { console.error('Confirm failed', e); }
 }
 
 /* ════════════════════════════════════════════════════════
@@ -666,10 +722,16 @@ function issueRows(issues, filename, checkKey) {
       data-filename="${esc(filename)}" data-check="${esc(checkKey)}" data-idx="${i}">
       <i class="bi bi-${ic} flex-shrink-0 mt-1"></i>
       <span class="flex-grow-1">${esc(issue.message)}</span>
-      <button class="btn btn-sm btn-outline-secondary py-0 px-2 flex-shrink-0 dismiss-btn"
-              title="Mark as reviewed" onclick="toggleDismiss(this, event)">
-        <i class="bi bi-check2"></i> Dismiss
-      </button>
+      <div class="d-flex gap-1 flex-shrink-0">
+        <button class="btn btn-sm btn-outline-secondary py-0 px-2 dismiss-btn"
+                title="False positive — exclude from report" onclick="toggleDismiss(this, event)">
+          <i class="bi bi-x-lg"></i> Dismiss
+        </button>
+        <button class="btn btn-sm btn-outline-success py-0 px-2 confirm-btn"
+                title="Real issue — mark as confirmed" onclick="toggleConfirm(this, event)">
+          <i class="bi bi-check-circle"></i> Confirm
+        </button>
+      </div>
     </div>`;
   }).join('');
 }

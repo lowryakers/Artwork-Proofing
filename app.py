@@ -517,7 +517,8 @@ def summary(job_id):
         return redirect(url_for('landing'))
     if job['status'] != 'done':
         return redirect(url_for('result', job_id=job_id))
-    return render_template('summary.html', job=job, job_id=job_id)
+    return render_template('summary.html', job=job, job_id=job_id,
+                           feedback_patterns=proof_engine.get_feedback_patterns())
 
 
 @app.route('/history')
@@ -602,6 +603,23 @@ def api_dismiss(job_id):
         data.get('check', ''),
         int(data.get('index', 0)),
         bool(data.get('dismissed', True)),
+    )
+    if not ok:
+        return jsonify({'error': 'job not found'}), 404
+    return jsonify({'ok': True})
+
+
+@app.route('/api/confirm/<job_id>', methods=['POST'])
+def api_confirm(job_id):
+    data = request.get_json()
+    if not data:
+        return jsonify({'error': 'no data'}), 400
+    ok = proof_engine.set_confirmation(
+        job_id,
+        data.get('filename', ''),
+        data.get('check', ''),
+        int(data.get('index', 0)),
+        bool(data.get('confirmed', True)),
     )
     if not ok:
         return jsonify({'error': 'job not found'}), 404
