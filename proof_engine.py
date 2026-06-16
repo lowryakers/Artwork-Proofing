@@ -419,12 +419,22 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
     if not effective_wind and matched_spec.get('wind_direction'):
         effective_wind = matched_spec['wind_direction']
 
+    # Required eyemark color: spec sheet > brand_config > mode default
+    # Column names accepted: "eyemark color", "eyemark_color", "eye mark color"
+    required_eyemark = (
+        matched_spec.get('eyemark color') or
+        matched_spec.get('eyemark_color') or
+        matched_spec.get('eye mark color') or
+        matched_spec.get('eyemark') or
+        brand_config.get('required_eyemark_color', '')
+    ).strip().lower() if matched_spec else brand_config.get('required_eyemark_color', '').strip().lower()
+
     if brand_mode == 'generic':
         is_film = brand_config.get('packaging_type', 'other') == 'stick'
         brand_name = brand_config.get('brand_name', '')
         checks = {
             'gtin':     _check_gtin(combined_text, fname, gtin_rows, barcode_gtins),
-            'eyemark':  _check_eyemark(img, is_film, fname),
+            'eyemark':  _check_eyemark(img, is_film, fname, required_eyemark),
             'spelling': _check_spelling_generic(combined_text, brand_name),
             'fda':      _check_fda_light(combined_text, fname),
             'specs':    _check_print_specs(pdf_path, brand_config, matched_spec),
@@ -432,13 +442,15 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
         if is_film:
             checks['wind'] = _check_wind_direction(combined_text, effective_wind)
     else:
-        # ProDough mode
+        # ProDough mode: white eyemark is the company standard for all film/stick products
+        if not required_eyemark:
+            required_eyemark = 'white'
         is_film = _is_film_rollstock(fname, combined_text)
         proof_type = brand_config.get('proof_type', 'press')
         checks = {
             'gtin':     _check_gtin(combined_text, fname, gtin_rows, barcode_gtins),
             'nfp':      _check_nfp(combined_text),
-            'eyemark':  _check_eyemark(img, is_film, fname),
+            'eyemark':  _check_eyemark(img, is_film, fname, required_eyemark),
             'spelling': _check_spelling(combined_text, fname),
             'fda':      _check_fda(combined_text, fname),
         }
@@ -723,7 +735,8 @@ def _check_nfp(ocr_text: str) -> dict:
 # Rule: eyemark MUST be solid black (#000000) or solid white (#FFFFFF).
 # Any other color will cause unreliable photo-eye detection on the production line.
 
-def _check_eyemark(img, is_film: bool = False, fname: str = '') -> dict:
+def _check_eyemark(img, is_film: bool = False, fname: str = '',
+                   required_color: str = '') -> dict:
     issues, notes = [], []
 
     if not is_film:
@@ -770,16 +783,26 @@ def _check_eyemark(img, is_film: bool = False, fname: str = '') -> dict:
     else:
         eyemark_color = 'none'
 
-    if eyemark_color == 'black':
-        notes.append(
-            f'✔ BLACK eyemark detected (darkest pixel: {min_luma:.0f}/255) — OK. '
-            'Solid black eyemark provides reliable photo-eye detection.'
-        )
-    elif eyemark_color == 'white':
-        notes.append(
-            f'✔ WHITE eyemark detected (lightest pixel: {max_luma:.0f}/255) — OK. '
-            'Solid white eyemark provides reliable photo-eye detection.'
-        )
+    req = required_color.lower().strip() if required_color else ''
+
+    if eyemark_color in ('black', 'white'):
+        if req and eyemark_color != req:
+            # Detected color doesn't match what the spec requires
+            issues.append({
+                'severity': 'critical',
+                'message': (
+                    f'Wrong eyemark color — detected {eyemark_color.upper()} '
+                    f'but spec requires {req.upper()}. '
+                    f'The production line photo-eye sensor is calibrated for a {req.upper()} eyemark. '
+                    f'Change the eyemark fill to pure {req.upper()} (#{"FFFFFF" if req=="white" else "000000"}) '
+                    'before going to press.'
+                ),
+            })
+        else:
+            notes.append(
+                f'✔ {eyemark_color.upper()} eyemark detected — OK. '
+                'Solid eyemark provides reliable photo-eye detection.'
+            )
     else:
         # Describe the actual color so the designer knows exactly what to fix
         if avg_luma < 85:
