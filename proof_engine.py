@@ -1599,13 +1599,10 @@ def _check_wind_direction(ocr_text: str, required_wind: str) -> dict:
                 ),
             })
     else:
-        issues.append({
-            'severity': 'warning',
-            'message': (
-                f'Wind direction not detected in PDF — verify manually that the press proof '
-                f'specifies {req_label}.'
-            ),
-        })
+        notes.append(
+            f'Wind direction not detected in PDF — verify manually that the press proof '
+            f'specifies {req_label}.'
+        )
 
     return {'issues': issues, 'notes': notes}
 
@@ -1725,24 +1722,13 @@ def _check_print_specs(pdf_path: str, brand_config: dict = None,
             notes.append(f'Trim size (TrimBox): {tb_w} × {tb_h} mm')
             notes.append(f'Full page (MediaBox): {mb_w} × {mb_h} mm')
             if bleed_mm and bleed_mm > 0:
-                if bleed_mm < 2.5:
-                    issues.append({'severity': 'warning',
-                                   'message': f'Bleed is only {bleed_mm} mm (MediaBox vs TrimBox). '
-                                              'Standard print bleed is 3 mm. Verify with your print supplier.'})
-                else:
-                    notes.append(f'Bleed: {bleed_mm} mm ✓')
+                notes.append(f'Bleed: {bleed_mm} mm')
             else:
-                issues.append({'severity': 'warning',
-                               'message': 'No bleed detected (TrimBox equals MediaBox). '
-                                          'Print-ready files should have ≥ 3 mm bleed on all sides.'})
+                notes.append('No bleed detected (TrimBox equals MediaBox).')
         else:
             notes.append(f'Page size (MediaBox): {mb_w} × {mb_h} mm')
-            trimbox_sev = 'note' if proof_type == 'art' else 'warning'
-            if trimbox_sev == 'warning':
-                issues.append({'severity': 'warning',
-                               'message': 'No TrimBox found. Print-ready PDFs must define a TrimBox '
-                                          '(the finished trim size). Add a TrimBox in your design app before '
-                                          'exporting (Illustrator: File → Document Setup → Trim Marks & Bleed).'})
+            if proof_type != 'art':
+                notes.append('No TrimBox found. Add a TrimBox before submitting press-ready files.')
             else:
                 notes.append('No TrimBox found (art proof — no finishing panel expected). '
                              'Add a TrimBox before submitting press-ready files.')
@@ -1897,7 +1883,10 @@ def _check_print_specs(pdf_path: str, brand_config: dict = None,
             notes.append(f'Material: {material_found}')
             # Validate against required material — spec sheet takes priority over brand_config
             req_mat = (matched_spec.get('material') or brand_config.get('required_material', '')).strip()
-            if req_mat and req_mat.lower() not in material_found.lower():
+            # Normalize whitespace (collapse newlines/extra spaces) before comparing so that
+            # a material string split across two PDF text lines still matches the spec value.
+            _norm = lambda s: re.sub(r'\s+', ' ', s).strip()
+            if req_mat and _norm(req_mat).lower() not in _norm(material_found).lower():
                 issues.append({'severity': 'warning',
                                'message': f'Material mismatch — file specifies "{material_found}", '
                                           f'but spec requires "{req_mat}". '
