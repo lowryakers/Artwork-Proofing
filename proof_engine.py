@@ -460,6 +460,10 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
             if effective_wind:
                 checks['wind'] = _check_wind_direction(combined_text, effective_wind)
 
+    # Inject spec GTIN so the UI can show detected-vs-spec comparison
+    if matched_spec:
+        checks['gtin']['spec_gtin'] = str(matched_spec.get('gtin', '')).strip()
+
     all_issues = [i for c in checks.values() for i in c.get('issues', [])]
     crit  = [i for i in all_issues if i['severity'] == 'critical']
     warns = [i for i in all_issues if i['severity'] == 'warning']
@@ -671,14 +675,23 @@ def _check_nfp(ocr_text: str) -> dict:
                 ),
             })
 
-    # Only match "Calories NNN" (NFP format) — the reverse "NNN calories" form
-    # also catches preparation-instruction text like "provides 300 calories when mixed with milk"
-    # and generates false positives on powder products.
-    cal_hits = re.findall(r'calories\s+(\d+)', tl)
-    calories = sorted({int(c) for c in cal_hits if 30 <= int(c) <= 800})
+    # NFP-format patterns: label BEFORE value ("Calories 120", "Protein 25g")
+    nfp_cal_hits  = re.findall(r'calories\s+(\d+)', tl)
+    nfp_calories  = sorted({int(c) for c in nfp_cal_hits  if 30 <= int(c) <= 800})
+    nfp_prot_hits = re.findall(r'protein\s+(\d+)\s*g', tl)
+    nfp_proteins  = sorted({int(p) for p in nfp_prot_hits if 0 < int(p) < 120})
+    nfp_zero_sugar = bool(re.search(r'added\s+sugars?\s+0\s*g|added\s+sugars?\s*\n?\s*0', tl))
 
-    prot_hits = re.findall(r'protein\s+(\d+)\s*g|(\d+)\s*g\s+protein', tl)
-    proteins = sorted({int(a or b) for a, b in prot_hits if 0 < int(a or b) < 120})
+    # Front callout format: value BEFORE label ("120 Calories", "25g Protein", "0G Added Sugar")
+    front_cal_hits  = re.findall(r'\b(\d+)\s*cal(?:ories?)?\b(?!\s*\d)', tl)
+    front_calories  = sorted({int(c) for c in front_cal_hits  if 30 <= int(c) <= 800})
+    front_prot_hits = re.findall(r'\b(\d+)\s*g\s+protein\b', tl)
+    front_proteins  = sorted({int(p) for p in front_prot_hits if 0 < int(p) < 120})
+    front_zero_sugar = bool(re.search(r'\b0\s*g\s+added\s+sugar\b', tl))
+
+    # Combined lists — used by the existing mismatch checks below
+    calories = sorted(set(nfp_calories) | set(front_calories))
+    proteins = sorted(set(nfp_proteins) | set(front_proteins))
 
     nw_hits = re.findall(r'net\s*wt\.?\s*([\d.]+)\s*g', tl)
 
@@ -726,6 +739,16 @@ def _check_nfp(ocr_text: str) -> dict:
         'calories': calories,
         'proteins': proteins,
         'net_weights': nw_hits,
+        'front_callout': {
+            'calories': front_calories,
+            'proteins': front_proteins,
+            'zero_sugar': front_zero_sugar,
+        },
+        'nfp_data': {
+            'calories': nfp_calories,
+            'proteins': nfp_proteins,
+            'zero_sugar': nfp_zero_sugar,
+        },
         'issues': issues,
         'notes': notes,
     }
@@ -823,7 +846,7 @@ def _check_eyemark(img, is_film: bool = False, fname: str = '',
             ),
         })
 
-    return {'issues': issues, 'notes': notes, 'eyemark_color': eyemark_color}
+    return {'issues': issues, 'notes': notes, 'eyemark_color': eyemark_color, 'required_color': req}
 
 
 # ── Check 4: Spelling / brand name ───────────────────────────────────────────
