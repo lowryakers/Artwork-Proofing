@@ -1095,7 +1095,7 @@ def _check_fda(ocr_text: str, fname: str) -> dict:
     is_non_dairy_milk   = bool(re.search(  # only suppresses the milk-specific check
         r'\bbeef\b|\bcollagen\b|\bbovine\b|\bplant\b|\bpea\s+protein\b|\brice\s+protein\b|\bvegan\b',
         fname_tl))
-    is_wheat_product    = bool(re.search(r'\bpancake\b|\bdonut\b|\bflour\b|\bbreading\b', fname.lower()))
+    is_wheat_product    = bool(re.search(r'\bpancake\b|\bflour\b|\bbreading\b', fname.lower()))
     is_peanut_product   = bool(re.search(r'\bpeanut\b|\bpb\b', fname.lower()))
     _TREE_NUTS = r'\balmond\b|\bcashew\b|\bwalnut\b|\bpecan\b|\bhazelnut\b|\bpistachio\b|\bmacadamia\b'
     is_tree_nut_product = bool(re.search(_TREE_NUTS, fname_tl))
@@ -1116,6 +1116,23 @@ def _check_fda(ocr_text: str, fname: str) -> dict:
         _milk_in_ocr or _peanut_in_ocr or _tree_nut_in_ocr or _soy_in_ocr or
         _egg_in_ocr or _fish_in_ocr or _shellfish_in_ocr or _sesame_in_ocr or _wheat_in_ocr
     )
+
+    # ── Fallback 3: "contains:" declaration marker + allergen within 200 chars ─
+    # Handles OCR fragmentation where column-layout labels split "Contains:"
+    # and the allergen word across lines or OCR passes. "Contains less than X%"
+    # never uses a colon, so matching "contains:" is specific to the declaration.
+    if not has_contains_stmt:
+        for _cm in re.finditer(r'\bcontains?\s*:\s*', tl):
+            _window = tl[_cm.end():_cm.end() + 200]
+            if re.search(r'(?:' + _ALLERGEN_WORDS + r')', _window):
+                has_contains_stmt = True
+                break
+
+    # ── Fallback 4: "contains:" present and any allergen detected elsewhere in text ─
+    # Last resort when OCR splits the declaration across pages/passes completely.
+    if not has_contains_stmt and _any_allergen_in_ocr:
+        if re.search(r'\bcontains?\s*:', tl):
+            has_contains_stmt = True
 
     # ── Step 1: Filename-based checks ─────────────────────────────────────────
     # When the filename identifies a known allergen product but OCR can't find
@@ -1836,10 +1853,8 @@ def _check_print_specs(pdf_path: str, brand_config: dict = None,
             except Exception:
                 continue
         if has_rgb:
-            issues.append({'severity': 'warning',
-                           'message': 'RGB color content detected in the PDF. Print-ready files '
-                                      'should be fully CMYK. RGB elements may produce unexpected '
-                                      'color shifts when converted by the RIP at the print supplier.'})
+            notes.append('RGB objects detected in PDF (may include ICC profiles or embedded images — '
+                         'verify CMYK output intent with your print supplier if color accuracy is critical).')
         else:
             notes.append('Color mode: CMYK — no RGB content detected ✓')
 
