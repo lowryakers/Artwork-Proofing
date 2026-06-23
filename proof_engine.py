@@ -27,6 +27,12 @@ except ImportError:
     PIL_AVAILABLE = False
 
 try:
+    import pdfplumber as _pdfplumber
+    PDFPLUMBER_AVAILABLE = True
+except ImportError:
+    PDFPLUMBER_AVAILABLE = False
+
+try:
     from pyzbar.pyzbar import decode as _pyzbar_decode
     PYZBAR_AVAILABLE = True
 except ImportError:
@@ -368,7 +374,23 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
         except Exception:
             pass
 
-    # ── Native PDF text extraction (PyMuPDF) — accurate for non-outlined text ──
+    # ── Native text: pdfplumber (column-aware, spatially sorted) ────────────
+    # pdfplumber crops the page into left/right halves before extracting text,
+    # so the NFP column and ingredient column are never interleaved.
+    pdfplumber_text = ''
+    if PDFPLUMBER_AVAILABLE:
+        try:
+            with _pdfplumber.open(pdf_path) as _plumb_doc:
+                for _pg in _plumb_doc.pages:
+                    _pw, _ph = _pg.width, _pg.height
+                    _left_crop  = _pg.crop((0,       0, _pw / 2, _ph))
+                    _right_crop = _pg.crop((_pw / 2, 0, _pw,     _ph))
+                    pdfplumber_text += (_left_crop.extract_text()  or '') + '\n'
+                    pdfplumber_text += (_right_crop.extract_text() or '') + '\n'
+        except Exception:
+            pass
+
+    # ── Native text: PyMuPDF fallback ────────────────────────────────────────
     native_text = ''
     try:
         import fitz as _fitz
@@ -378,21 +400,37 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
     except Exception:
         pass
 
-    # ── OCR pass 1: PSM 3 (auto page segmentation) — main text extraction ────
-    ocr_text = ''
-    try:
-        r = subprocess.run(
-            ['tesseract', img_for_ocr, 'stdout', '--oem', '3', '--psm', '3', '-l', 'eng'],
-            capture_output=True, text=True, timeout=120,
-        )
-        ocr_text = r.stdout
-    except Exception:
-        pass
+    # ── OCR: region-based (left half + right half) with PSM 6 ───────────────
+    # Replaces the old PSM 3 full-page pass. PSM 3 interleaved columns and
+    # cut off the bottom of the ingredient column ("Contains: Milk" was lost).
+    # PSM 6 (uniform block) on each half reads each column independently.
+    ocr_left = ocr_right = ''
+    if PIL_AVAILABLE:
+        try:
+            _ocr_full = Image.open(img_for_ocr)
+            _ow, _oh  = _ocr_full.size
+            _left_img  = _ocr_full.crop((0,        0, _ow // 2, _oh))
+            _right_img = _ocr_full.crop((_ow // 2, 0, _ow,      _oh))
+            _left_path  = img_prefix + '_ocr_left.png'
+            _right_path = img_prefix + '_ocr_right.png'
+            _left_img.save(_left_path)
+            _right_img.save(_right_path)
+            _rl = subprocess.run(
+                ['tesseract', _left_path,  'stdout', '--oem', '3', '--psm', '6', '-l', 'eng'],
+                capture_output=True, text=True, timeout=90,
+            )
+            ocr_left = _rl.stdout
+            _rr = subprocess.run(
+                ['tesseract', _right_path, 'stdout', '--oem', '3', '--psm', '6', '-l', 'eng'],
+                capture_output=True, text=True, timeout=90,
+            )
+            ocr_right = _rr.stdout
+        except Exception:
+            pass
 
-    # ── OCR pass 2: PSM 11 (sparse text) — catches isolated text that PSM 3 ──
-    # misses due to multi-column layouts. In two-column labels (NFP left,
-    # ingredients right), PSM 3 stops at the NFP column bottom and misses
-    # the ingredient tail including "Contains: Milk" declarations.
+    # ── OCR: PSM 11 sparse — full-page catchall ──────────────────────────────
+    # Catches any isolated text the region passes miss (e.g. single-column
+    # layouts, rotated text, corner stamps).
     ocr_sparse = ''
     try:
         r2 = subprocess.run(
@@ -403,8 +441,16 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
     except Exception:
         pass
 
-    # Merge: native text is authoritative; PSM 3 fills the gaps; PSM 11 supplements
-    combined_text = native_text + '\n' + ocr_text + '\n' + ocr_sparse
+    # Combine all sources. pdfplumber provides column-aware native text for
+    # non-outlined PDFs; region OCR provides column-split text for outlined
+    # press-ready files; PSM 11 catches anything the region splits miss.
+    combined_text = (
+        pdfplumber_text + '\n' +
+        native_text     + '\n' +
+        ocr_left        + '\n' +
+        ocr_right       + '\n' +
+        ocr_sparse
+    )
 
     # Scan barcode stripes directly from rendered image (primary GTIN source)
     barcode_gtins = _scan_barcodes(img_path)
