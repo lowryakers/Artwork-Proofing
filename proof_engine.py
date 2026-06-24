@@ -342,7 +342,7 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
     # ── Convert PDF → PNG ────────────────────────────────────────────────────
     img_prefix = os.path.join(work_dir, stem)
     subprocess.run(
-        ['pdftoppm', '-r', '300', '-png', '-singlefile', pdf_path, img_prefix],
+        ['pdftoppm', '-r', '400', '-png', '-singlefile', pdf_path, img_prefix],
         capture_output=True, check=True, timeout=120,
     )
     img_path = img_prefix + '.png'
@@ -443,12 +443,11 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
     except Exception:
         pass
 
-    # ── OCR: inverted image — catches white text on colored backgrounds ───────
+    # ── OCR: inverted halves — catches white text on colored backgrounds ────────
     # ProDough badge callouts (e.g. "117 Calories", "25G Protein") use white
-    # text inside colored circles. Tesseract can't read light-on-dark without
-    # first inverting the image. We invert the left half (front panel) and run
-    # PSM 11 sparse to extract the badge numbers and labels.
-    ocr_inv_left = ''
+    # text inside colored circles. We invert both halves independently so badges
+    # on either the front or back panel are captured.
+    ocr_inv_left = ocr_inv_right = ''
     if PIL_AVAILABLE:
         try:
             from PIL import ImageOps as _ImageOps
@@ -462,18 +461,45 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
             ocr_inv_left = _ri.stdout
         except Exception:
             pass
+        try:
+            _inv_right = _ImageOps.invert(_right_img.convert('RGB'))
+            _inv_right_path = img_prefix + '_ocr_inv_right.png'
+            _inv_right.save(_inv_right_path)
+            _rr2 = subprocess.run(
+                ['tesseract', _inv_right_path, 'stdout', '--oem', '3', '--psm', '11', '-l', 'eng'],
+                capture_output=True, text=True, timeout=90,
+            )
+            ocr_inv_right = _rr2.stdout
+        except Exception:
+            pass
 
-    # Combine all sources. pdfplumber provides column-aware native text for
-    # non-outlined PDFs; region OCR provides column-split text for outlined
-    # press-ready files; PSM 11 catches anything the region splits miss;
-    # inverted left-half pass catches white-on-color badge text.
+    # ── OCR: binary threshold — gives Tesseract the cleanest possible input ───
+    # Adaptive thresholding converts the image to pure B&W which Tesseract reads
+    # more reliably than grayscale on gradient/complex backgrounds.
+    ocr_binary = ''
+    if PIL_AVAILABLE:
+        try:
+            _bin_img = Image.open(img_path).convert('L')
+            _bin_img = _bin_img.point(lambda p: 255 if p > 140 else 0, '1').convert('L')
+            _bin_path = img_prefix + '_ocr_bin.png'
+            _bin_img.save(_bin_path)
+            _rb = subprocess.run(
+                ['tesseract', _bin_path, 'stdout', '--oem', '3', '--psm', '11', '-l', 'eng'],
+                capture_output=True, text=True, timeout=90,
+            )
+            ocr_binary = _rb.stdout
+        except Exception:
+            pass
+
     combined_text = (
         pdfplumber_text + '\n' +
         native_text     + '\n' +
         ocr_left        + '\n' +
         ocr_right       + '\n' +
         ocr_sparse      + '\n' +
-        ocr_inv_left
+        ocr_inv_left    + '\n' +
+        ocr_inv_right   + '\n' +
+        ocr_binary
     )
 
     # Scan barcode stripes directly from rendered image (primary GTIN source)
@@ -516,7 +542,7 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
         proof_type = brand_config.get('proof_type', 'press')
         checks = {
             'gtin':     _check_gtin(combined_text, fname, gtin_rows, barcode_gtins),
-            'nfp':      _check_nfp(combined_text, front_text=ocr_left + '\n' + ocr_inv_left),
+            'nfp':      _check_nfp(combined_text, front_text=ocr_left + '\n' + ocr_inv_left + '\n' + ocr_inv_right),
             'eyemark':  _check_eyemark(img, is_film, fname, required_eyemark),
             'spelling': _check_spelling(combined_text, fname),
             'fda':      _check_fda(combined_text, fname),
