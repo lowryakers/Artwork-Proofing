@@ -512,9 +512,9 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
         if is_film:
             checks['wind'] = _check_wind_direction(combined_text, effective_wind)
     else:
-        # ProDough mode: white eyemark is the company standard for all film/stick products
+        # ProDough mode: black eyemark is the company standard for all film/stick products
         if not required_eyemark:
-            required_eyemark = 'white'
+            required_eyemark = 'black'
         is_film = _is_film_rollstock(fname, combined_text)
         proof_type = brand_config.get('proof_type', 'press')
         checks = {
@@ -904,8 +904,28 @@ def _check_eyemark(img, is_film: bool = False, fname: str = '',
     mw = max(1, int(w * 0.10))
     mh = max(1, int(h * 0.08))
 
-    mark_region = img.crop((w - mw, h - mh, w, h))
-    pixels = list(mark_region.getdata())
+    # Sample all 4 corners; pick the one with the most extreme luma (most likely to be the eyemark)
+    corner_boxes = [
+        (0,       0,       mw,  mh),   # top-left
+        (w - mw,  0,       w,   mh),   # top-right
+        (0,       h - mh,  mw,  h),    # bottom-left
+        (w - mw,  h - mh,  w,   h),    # bottom-right
+    ]
+    best_pixels = None
+    best_extremity = -1
+    for box in corner_boxes:
+        corner_img = img.crop(box)
+        cpx = list(corner_img.getdata())
+        if not cpx:
+            continue
+        cl = [0.299 * r + 0.587 * g + 0.114 * b for r, g, b in cpx]
+        # Extremity = how far the corner's pixels are from mid-grey (128)
+        extremity = max(abs(min(cl) - 128), abs(max(cl) - 128))
+        if extremity > best_extremity:
+            best_extremity = extremity
+            best_pixels = cpx
+
+    pixels = best_pixels
     if not pixels:
         return {'issues': issues, 'notes': notes, 'eyemark_color': None}
 
