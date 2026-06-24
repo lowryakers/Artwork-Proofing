@@ -924,53 +924,54 @@ def _check_eyemark(img, is_film: bool = False, fname: str = '',
         return {'issues': issues, 'notes': notes, 'eyemark_color': None}
 
     w, h = img.size
-    mw = max(1, int(w * 0.10))
-    mh = max(1, int(h * 0.08))
 
-    # Sample all 4 corners; pick the one with the most extreme luma (most likely to be the eyemark)
-    corner_boxes = [
-        (0,       0,       mw,  mh),   # top-left
-        (w - mw,  0,       w,   mh),   # top-right
-        (0,       h - mh,  mw,  h),    # bottom-left
-        (w - mw,  h - mh,  w,   h),    # bottom-right
-    ]
-    best_pixels = None
-    best_extremity = -1
-    for box in corner_boxes:
-        corner_img = img.crop(box)
-        cpx = list(corner_img.getdata())
-        if not cpx:
-            continue
-        cl = [0.299 * r + 0.587 * g + 0.114 * b for r, g, b in cpx]
-        # Extremity = how far the corner's pixels are from mid-grey (128)
-        extremity = max(abs(min(cl) - 128), abs(max(cl) - 128))
-        if extremity > best_extremity:
-            best_extremity = extremity
-            best_pixels = cpx
+    # Scan the full image border with small tiles looking for the eyemark.
+    # Key insight: an eyemark is a SOLID uniform patch (very low pixel range).
+    # Barcodes have alternating black/white bars → pixel range ~255 → excluded.
+    # This prevents the barcode (which always appears "extreme") from being
+    # mistaken for the eyemark.
+    tw = max(25, int(min(w, h) * 0.055))   # tile side length
+    bx = max(tw, int(w  * 0.16))            # left/right border scan depth
+    by = max(tw, int(h  * 0.13))            # top/bottom border scan depth
+    step = max(tw // 2, 12)
 
-    pixels = best_pixels
-    if not pixels:
-        return {'issues': issues, 'notes': notes, 'eyemark_color': None}
+    gray = img.convert('L')
+    best_score = 0
+    eyemark_color = None
+    avg_luma = 128  # fallback
 
-    lumas = [0.299 * r + 0.587 * g + 0.114 * b for r, g, b in pixels]
-    min_luma = min(lumas)
-    max_luma = max(lumas)
-    avg_luma = sum(lumas) / len(lumas)
+    def _em_score(px):
+        if len(px) < 4:
+            return 0, None
+        mn, mx = min(px), max(px)
+        # Pixel range > 90 → mixed content (barcode, graphics) — not a solid eyemark
+        if mx - mn > 90:
+            return 0, None
+        avg = sum(px) / len(px)
+        uniformity = 1.0 - (mx - mn) / 90.0
+        if avg < 45:                          # solid dark → black eyemark
+            return (1.0 - avg / 45.0) * uniformity, 'black'
+        if avg > 210:                         # solid light → white eyemark
+            return ((avg - 210.0) / 45.0) * uniformity, 'white'
+        return 0, None
 
-    # A black eyemark leaves very dark pixels (<25); a white eyemark leaves very light pixels (>230).
-    has_black = min_luma < 25
-    has_white = max_luma > 230
+    def _scan_zone(x0, y0, x1, y1):
+        nonlocal best_score, eyemark_color, avg_luma
+        for yy in range(y0, max(y0 + 1, y1 - tw + 1), step):
+            for xx in range(x0, max(x0 + 1, x1 - tw + 1), step):
+                px = list(gray.crop((xx, yy, min(xx + tw, x1), min(yy + tw, y1))).getdata())
+                sc, col = _em_score(px)
+                if sc > best_score:
+                    best_score = sc
+                    eyemark_color = col
+                    avg_luma = sum(px) / max(1, len(px))
 
-    if has_black and has_white:
-        # Both extremes present — determine which is the eyemark (the minority element)
-        black_count = sum(1 for l in lumas if l < 25)
-        white_count = sum(1 for l in lumas if l > 230)
-        eyemark_color = 'black' if black_count <= white_count else 'white'
-    elif has_black:
-        eyemark_color = 'black'
-    elif has_white:
-        eyemark_color = 'white'
-    else:
+    _scan_zone(0,       0,       w,      by)       # top strip
+    _scan_zone(0,       h - by,  w,      h)        # bottom strip
+    _scan_zone(0,       0,       bx,     h)        # left strip
+    _scan_zone(w - bx,  0,       w,      h)        # right strip
+
+    if eyemark_color is None:
         eyemark_color = 'none'
 
     req = required_color.lower().strip() if required_color else ''
