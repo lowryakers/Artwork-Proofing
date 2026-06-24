@@ -796,11 +796,14 @@ def _check_nfp(ocr_text: str, front_text: str = '') -> dict:
     for _i, _line in enumerate(_lines):
         _s = _line.strip()
         _ctx_fwd = ' '.join(l.strip() for l in _lines[_i + 1: _i + 7])
-        # Standalone number (e.g. "117")
+        # Standalone number (e.g. "117") — but skip "100" if next lines show "%"
+        # (catches "100% Grass-Fed Whey" badges being misread as 100 calories)
         _m = re.match(r'^(\d{2,3})$', _s)
         if _m:
             _v = int(_m.group(1))
-            if 30 <= _v <= 800 and re.search(r'\bcal(?:ories?)?\b', _ctx_fwd):
+            _next_few = ' '.join(l.strip() for l in _lines[_i + 1: _i + 3])
+            _is_pct = '%' in _next_few or 'percent' in _next_few.lower()
+            if not _is_pct and 30 <= _v <= 800 and re.search(r'\bcal(?:ories?)?\b', _ctx_fwd):
                 _fc_cals.add(_v)
         # Standalone "NNg" or "NN" followed by "g" on next line (e.g. "25g" or "25G")
         _mg = re.match(r'^(\d+)g$', _s)
@@ -821,9 +824,13 @@ def _check_nfp(ocr_text: str, front_text: str = '') -> dict:
     # chars BEFORE it; protein keyword with number in 60 chars before it.
     for _km in re.finditer(r'\bcal(?:ories?)?\b', fl):
         _before = fl[max(0, _km.start() - 120): _km.start()]
-        for _v in re.findall(r'\b(\d{2,3})\b', _before):
-            _vi = int(_v)
+        for _vm in re.finditer(r'\b(\d{2,3})\b', _before):
+            _vi = int(_vm.group(1))
             if 30 <= _vi <= 800:
+                # Skip if this number is immediately followed by "%" (percentage claim)
+                _trail = _before[_vm.end(): _vm.end() + 4].lstrip()
+                if _trail.startswith('%'):
+                    continue
                 _fc_cals.add(_vi)
     for _km in re.finditer(r'\bprotein\b', fl):
         _before = fl[max(0, _km.start() - 60): _km.start()]
@@ -925,20 +932,41 @@ def _check_eyemark(img, is_film: bool = False, fname: str = '',
 
     w, h = img.size
 
-    # Scan the full image border with small tiles looking for the eyemark.
-    # Key insight: an eyemark is a SOLID uniform patch (very low pixel range).
-    # Barcodes have alternating black/white bars → pixel range ~255 → excluded.
-    # This prevents the barcode (which always appears "extreme") from being
-    # mistaken for the eyemark.
+    # Detect barcode location so we can exclude it from the eyemark scan.
+    # Barcode white spaces score identically to a solid white patch — we must
+    # mask the barcode region or we'll always mis-detect it as the eyemark.
+    _barcode_zones = []  # list of (x0, y0, x1, y1) exclusion rectangles
+    if PYZBAR_AVAILABLE:
+        try:
+            _bc_decoded = _pyzbar_decode(img.convert('RGB'))
+            for _bc in _bc_decoded:
+                _r = _bc.rect
+                _margin = max(30, int(min(w, h) * 0.06))
+                _barcode_zones.append((
+                    max(0,  _r.left  - _margin),
+                    max(0,  _r.top   - _margin),
+                    min(w,  _r.left  + _r.width  + _margin),
+                    min(h,  _r.top   + _r.height + _margin),
+                ))
+        except Exception:
+            pass
+
+    def _in_barcode(xx, yy):
+        """Return True if tile at (xx,yy) overlaps any barcode exclusion zone."""
+        for zx0, zy0, zx1, zy1 in _barcode_zones:
+            if xx < zx1 and xx + tw > zx0 and yy < zy1 and yy + tw > zy0:
+                return True
+        return False
+
     tw = max(25, int(min(w, h) * 0.055))   # tile side length
     bx = max(tw, int(w  * 0.16))            # left/right border scan depth
     by = max(tw, int(h  * 0.13))            # top/bottom border scan depth
     step = max(tw // 2, 12)
 
     gray = img.convert('L')
-    best_score = 0
-    eyemark_color = None
-    avg_luma = 128  # fallback
+    best_black = 0   # best score for a solid-dark tile
+    best_white = 0   # best score for a solid-light tile
+    avg_luma = 128   # fallback for the "else" color description branch
 
     def _em_score(px):
         if len(px) < 4:
@@ -949,29 +977,40 @@ def _check_eyemark(img, is_film: bool = False, fname: str = '',
             return 0, None
         avg = sum(px) / len(px)
         uniformity = 1.0 - (mx - mn) / 90.0
-        if avg < 45:                          # solid dark → black eyemark
+        if avg < 45:
             return (1.0 - avg / 45.0) * uniformity, 'black'
-        if avg > 210:                         # solid light → white eyemark
+        if avg > 210:
             return ((avg - 210.0) / 45.0) * uniformity, 'white'
         return 0, None
 
     def _scan_zone(x0, y0, x1, y1):
-        nonlocal best_score, eyemark_color, avg_luma
+        nonlocal best_black, best_white, avg_luma
         for yy in range(y0, max(y0 + 1, y1 - tw + 1), step):
             for xx in range(x0, max(x0 + 1, x1 - tw + 1), step):
+                if _in_barcode(xx, yy):
+                    continue
                 px = list(gray.crop((xx, yy, min(xx + tw, x1), min(yy + tw, y1))).getdata())
                 sc, col = _em_score(px)
-                if sc > best_score:
-                    best_score = sc
-                    eyemark_color = col
+                if col == 'black' and sc > best_black:
+                    best_black = sc
                     avg_luma = sum(px) / max(1, len(px))
+                elif col == 'white' and sc > best_white:
+                    best_white = sc
 
     _scan_zone(0,       0,       w,      by)       # top strip
     _scan_zone(0,       h - by,  w,      h)        # bottom strip
     _scan_zone(0,       0,       bx,     h)        # left strip
     _scan_zone(w - bx,  0,       w,      h)        # right strip
 
-    if eyemark_color is None:
+    # Asymmetric decision: solid dark patches in the artwork border are rare and
+    # almost always intentional (eyemark, crop mark). White regions are common
+    # (paper background, NFP label). Prefer black; only report white if there is
+    # no dark candidate at all and the white signal is very strong.
+    if best_black >= 0.20:
+        eyemark_color = 'black'
+    elif best_white >= 0.85 and best_black < 0.10:
+        eyemark_color = 'white'
+    else:
         eyemark_color = 'none'
 
     req = required_color.lower().strip() if required_color else ''
@@ -1300,7 +1339,7 @@ def _check_fda(ocr_text: str, fname: str) -> dict:
     is_tree_nut_product = bool(re.search(_TREE_NUTS, fname_tl))
 
     # Per-allergen OCR presence
-    _milk_in_ocr      = bool(re.search(r'\bmilk\b|\bnon.fat\s+milk\b|\bmilk\s+powder\b|\bskim\s+milk\b|\bdairy\b|\bcasein\b', tl))
+    _milk_in_ocr      = bool(re.search(r'\bmilk\b|\bnon.fat\s+milk\b|\bmilk\s+powder\b|\bskim\s+milk\b|\bdairy\b|\bcasein\b|\bwhey\b|\blactose\b', tl))
     _peanut_in_ocr    = bool(re.search(r'\bpeanut\b', tl))
     _tree_nut_in_ocr  = bool(re.search(_TREE_NUTS + r'|\btree\s+nut\b', tl))
     _soy_in_ocr       = bool(re.search(r'\bsoy(?:bean)?\b|\bsoy\s+lecithin\b', tl))
