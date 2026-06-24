@@ -1109,7 +1109,13 @@ def _check_fda(ocr_text: str, fname: str) -> dict:
             r'\bless\s+than\s+\d', r'\bcontains\s+less\s+than\b',
         ]
         _has_ingredients = any(re.search(p, tl) for p in _ingredient_signals)
-        if not _has_ingredients:
+        # Suppress the absence warning when the NFP is detected — on multi-panel flat
+        # layouts (pouches, bags) the ingredient text is often outlined or positioned
+        # outside the OCR region, but if we can read the NFP the ingredient list is
+        # almost certainly present. A missing ingredient panel is a visual defect that
+        # human review catches immediately.
+        _nfp_found = _has_nfp_text or _has_nfp_numbers or _nfp_row_hits >= 2
+        if not _has_ingredients and not _nfp_found:
             issues.append({
                 'severity': 'warning',
                 'message': (
