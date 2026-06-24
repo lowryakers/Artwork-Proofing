@@ -495,7 +495,7 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
         proof_type = brand_config.get('proof_type', 'press')
         checks = {
             'gtin':     _check_gtin(combined_text, fname, gtin_rows, barcode_gtins),
-            'nfp':      _check_nfp(combined_text),
+            'nfp':      _check_nfp(combined_text, front_text=ocr_left),
             'eyemark':  _check_eyemark(img, is_film, fname, required_eyemark),
             'spelling': _check_spelling(combined_text, fname),
             'fda':      _check_fda(combined_text, fname),
@@ -685,9 +685,12 @@ def _check_gtin(ocr_text: str, fname: str, gtin_rows: list,
 
 # ── Check 2: Front call-outs vs NFP ──────────────────────────────────────────
 
-def _check_nfp(ocr_text: str) -> dict:
+def _check_nfp(ocr_text: str, front_text: str = '') -> dict:
     issues, notes = [], []
     tl = ocr_text.lower()
+    # For front callout badge detection, use left-half OCR if provided (more
+    # accurate than full combined text which mixes front + back panel).
+    fl = front_text.lower() if front_text.strip() else tl
 
     # Use multi-signal detection — outlined-text PDFs often OCR row labels/numbers
     # even when the "Nutrition Facts" header text doesn't render. Avoid false flags
@@ -733,53 +736,57 @@ def _check_nfp(ocr_text: str) -> dict:
     _fc_cals, _fc_prots = set(), set()
 
     # Strategy 1: inline "117 cal/calories" or "25g protein" on same line
-    for _v in re.findall(r'\b(\d{2,3})\s*cal(?:ories?)?\b(?!\s*\d)', tl):
+    # Run on fl (left-half / front-panel text) for accuracy
+    for _v in re.findall(r'\b(\d{2,3})\s*cal(?:ories?)?\b(?!\s*\d)', fl):
         if 30 <= int(_v) <= 800: _fc_cals.add(int(_v))
-    for _v in re.findall(r'\b(\d+)\s*g\s+protein\b', tl):
+    for _v in re.findall(r'\b(\d+)\s*g\s+protein\b', fl):
         if 0 < int(_v) < 120: _fc_prots.add(int(_v))
 
     # Strategy 2: multi-line badge format — standalone number on its own line
-    # followed within 3 lines by the keyword ("117\nCalories\nPer Serving")
-    _lines = tl.split('\n')
+    # followed within 6 lines by the keyword ("117\nCalories\nPer Serving")
+    _lines = fl.split('\n')
     for _i, _line in enumerate(_lines):
         _s = _line.strip()
-        _ctx_fwd = ' '.join(l.strip() for l in _lines[_i + 1: _i + 4])
+        _ctx_fwd = ' '.join(l.strip() for l in _lines[_i + 1: _i + 7])
         # Standalone number (e.g. "117")
         _m = re.match(r'^(\d{2,3})$', _s)
         if _m:
             _v = int(_m.group(1))
             if 30 <= _v <= 800 and re.search(r'\bcal(?:ories?)?\b', _ctx_fwd):
                 _fc_cals.add(_v)
-        # Standalone "NNg" (e.g. "25g" or "25G")
+        # Standalone "NNg" or "NN" followed by "g" on next line (e.g. "25g" or "25G")
         _mg = re.match(r'^(\d+)g$', _s)
         if _mg:
             _v = int(_mg.group(1))
             if 0 < _v < 120 and re.search(r'\bprotein\b', _ctx_fwd):
                 _fc_prots.add(_v)
+        # "25" on one line, "g" or "grams" on next — OCR sometimes splits the unit
+        _mn = re.match(r'^(\d{1,2})$', _s)
+        if _mn:
+            _v = int(_mn.group(1))
+            _next = _lines[_i + 1].strip().lower() if _i + 1 < len(_lines) else ''
+            if _next in ('g', 'grams') and 0 < _v < 120:
+                if re.search(r'\bprotein\b', _ctx_fwd):
+                    _fc_prots.add(_v)
 
-    # Strategy 3: reverse window — "calories" keyword with a number in the 40
-    # chars BEFORE it (handles "117 Calories Per Serving" even when separated
-    # by up to 40 chars of whitespace/newlines)
-    for _km in re.finditer(r'\bcal(?:ories?)?\b', tl):
-        _before = tl[max(0, _km.start() - 40): _km.start()]
+    # Strategy 3: reverse window — "calories" keyword with a number in the 120
+    # chars BEFORE it; protein keyword with number in 60 chars before it.
+    for _km in re.finditer(r'\bcal(?:ories?)?\b', fl):
+        _before = fl[max(0, _km.start() - 120): _km.start()]
         for _v in re.findall(r'\b(\d{2,3})\b', _before):
             _vi = int(_v)
             if 30 <= _vi <= 800:
                 _fc_cals.add(_vi)
-    for _km in re.finditer(r'\bprotein\b', tl):
-        _before = tl[max(0, _km.start() - 25): _km.start()]
+    for _km in re.finditer(r'\bprotein\b', fl):
+        _before = fl[max(0, _km.start() - 60): _km.start()]
         for _v in re.findall(r'\b(\d{1,2})\b', _before):
             _vi = int(_v)
             if 5 < _vi < 120:
                 _fc_prots.add(_vi)
 
-    # Remove values that only appear in NFP format (label-before-value) to avoid
-    # double-counting — if a value was already found in nfp_calories, it came from
-    # the NFP pattern; only keep it in front_calories if it was also found in a
-    # front-callout pattern.
     front_calories  = sorted(_fc_cals)
     front_proteins  = sorted(_fc_prots)
-    front_zero_sugar = bool(re.search(r'\b0\s*g\s*\n?\s*added\s+sugar|\b0\s+added\s+sugar', tl))
+    front_zero_sugar = bool(re.search(r'\b0\s*g\s*\n?\s*added\s+sugar|\b0\s+added\s+sugar', fl))
 
     # Combined lists — used by the mismatch checks below
     calories = sorted(set(nfp_calories) | set(front_calories))
@@ -1253,6 +1260,18 @@ def _check_fda(ocr_text: str, fname: str) -> dict:
     # Last resort when OCR splits the declaration across pages/passes completely.
     if not has_contains_stmt and _any_allergen_in_ocr:
         if re.search(r'\bcontains?\s*:', tl):
+            has_contains_stmt = True
+
+    # ── Fallback 5: known-allergen product where that allergen IS visible in OCR ─
+    # Step 1 (below) already fires a critical flag when the allergen is MISSING from
+    # OCR entirely. If the allergen IS present in OCR, the ingredient list references
+    # it — meaning the Contains statement very likely exists but was OCR-fragmented.
+    # Suppress the general "no Contains" warning to avoid double-flagging compliant files.
+    if not has_contains_stmt:
+        if (is_whey_product    and not is_non_dairy_milk and _milk_in_ocr) or \
+           (is_wheat_product   and _wheat_in_ocr)   or \
+           (is_peanut_product  and _peanut_in_ocr)  or \
+           (is_tree_nut_product and _tree_nut_in_ocr):
             has_contains_stmt = True
 
     # ── Step 1: Filename-based checks ─────────────────────────────────────────
