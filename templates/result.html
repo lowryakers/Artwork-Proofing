@@ -863,9 +863,58 @@ function checkCard(num, title, icon, check, uid, filename, checkKey, alwaysOpen)
                 : infos.length ? `<span class="badge bg-info text-dark">${infos.length} notes</span>`
                 :                `<span class="badge bg-success">OK</span>`;
   let extras = '';
-  if (check.found_gtins?.length) extras += `<div class="mt-2 text-muted">GTINs detected: <code>${check.found_gtins.join(', ')}</code></div>`;
-  if (check.calories?.length)    extras += `<div class="mt-1 text-muted">Calories found: ${check.calories.join(', ')}</div>`;
-  if (check.proteins?.length)    extras += `<div class="mt-1 text-muted">Protein (g) found: ${check.proteins.join(', ')}</div>`;
+  if (checkKey === 'gtin') {
+    const detected = check.found_gtins?.length
+      ? check.found_gtins.map(g => `<div><code>${esc(g)}</code></div>`).join('')
+      : `<span class="text-danger"><i class="bi bi-x-circle me-1"></i>None detected</span>`;
+    const sg = check.spec_gtin || '';
+    const specHtml = sg
+      ? `<code>${esc(sg)}</code>${
+          check.found_gtins?.includes(sg)
+            ? `<i class="bi bi-check-circle-fill text-success ms-1"></i>`
+            : check.found_gtins?.length
+              ? `<i class="bi bi-x-circle-fill text-danger ms-1"></i>`
+              : ''
+        }`
+      : `<span class="text-muted fst-italic">Not in spec sheet</span>`;
+    extras += `<div class="mt-2 border rounded overflow-hidden" style="font-size:.8rem"><div class="row g-0">
+      <div class="col-6 p-2 border-end"><div class="text-muted fw-semibold mb-1" style="font-size:.72rem;text-transform:uppercase;letter-spacing:.04em">Detected in Artwork</div>${detected}</div>
+      <div class="col-6 p-2"><div class="text-muted fw-semibold mb-1" style="font-size:.72rem;text-transform:uppercase;letter-spacing:.04em">From Master Spreadsheet</div>${specHtml}</div>
+    </div></div>`;
+  }
+  if (checkKey === 'nfp') {
+    const fc = check.front_callout || {};
+    const nf = check.nfp_data     || {};
+    const chk = v => v ? `<i class="bi bi-check-circle-fill text-success ms-1"></i>` : `<span class="text-muted">—</span>`;
+    extras += `<div class="mt-2 border rounded overflow-hidden" style="font-size:.8rem"><div class="row g-0">
+      <div class="col-6 p-2 border-end">
+        <div class="text-muted fw-semibold mb-1" style="font-size:.72rem;text-transform:uppercase;letter-spacing:.04em">Front Panel (call-out)</div>
+        <div>Calories: ${fc.calories?.length ? `<strong>${fc.calories.join(', ')}</strong>` : '—'}</div>
+        <div>Protein: ${fc.proteins?.length ? `<strong>${fc.proteins.join(', ')}g</strong>` : '—'}</div>
+        <div>0g Added Sugar: ${chk(fc.zero_sugar)}</div>
+      </div>
+      <div class="col-6 p-2">
+        <div class="text-muted fw-semibold mb-1" style="font-size:.72rem;text-transform:uppercase;letter-spacing:.04em">Nutrition Facts Panel</div>
+        <div>Calories: ${nf.calories?.length ? `<strong>${nf.calories.join(', ')}</strong>` : '—'}</div>
+        <div>Protein: ${nf.proteins?.length ? `<strong>${nf.proteins.join(', ')}g</strong>` : '—'}</div>
+        <div>0g Added Sugars: ${chk(nf.zero_sugar)}</div>
+      </div>
+    </div></div>`;
+  }
+  if (checkKey === 'eyemark' && !check.skipped) {
+    const colorBadge = c => {
+      if (c === 'black') return `<span class="badge" style="background:#000;color:#fff"><i class="bi bi-circle-fill me-1"></i>BLACK</span>`;
+      if (c === 'white') return `<span class="badge border" style="background:#fff;color:#000"><i class="bi bi-circle me-1"></i>WHITE</span>`;
+      if (c === 'none')  return `<span class="text-warning"><i class="bi bi-question-circle me-1"></i>Not detected</span>`;
+      if (c) return `<span class="text-muted">${c.toUpperCase()}</span>`;
+      return '<span class="text-muted">—</span>';
+    };
+    const rc = check.required_color || '';
+    extras += `<div class="mt-2 border rounded overflow-hidden" style="font-size:.8rem"><div class="row g-0">
+      <div class="col-6 p-2 border-end"><div class="text-muted fw-semibold mb-1" style="font-size:.72rem;text-transform:uppercase;letter-spacing:.04em">Detected in Artwork</div>${colorBadge(check.eyemark_color)}</div>
+      <div class="col-6 p-2"><div class="text-muted fw-semibold mb-1" style="font-size:.72rem;text-transform:uppercase;letter-spacing:.04em">Required (Master Sheet)</div>${rc ? colorBadge(rc) : '<span class="text-muted fst-italic">Not specified</span>'}</div>
+    </div></div>`;
+  }
   return `<div class="card mb-2 check-card ${bdrCls} shadow-sm"${checkAttr}>
     <div class="card-header d-flex align-items-center gap-2 py-2 ${hdrCls}"
          data-bs-toggle="collapse" data-bs-target="#${id}" style="cursor:pointer">
