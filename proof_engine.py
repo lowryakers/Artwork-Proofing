@@ -728,14 +728,60 @@ def _check_nfp(ocr_text: str) -> dict:
     nfp_proteins  = sorted({int(p) for p in nfp_prot_hits if 0 < int(p) < 120})
     nfp_zero_sugar = bool(re.search(r'added\s+sugars?\s+0\s*g|added\s+sugars?\s*\n?\s*0', tl))
 
-    # Front callout format: value BEFORE label ("120 Calories", "25g Protein", "0G Added Sugar")
-    front_cal_hits  = re.findall(r'\b(\d+)\s*cal(?:ories?)?\b(?!\s*\d)', tl)
-    front_calories  = sorted({int(c) for c in front_cal_hits  if 30 <= int(c) <= 800})
-    front_prot_hits = re.findall(r'\b(\d+)\s*g\s+protein\b', tl)
-    front_proteins  = sorted({int(p) for p in front_prot_hits if 0 < int(p) < 120})
-    front_zero_sugar = bool(re.search(r'\b0\s*g\s+added\s+sugar\b', tl))
+    # Front callout format — circular badge callouts show the number on one line
+    # and the label on the next, so we need multi-strategy detection.
+    _fc_cals, _fc_prots = set(), set()
 
-    # Combined lists — used by the existing mismatch checks below
+    # Strategy 1: inline "117 cal/calories" or "25g protein" on same line
+    for _v in re.findall(r'\b(\d{2,3})\s*cal(?:ories?)?\b(?!\s*\d)', tl):
+        if 30 <= int(_v) <= 800: _fc_cals.add(int(_v))
+    for _v in re.findall(r'\b(\d+)\s*g\s+protein\b', tl):
+        if 0 < int(_v) < 120: _fc_prots.add(int(_v))
+
+    # Strategy 2: multi-line badge format — standalone number on its own line
+    # followed within 3 lines by the keyword ("117\nCalories\nPer Serving")
+    _lines = tl.split('\n')
+    for _i, _line in enumerate(_lines):
+        _s = _line.strip()
+        _ctx_fwd = ' '.join(l.strip() for l in _lines[_i + 1: _i + 4])
+        # Standalone number (e.g. "117")
+        _m = re.match(r'^(\d{2,3})$', _s)
+        if _m:
+            _v = int(_m.group(1))
+            if 30 <= _v <= 800 and re.search(r'\bcal(?:ories?)?\b', _ctx_fwd):
+                _fc_cals.add(_v)
+        # Standalone "NNg" (e.g. "25g" or "25G")
+        _mg = re.match(r'^(\d+)g$', _s)
+        if _mg:
+            _v = int(_mg.group(1))
+            if 0 < _v < 120 and re.search(r'\bprotein\b', _ctx_fwd):
+                _fc_prots.add(_v)
+
+    # Strategy 3: reverse window — "calories" keyword with a number in the 40
+    # chars BEFORE it (handles "117 Calories Per Serving" even when separated
+    # by up to 40 chars of whitespace/newlines)
+    for _km in re.finditer(r'\bcal(?:ories?)?\b', tl):
+        _before = tl[max(0, _km.start() - 40): _km.start()]
+        for _v in re.findall(r'\b(\d{2,3})\b', _before):
+            _vi = int(_v)
+            if 30 <= _vi <= 800:
+                _fc_cals.add(_vi)
+    for _km in re.finditer(r'\bprotein\b', tl):
+        _before = tl[max(0, _km.start() - 25): _km.start()]
+        for _v in re.findall(r'\b(\d{1,2})\b', _before):
+            _vi = int(_v)
+            if 5 < _vi < 120:
+                _fc_prots.add(_vi)
+
+    # Remove values that only appear in NFP format (label-before-value) to avoid
+    # double-counting — if a value was already found in nfp_calories, it came from
+    # the NFP pattern; only keep it in front_calories if it was also found in a
+    # front-callout pattern.
+    front_calories  = sorted(_fc_cals)
+    front_proteins  = sorted(_fc_prots)
+    front_zero_sugar = bool(re.search(r'\b0\s*g\s*\n?\s*added\s+sugar|\b0\s+added\s+sugar', tl))
+
+    # Combined lists — used by the mismatch checks below
     calories = sorted(set(nfp_calories) | set(front_calories))
     proteins = sorted(set(nfp_proteins) | set(front_proteins))
 
@@ -753,12 +799,12 @@ def _check_nfp(ocr_text: str) -> dict:
 
     if len(set(calories)) > 1 and not has_dual_column:
         diff = max(calories) - min(calories)
-        if diff > 5:
+        if diff > 1:
             issues.append({
                 'severity': 'warning',
                 'message': (
-                    f'Multiple calorie values detected ({", ".join(str(c) for c in calories)} cal). '
-                    'If the front call-out and NFP show different values, this is an FDA labeling violation.'
+                    f'Calorie mismatch: front call-out shows {min(calories)} cal but NFP shows {max(calories)} cal. '
+                    'Front panel and NFP must declare identical calorie counts (FDA labeling requirement).'
                 ),
             })
 
