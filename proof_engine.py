@@ -489,9 +489,9 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
     if not effective_wind and matched_spec.get('wind_direction'):
         effective_wind = matched_spec['wind_direction']
 
-    # Required eyemark color: spec sheet > brand_config > mode default
-    # Column names accepted: "eyemark color", "eyemark_color", "eye mark color"
+    # Required eyemark color: spec sheet > brand_config
     required_eyemark = (
+        matched_spec.get('eye_mark_color') or
         matched_spec.get('eyemark color') or
         matched_spec.get('eyemark_color') or
         matched_spec.get('eye mark color') or
