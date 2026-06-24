@@ -144,25 +144,37 @@
   </div>
 </div>
 
-<!-- Per-file tabs (multiple files) -->
+<!-- Per-file sidebar + panes (multiple files) -->
 {% if job.results | length > 1 %}
-<ul class="nav nav-tabs mb-3" id="fileTabs" role="tablist">
-  {% for r in job.results %}
-  <li class="nav-item" role="presentation">
-    <button class="nav-link small px-3 py-2 {% if loop.first %}active{% endif %}"
-            data-bs-toggle="tab" data-bs-target="#fp{{ loop.index0 }}" type="button">
-      {{ _sev_icon(r.severity) }}
-      {{ r.filename | truncate(28, true, '…') }}
-    </button>
-  </li>
-  {% endfor %}
-</ul>
-<div class="tab-content">
-  {% for r in job.results %}
-  <div class="tab-pane fade {% if loop.first %}show active{% endif %}" id="fp{{ loop.index0 }}">
-    {{ _file_result(r, job.id, loop.index0, dismissals, confirmations) }}
+<div class="d-flex gap-3 align-items-start" id="reportLayout">
+  <div class="file-sidebar" id="fileSidebar">
+    <div class="px-2 py-1 text-muted" style="font-size:.7rem;text-transform:uppercase;letter-spacing:.05em;border-bottom:1px solid #eee;margin-bottom:4px">
+      {{ job.results | length }} Files
+    </div>
+    {% for r in job.results %}
+    <a class="file-sidebar-item{% if loop.first %} active{% endif %}"
+       onclick="showFile({{ loop.index0 }})" href="#" id="fsitem{{ loop.index0 }}">
+      {{ _sev_icon(r.severity) }}<span class="fsname">{{ r.filename | truncate(28, true, '…') }}</span>
+    </a>
+    {% endfor %}
   </div>
-  {% endfor %}
+  <div class="flex-grow-1 min-width-0" id="fileContent">
+    <div id="noMatchMsg" style="display:none" class="alert alert-secondary mt-2"><i class="bi bi-funnel me-2"></i>No files match the current filter combination.</div>
+    {% for r in job.results %}
+    <div class="file-pane{% if not loop.first %} d-none{% endif %}" id="fp{{ loop.index0 }}">
+      {{ _file_result(r, job.id, loop.index0, dismissals, confirmations) }}
+      <div class="file-nav-bar">
+        <button class="btn btn-outline-secondary btn-sm" onclick="showFile({{ loop.index0 - 1 }})" {% if loop.first %}disabled{% endif %}>
+          <i class="bi bi-arrow-left me-1"></i>Prev
+        </button>
+        <span class="text-muted small">{{ loop.index }} of {{ job.results | length }}</span>
+        <button class="btn btn-dark btn-sm" onclick="showFile({{ loop.index0 + 1 }})" {% if loop.last %}disabled{% endif %}>
+          Next<i class="bi bi-arrow-right ms-1"></i>
+        </button>
+      </div>
+    </div>
+    {% endfor %}
+  </div>
 </div>
 {% else %}
   {% for r in job.results %}{{ _file_result(r, job.id, loop.index0, dismissals, confirmations) }}{% endfor %}
