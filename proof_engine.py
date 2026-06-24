@@ -512,9 +512,6 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
         if is_film:
             checks['wind'] = _check_wind_direction(combined_text, effective_wind)
     else:
-        # ProDough mode: black eyemark is the company standard for all film/stick products
-        if not required_eyemark:
-            required_eyemark = 'black'
         is_film = _is_film_rollstock(fname, combined_text)
         proof_type = brand_config.get('proof_type', 'press')
         checks = {
