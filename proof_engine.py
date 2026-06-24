@@ -392,10 +392,12 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
 
     # ── Native text: PyMuPDF fallback ────────────────────────────────────────
     native_text = ''
+    page_rotation = 0
     try:
         import fitz as _fitz
         _doc = _fitz.open(pdf_path)
         native_text = '\n'.join(_doc[i].get_text() for i in range(len(_doc)))
+        page_rotation = _doc[0].rotation if len(_doc) > 0 else 0
         _doc.close()
     except Exception:
         pass
@@ -559,6 +561,7 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
         'info_count': len(infos),
         'error': None,
         'matched_spec': matched_spec,
+        'page_rotation': page_rotation,
     }
 
 

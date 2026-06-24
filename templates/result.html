@@ -161,7 +161,7 @@
   <div class="flex-grow-1 min-width-0" id="fileContent">
     <div id="noMatchMsg" style="display:none" class="alert alert-secondary mt-2"><i class="bi bi-funnel me-2"></i>No files match the current filter combination.</div>
     {% for r in job.results %}
-    <div class="file-pane{% if not loop.first %} d-none{% endif %}" id="fp{{ loop.index0 }}">
+    <div class="file-pane{% if not loop.first %} d-none{% endif %}" id="fp{{ loop.index0 }}" data-page-rotation="{{ r.get('page_rotation', 0) }}">
       {{ _file_result(r, job.id, loop.index0, dismissals, confirmations) }}
       <div class="file-nav-bar">
         <button class="btn btn-outline-secondary btn-sm" onclick="showFile({{ loop.index0 - 1 }})" {% if loop.first %}disabled{% endif %}>
@@ -1247,7 +1247,7 @@ function buildReport(job) {
 
     // File panes (hidden/shown via CSS)
     const panes = results.map((r, i) =>
-      `<div class="file-pane${i===0?'':' d-none'}" id="jsfp${i}">
+      `<div class="file-pane${i===0?'':' d-none'}" id="jsfp${i}" data-page-rotation="${r.page_rotation||0}">
         ${fileResult(r, job.id, i)}
         <div class="file-nav-bar">
           <button class="btn btn-outline-secondary btn-sm" onclick="showFile(${i-1})" ${i===0?'disabled':''}>
@@ -1278,14 +1278,21 @@ function buildReport(job) {
 
 let _currentFileIdx = 0;
 function showFile(idx) {
-  const results = document.querySelectorAll('.file-pane');
-  if (idx < 0 || idx >= results.length) return;
-  results.forEach((p, i) => p.classList.toggle('d-none', i !== idx));
+  const panes = document.querySelectorAll('.file-pane');
+  if (idx < 0 || idx >= panes.length) return;
+  panes.forEach((p, i) => p.classList.toggle('d-none', i !== idx));
   document.querySelectorAll('.file-sidebar-item').forEach((el, i) => el.classList.toggle('active', i === idx));
   _currentFileIdx = idx;
-  // Re-wire viewer boxes in the newly shown pane
+  // Re-wire viewer boxes and apply PDF page rotation
   const pane = document.getElementById('jsfp' + idx);
-  if (pane) pane.querySelectorAll('.res-viewer-box').forEach(wireViewerBox);
+  if (pane) {
+    pane.querySelectorAll('.res-viewer-box').forEach(wireViewerBox);
+    const rot = parseInt(pane.dataset.pageRotation || '0');
+    if (rot) {
+      const s = rsState(idx);
+      if (s.rotation === 0) { s.rotation = rot; rsApply(idx); }
+    }
+  }
 }
 
 /* ── Render helper ── */
@@ -1296,6 +1303,12 @@ async function renderDone() {
     document.getElementById('reportRoot').innerHTML = buildReport(job);
     document.getElementById('resultsView').style.display = '';
     document.querySelectorAll('.res-viewer-box').forEach(wireViewerBox);
+    // Apply PDF page rotation for the initially visible file (file 0)
+    const _fp0 = document.getElementById('jsfp0');
+    if (_fp0) {
+      const _rot0 = parseInt(_fp0.dataset.pageRotation || '0');
+      if (_rot0) { const _s0 = rsState(0); _s0.rotation = _rot0; rsApply(0); }
+    }
   } catch (err) {
     document.getElementById('loadingView').style.display = 'none';
     document.getElementById('errorMsg').textContent = 'Failed to load results: ' + err;
