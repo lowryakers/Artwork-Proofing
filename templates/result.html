@@ -499,6 +499,82 @@
       </div>
       {% endif %}
 
+{% if check_key == 'spelling' %}
+<div class="mt-2 border rounded overflow-hidden" style="font-size:.8rem">
+  <div class="row g-0">
+    <div class="col-6 p-2 border-end">
+      <div class="text-muted fw-semibold mb-1" style="font-size:.72rem;text-transform:uppercase;letter-spacing:.04em">Detected in Artwork</div>
+      {% if check.get('brand_found') == true %}
+        <span class="text-success"><i class="bi bi-check-circle-fill me-1"></i>Detected</span>
+      {% elif check.get('brand_found') == false %}
+        <span class="text-warning"><i class="bi bi-question-circle me-1"></i>Not detected in OCR</span>
+      {% else %}
+        <span class="text-muted">—</span>
+      {% endif %}
+    </div>
+    <div class="col-6 p-2">
+      <div class="text-muted fw-semibold mb-1" style="font-size:.72rem;text-transform:uppercase;letter-spacing:.04em">Expected</div>
+      <span class="fw-semibold">ProDough<sup>®</sup></span>
+    </div>
+  </div>
+</div>
+{% endif %}
+
+{% if check_key == 'fda' %}
+{% set allergens = check.get('allergens_found', []) %}
+<div class="mt-2 border rounded overflow-hidden" style="font-size:.8rem">
+  <div class="row g-0">
+    <div class="col-6 p-2 border-end">
+      <div class="text-muted fw-semibold mb-1" style="font-size:.72rem;text-transform:uppercase;letter-spacing:.04em">Allergens in OCR</div>
+      {% if allergens %}
+        {% for a in allergens %}<span class="badge bg-secondary me-1 mb-1">{{ a }}</span>{% endfor %}
+      {% else %}
+        <span class="text-muted fst-italic">None detected</span>
+      {% endif %}
+    </div>
+    <div class="col-6 p-2">
+      <div class="text-muted fw-semibold mb-1" style="font-size:.72rem;text-transform:uppercase;letter-spacing:.04em">Contains Declaration</div>
+      {% if check.get('sparse') %}
+        <span class="text-muted fst-italic">OCR sparse — verify manually</span>
+      {% elif check.get('has_contains') %}
+        <span class="text-success"><i class="bi bi-check-circle-fill me-1"></i>Found</span>
+      {% else %}
+        <span class="text-danger"><i class="bi bi-x-circle-fill me-1"></i>Not detected</span>
+      {% endif %}
+    </div>
+  </div>
+</div>
+{% endif %}
+
+{% if check_key == 'wind' %}
+<div class="mt-2 border rounded overflow-hidden" style="font-size:.8rem">
+  <div class="row g-0">
+    <div class="col-6 p-2 border-end">
+      <div class="text-muted fw-semibold mb-1" style="font-size:.72rem;text-transform:uppercase;letter-spacing:.04em">Detected in Artwork</div>
+      {% if check.get('detected_direction') %}
+        Wind {{ check.detected_direction }}
+        {% if check.detected_direction == check.get('required_direction') %}
+          <i class="bi bi-check-circle-fill text-success ms-1"></i>
+        {% else %}
+          <i class="bi bi-x-circle-fill text-danger ms-1"></i>
+        {% endif %}
+      {% else %}
+        <span class="text-muted fst-italic">Not detected</span>
+      {% endif %}
+    </div>
+    <div class="col-6 p-2">
+      <div class="text-muted fw-semibold mb-1" style="font-size:.72rem;text-transform:uppercase;letter-spacing:.04em">Required (Spec)</div>
+      {% if check.get('required_label') %}
+        Wind {{ check.required_direction }}
+        <div class="text-muted" style="font-size:.72rem">{{ check.required_label.split('—')[1].strip() if '—' in check.required_label else check.required_label }}</div>
+      {% else %}
+        <span class="text-muted fst-italic">Not specified</span>
+      {% endif %}
+    </div>
+  </div>
+</div>
+{% endif %}
+
     </div>
   </div>
 </div>
@@ -525,6 +601,43 @@
   #reportRoot[data-check-filter="fda"]      .check-card[data-check="fda"]      { display:block!important; }
   #reportRoot[data-check-filter="specs"]    .check-card[data-check="specs"]    { display:block!important; }
   #reportRoot[data-check-filter="wind"]     .check-card[data-check="wind"]     { display:block!important; }
+  /* File sidebar navigation */
+  .file-sidebar {
+    width: 210px;
+    flex-shrink: 0;
+    border-right: 1px solid #dee2e6;
+    max-height: calc(100vh - 160px);
+    overflow-y: auto;
+    position: sticky;
+    top: 70px;
+    align-self: flex-start;
+  }
+  .file-sidebar-item {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 10px;
+    cursor: pointer;
+    border-radius: 6px;
+    margin: 2px 4px;
+    font-size: 0.78rem;
+    line-height: 1.3;
+    text-decoration: none;
+    color: #444;
+    transition: background .15s;
+  }
+  .file-sidebar-item:hover { background: #f0f0f0; color: #222; }
+  .file-sidebar-item.active { background: #e8f0fe; color: #1a56db; font-weight: 600; }
+  .file-sidebar-item .fsname { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  /* File navigation prev/next */
+  .file-nav-bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 10px 0;
+    margin-top: 12px;
+    border-top: 1px solid #dee2e6;
+  }
   /* ── Dismissed ── */
   .issue-row.dismissed { opacity:.45; text-decoration:line-through; }
   /* ── Confirmed ── */
@@ -543,10 +656,11 @@ function esc(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').re
 /* ── Filename display ── */
 function simplifyFilename(fname) {
   return fname
-    .replace(/\.[^.]+$/, '')                                         // remove extension
-    .replace(/^PD[_\-\s]+/i, '')                                     // strip PD_ / PD- prefix
-    .replace(/[_\-]+/g, ' ')                                         // _ and - → spaces
-    .replace(/\s+\d+\.?\d*\s*(oz|lb|lbs|g|kg|ct|pk|pack)\b.*/i, '') // strip trailing size
+    .replace(/\.pdf$/i, '')
+    .replace(/\s*PROOF\s*$/i, '')
+    .replace(/^[\d]+\s*/, '')
+    .replace(/\bPD[_\s]?/gi, '')
+    .replace(/_/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
 }
@@ -598,31 +712,20 @@ function isCardVisible(card) {
 }
 
 function updateFileVisibility() {
-  const tabList    = document.querySelector('#reportRoot .nav-tabs');
-  const tabContent = document.querySelector('#reportRoot .tab-content');
-  if (!tabList || !tabContent) return; // single-file layout
+  const sidebar = document.getElementById('fileSidebar');
+  if (!sidebar) return; // single-file layout
 
-  let firstVisibleBtn = null;
-  const activeBtn = tabList.querySelector('.nav-link.active');
-
-  tabList.querySelectorAll('.nav-item').forEach(item => {
-    const btn    = item.querySelector('.nav-link');
-    const target = btn?.getAttribute('data-bs-target');
-    const pane   = target ? tabContent.querySelector(target) : null;
-    if (!btn || !pane) return;
+  let anyVisible = false;
+  document.querySelectorAll('.file-pane').forEach((pane, i) => {
     const hasVisible = Array.from(pane.querySelectorAll('.check-card')).some(isCardVisible);
-    item.style.display = hasVisible ? '' : 'none';
-    if (hasVisible && !firstVisibleBtn) firstVisibleBtn = btn;
+    const sideItem = document.getElementById('fsitem' + i);
+    if (sideItem) sideItem.style.display = hasVisible ? '' : 'none';
+    if (hasVisible) anyVisible = true;
   });
-
-  // If the active tab became hidden, jump to first visible one
-  if (activeBtn?.closest('.nav-item')?.style.display === 'none' && firstVisibleBtn) {
-    firstVisibleBtn.click();
-  }
 
   // Empty-state message
   const noMatch = document.getElementById('noMatchMsg');
-  if (noMatch) noMatch.style.display = firstVisibleBtn ? 'none' : '';
+  if (noMatch) noMatch.style.display = anyVisible ? 'none' : '';
 }
 
 /* ── Dismiss ── */
@@ -736,7 +839,7 @@ function wireViewerBox(box) {
   /* Wheel zoom at cursor */
   box.addEventListener('wheel', e => {
     e.preventDefault();
-    rsZoomAt(idx, rsState(idx).scale * (e.deltaY < 0 ? 1.12 : 1/1.12), e.clientX, e.clientY);
+    rsZoomAt(idx, rsState(idx).scale * (e.deltaY < 0 ? 1.08 : 1/1.08), e.clientX, e.clientY);
   }, { passive: false });
   /* Double-click zoom */
   box.addEventListener('dblclick', e => {
@@ -915,6 +1018,52 @@ function checkCard(num, title, icon, check, uid, filename, checkKey, alwaysOpen)
       <div class="col-6 p-2"><div class="text-muted fw-semibold mb-1" style="font-size:.72rem;text-transform:uppercase;letter-spacing:.04em">Required (Master Sheet)</div>${rc ? colorBadge(rc) : '<span class="text-muted fst-italic">Not specified</span>'}</div>
     </div></div>`;
   }
+  if (checkKey === 'spelling') {
+    const bf = check.brand_found;
+    const statusHtml = bf === true
+      ? `<span class="text-success"><i class="bi bi-check-circle-fill me-1"></i>Detected</span>`
+      : bf === false
+        ? `<span class="text-warning"><i class="bi bi-question-circle me-1"></i>Not detected in OCR</span>`
+        : `<span class="text-muted">—</span>`;
+    extras += `<div class="mt-2 border rounded overflow-hidden" style="font-size:.8rem"><div class="row g-0">
+      <div class="col-6 p-2 border-end"><div class="text-muted fw-semibold mb-1" style="font-size:.72rem;text-transform:uppercase;letter-spacing:.04em">Detected in Artwork</div>${statusHtml}</div>
+      <div class="col-6 p-2"><div class="text-muted fw-semibold mb-1" style="font-size:.72rem;text-transform:uppercase;letter-spacing:.04em">Expected</div><span class="fw-semibold">ProDough<sup>®</sup></span></div>
+    </div></div>`;
+  }
+  if (checkKey === 'fda') {
+    const allergens = check.allergens_found || [];
+    const allergenHtml = allergens.length
+      ? allergens.map(a => `<span class="badge bg-secondary me-1 mb-1">${esc(a)}</span>`).join('')
+      : `<span class="text-muted fst-italic">None detected</span>`;
+    const containsHtml = check.sparse
+      ? `<span class="text-muted fst-italic">OCR sparse — verify manually</span>`
+      : check.has_contains === true
+        ? `<span class="text-success"><i class="bi bi-check-circle-fill me-1"></i>Found</span>`
+        : check.has_contains === false
+          ? `<span class="text-danger"><i class="bi bi-x-circle-fill me-1"></i>Not detected</span>`
+          : `<span class="text-muted">—</span>`;
+    extras += `<div class="mt-2 border rounded overflow-hidden" style="font-size:.8rem"><div class="row g-0">
+      <div class="col-6 p-2 border-end"><div class="text-muted fw-semibold mb-1" style="font-size:.72rem;text-transform:uppercase;letter-spacing:.04em">Allergens in OCR</div>${allergenHtml}</div>
+      <div class="col-6 p-2"><div class="text-muted fw-semibold mb-1" style="font-size:.72rem;text-transform:uppercase;letter-spacing:.04em">Contains Declaration</div>${containsHtml}</div>
+    </div></div>`;
+  }
+  if (checkKey === 'wind') {
+    const detLabel = check.detected_direction
+      ? `Wind ${esc(check.detected_direction)}`
+      : `<span class="text-muted fst-italic">Not detected</span>`;
+    const reqLabel = check.required_label
+      ? `Wind ${esc(check.required_direction)} — ${esc(check.required_label.split('—')[1]?.trim() || check.required_label)}`
+      : `<span class="text-muted fst-italic">Not specified</span>`;
+    const matchIcon = check.detected_direction && check.required_direction
+      ? (check.detected_direction === check.required_direction
+          ? `<i class="bi bi-check-circle-fill text-success ms-1"></i>`
+          : `<i class="bi bi-x-circle-fill text-danger ms-1"></i>`)
+      : '';
+    extras += `<div class="mt-2 border rounded overflow-hidden" style="font-size:.8rem"><div class="row g-0">
+      <div class="col-6 p-2 border-end"><div class="text-muted fw-semibold mb-1" style="font-size:.72rem;text-transform:uppercase;letter-spacing:.04em">Detected in Artwork</div>${detLabel}${matchIcon}</div>
+      <div class="col-6 p-2"><div class="text-muted fw-semibold mb-1" style="font-size:.72rem;text-transform:uppercase;letter-spacing:.04em">Required (Spec)</div>${reqLabel}</div>
+    </div></div>`;
+  }
   return `<div class="card mb-2 check-card ${bdrCls} shadow-sm"${checkAttr}>
     <div class="card-header d-flex align-items-center gap-2 py-2 ${hdrCls}"
          data-bs-toggle="collapse" data-bs-target="#${id}" style="cursor:pointer">
@@ -1071,17 +1220,60 @@ function buildReport(job) {
 
   let body;
   if (results.length > 1) {
-    const tabs  = results.map((r, i) => `<li class="nav-item"><button class="nav-link small px-3 py-2 ${i===0?'active':''}" data-bs-toggle="tab" data-bs-target="#jsfp${i}" type="button">${sevIcon(r.severity)}${esc(simplifyFilename(r.filename))}</button></li>`).join('');
-    const panes = results.map((r, i) => `<div class="tab-pane fade ${i===0?'show active':''}" id="jsfp${i}">${fileResult(r,job.id,i)}</div>`).join('');
-    body = `<ul class="nav nav-tabs mb-3">${tabs}</ul>
-            <div id="noMatchMsg" style="display:none" class="alert alert-secondary mt-2"><i class="bi bi-funnel me-2"></i>No files match the current filter combination.</div>
-            <div class="tab-content">${panes}</div>`;
+    // Sidebar file list
+    const sidebarItems = results.map((r, i) =>
+      `<a class="file-sidebar-item${i===0?' active':''}" onclick="showFile(${i})" href="#" id="fsitem${i}">
+        ${sevIcon(r.severity)}<span class="fsname">${esc(simplifyFilename(r.filename))}</span>
+       </a>`
+    ).join('');
+    const sidebar = `<div class="file-sidebar" id="fileSidebar">
+      <div class="px-2 py-1 text-muted" style="font-size:.7rem;text-transform:uppercase;letter-spacing:.05em;border-bottom:1px solid #eee;margin-bottom:4px">
+        ${results.length} Files
+      </div>
+      ${sidebarItems}
+    </div>`;
+
+    // File panes (hidden/shown via CSS)
+    const panes = results.map((r, i) =>
+      `<div class="file-pane${i===0?'':' d-none'}" id="jsfp${i}">
+        ${fileResult(r, job.id, i)}
+        <div class="file-nav-bar">
+          <button class="btn btn-outline-secondary btn-sm" onclick="showFile(${i-1})" ${i===0?'disabled':''}>
+            <i class="bi bi-arrow-left me-1"></i>Prev
+          </button>
+          <span class="text-muted small">${i+1} of ${results.length}</span>
+          <button class="btn btn-dark btn-sm" onclick="showFile(${i+1})" ${i===results.length-1?'disabled':''}>
+            Next<i class="bi bi-arrow-right ms-1"></i>
+          </button>
+        </div>
+       </div>`
+    ).join('');
+
+    body = `<div class="d-flex gap-3 align-items-start" id="reportLayout">
+      ${sidebar}
+      <div class="flex-grow-1 min-width-0" id="fileContent">
+        <div id="noMatchMsg" style="display:none" class="alert alert-secondary mt-2"><i class="bi bi-funnel me-2"></i>No files match the current filter combination.</div>
+        ${panes}
+      </div>
+    </div>`;
   } else {
     body = results[0] ? fileResult(results[0], job.id, 0) : '';
   }
 
   const html = hdr + summaryCards(job.summary) + filterBarHTML() + body;
   return html;
+}
+
+let _currentFileIdx = 0;
+function showFile(idx) {
+  const results = document.querySelectorAll('.file-pane');
+  if (idx < 0 || idx >= results.length) return;
+  results.forEach((p, i) => p.classList.toggle('d-none', i !== idx));
+  document.querySelectorAll('.file-sidebar-item').forEach((el, i) => el.classList.toggle('active', i === idx));
+  _currentFileIdx = idx;
+  // Re-wire viewer boxes in the newly shown pane
+  const pane = document.getElementById('jsfp' + idx);
+  if (pane) pane.querySelectorAll('.res-viewer-box').forEach(wireViewerBox);
 }
 
 /* ── Render helper ── */

@@ -1015,7 +1015,9 @@ def _check_spelling(ocr_text: str, fname: str) -> dict:
         'Social handles (@prodoughshop) and website URLs (prodoughshop.com) are excluded from this check.'
     )
 
-    return {'issues': issues, 'notes': notes}
+    _tl_spell = ocr_text.lower()
+    _brand_found = bool(re.search(r'\bprodough\b', _tl_spell))
+    return {'issues': issues, 'notes': notes, 'brand_found': _brand_found}
 
 
 # ── Generic brand spelling check ─────────────────────────────────────────────
@@ -1598,7 +1600,23 @@ def _check_fda(ocr_text: str, fname: str) -> dict:
             'Ensure caffeine amount is listed and total is within safe limits.'
         )
 
-    return {'issues': issues, 'notes': notes}
+    _allergens_detected = []
+    if _milk_in_ocr:     _allergens_detected.append('Milk/Dairy')
+    if _soy_in_ocr:      _allergens_detected.append('Soy')
+    if _wheat_in_ocr:    _allergens_detected.append('Wheat')
+    if _egg_in_ocr:      _allergens_detected.append('Egg')
+    if _peanut_in_ocr:   _allergens_detected.append('Peanuts')
+    if _tree_nut_in_ocr: _allergens_detected.append('Tree Nuts')
+    if _fish_in_ocr:     _allergens_detected.append('Fish')
+    if _shellfish_in_ocr: _allergens_detected.append('Shellfish')
+    if _sesame_in_ocr:   _allergens_detected.append('Sesame')
+    return {
+        'issues': issues,
+        'notes': notes,
+        'allergens_found': _allergens_detected,
+        'has_contains': has_contains_stmt,
+        'sparse': sparse,
+    }
 
 
 # ── Check 5 (lightweight): FDA compliance for generic brands ─────────────────
@@ -1783,7 +1801,13 @@ def _check_wind_direction(ocr_text: str, required_wind: str) -> dict:
             f'specifies {req_label}.'
         )
 
-    return {'issues': issues, 'notes': notes}
+    return {
+        'issues': issues,
+        'notes': notes,
+        'detected_direction': detected_wind,
+        'required_direction': required_wind,
+        'required_label': req_label,
+    }
 
 
 # ── Check 7: Print Specifications (PDF vector data — no OCR) ──────────────────
