@@ -122,7 +122,7 @@
       <span class="text-muted small fw-semibold" style="width:3.5rem">Severity:</span>
       <div class="btn-group btn-group-sm" id="filterBar" role="group">
         <button type="button" class="btn btn-dark active" onclick="setFilter('all')">All</button>
-        <button type="button" class="btn btn-outline-dark" onclick="setFilter('issues')">Issues Only</button>
+        <button type="button" class="btn btn-outline-dark" onclick="setFilter('issues')">Warnings</button>
         <button type="button" class="btn btn-outline-danger" onclick="setFilter('critical')">Critical</button>
       </div>
     </div>
@@ -323,8 +323,8 @@
 {% set card_id = 'chk' ~ num ~ '_' ~ idx %}
 
 <div class="card mb-2 check-card
-  {% if crits %}border-danger check-has-issues check-has-critical
-  {% elif warns %}border-warning check-has-issues
+  {% if crits %}border-danger check-has-issues check-has-critical{% if warns %} check-has-warning{% endif %}
+  {% elif warns %}border-warning check-has-issues check-has-warning
   {% else %}border-0{% endif %} shadow-sm" data-check="{{ check_key }}">
 
   <div class="card-header d-flex align-items-center gap-2 py-2
@@ -512,8 +512,8 @@
     .artwork-col { position: sticky; top: 1rem; align-self: flex-start; }
   }
   /* ── Severity filter modes ── */
-  #reportRoot[data-filter="issues"] .check-notes                         { display:none!important; }
-  #reportRoot[data-filter="issues"] .check-card:not(.check-has-issues)   { display:none!important; }
+  #reportRoot[data-filter="issues"] .check-notes                          { display:none!important; }
+  #reportRoot[data-filter="issues"] .check-card:not(.check-has-warning)   { display:none!important; }
   #reportRoot[data-filter="critical"] .check-notes                       { display:none!important; }
   #reportRoot[data-filter="critical"] .check-card:not(.check-has-critical){ display:none!important; }
   /* ── Per-check filter ── */
@@ -591,7 +591,7 @@ function isCardVisible(card) {
   if (!root) return true;
   const sevFilter   = root.getAttribute('data-filter');
   const checkFilter = root.getAttribute('data-check-filter');
-  if (sevFilter === 'issues'   && !card.classList.contains('check-has-issues'))   return false;
+  if (sevFilter === 'issues'   && !card.classList.contains('check-has-warning'))  return false;
   if (sevFilter === 'critical' && !card.classList.contains('check-has-critical')) return false;
   if (checkFilter && card.getAttribute('data-check') !== checkFilter) return false;
   return true;
@@ -854,8 +854,8 @@ function checkCard(num, title, icon, check, uid, filename, checkKey, alwaysOpen)
   const hasCrit = crits.length > 0;
   const hasIss  = crits.length > 0 || warns.length > 0;
   const hdrCls  = crits.length ? 'bg-danger bg-opacity-10' : warns.length ? 'bg-warning bg-opacity-10' : 'bg-light';
-  const bdrCls  = crits.length ? 'border-danger check-has-issues check-has-critical'
-                : warns.length ? 'border-warning check-has-issues' : 'border-0';
+  const bdrCls  = crits.length ? ('border-danger check-has-issues check-has-critical' + (warns.length ? ' check-has-warning' : ''))
+                : warns.length ? 'border-warning check-has-issues check-has-warning' : 'border-0';
   const checkAttr = checkKey ? ` data-check="${checkKey}"` : '';
   const iconCls = crits.length ? 'text-danger' : warns.length ? 'text-warning' : 'text-secondary';
   const badge   = crits.length ? `<span class="badge bg-danger">${crits.length} critical</span>`
@@ -1022,7 +1022,7 @@ function filterBarHTML() {
         <span class="text-muted small fw-semibold" style="width:3.5rem">Severity:</span>
         <div class="btn-group btn-group-sm" id="filterBar" role="group">
           <button type="button" class="btn btn-dark active" onclick="setFilter('all')">All</button>
-          <button type="button" class="btn btn-outline-dark" onclick="setFilter('issues')">Issues Only</button>
+          <button type="button" class="btn btn-outline-dark" onclick="setFilter('issues')">Warnings</button>
           <button type="button" class="btn btn-outline-danger" onclick="setFilter('critical')">Critical</button>
         </div>
       </div>

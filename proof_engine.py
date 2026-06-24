@@ -441,15 +441,37 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
     except Exception:
         pass
 
+    # ── OCR: inverted image — catches white text on colored backgrounds ───────
+    # ProDough badge callouts (e.g. "117 Calories", "25G Protein") use white
+    # text inside colored circles. Tesseract can't read light-on-dark without
+    # first inverting the image. We invert the left half (front panel) and run
+    # PSM 11 sparse to extract the badge numbers and labels.
+    ocr_inv_left = ''
+    if PIL_AVAILABLE:
+        try:
+            from PIL import ImageOps as _ImageOps
+            _inv_left = _ImageOps.invert(_left_img.convert('RGB'))
+            _inv_left_path = img_prefix + '_ocr_inv_left.png'
+            _inv_left.save(_inv_left_path)
+            _ri = subprocess.run(
+                ['tesseract', _inv_left_path, 'stdout', '--oem', '3', '--psm', '11', '-l', 'eng'],
+                capture_output=True, text=True, timeout=90,
+            )
+            ocr_inv_left = _ri.stdout
+        except Exception:
+            pass
+
     # Combine all sources. pdfplumber provides column-aware native text for
     # non-outlined PDFs; region OCR provides column-split text for outlined
-    # press-ready files; PSM 11 catches anything the region splits miss.
+    # press-ready files; PSM 11 catches anything the region splits miss;
+    # inverted left-half pass catches white-on-color badge text.
     combined_text = (
         pdfplumber_text + '\n' +
         native_text     + '\n' +
         ocr_left        + '\n' +
         ocr_right       + '\n' +
-        ocr_sparse
+        ocr_sparse      + '\n' +
+        ocr_inv_left
     )
 
     # Scan barcode stripes directly from rendered image (primary GTIN source)
@@ -495,7 +517,7 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
         proof_type = brand_config.get('proof_type', 'press')
         checks = {
             'gtin':     _check_gtin(combined_text, fname, gtin_rows, barcode_gtins),
-            'nfp':      _check_nfp(combined_text, front_text=ocr_left),
+            'nfp':      _check_nfp(combined_text, front_text=ocr_left + '\n' + ocr_inv_left),
             'eyemark':  _check_eyemark(img, is_film, fname, required_eyemark),
             'spelling': _check_spelling(combined_text, fname),
             'fda':      _check_fda(combined_text, fname),
