@@ -1276,8 +1276,10 @@ _SF_CLAIM_PATTERNS = [
 
 
 def _ocr_is_sparse(ocr_text: str) -> bool:
-    words = [w for w in ocr_text.split() if len(w) > 2]
-    return len(words) < 80
+    # Only count tokens that contain at least 3 consecutive letters — filters out
+    # OCR garbage like "[3022", "2le=223|0", "S|édg|Pac|ek" that inflated the count
+    real_words = [w for w in ocr_text.split() if re.search(r'[A-Za-z]{3}', w)]
+    return len(real_words) < 80
 
 
 def _check_fda(ocr_text: str, fname: str) -> dict:
