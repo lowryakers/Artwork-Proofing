@@ -358,14 +358,42 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
     # ── Load image + preprocess for OCR ─────────────────────────────────────
     # Load first so we can enhance before running Tesseract
     img = None
+    img_ocr_base = None  # auto-cropped version used for all OCR passes
     img_for_ocr = img_path  # default: use raw PNG if PIL unavailable
     if PIL_AVAILABLE:
         try:
-            from PIL import ImageEnhance, ImageFilter
+            from PIL import ImageEnhance, ImageFilter, ImageChops as _IChops
             img = Image.open(img_path).convert('RGB')
+
+            # Auto-crop to the packaging die cut — removes the white bleed/border
+            # that pdftoppm adds around the artwork. Without this, the packaging
+            # content occupies only a fraction of the rendered image and OCR
+            # resolution per character is too low for small label text.
+            img_ocr_base = img
+            try:
+                _gray_c = img.convert('L')
+                _white_ref = Image.new('L', img.size, 255)
+                _diff_c = _IChops.difference(_gray_c, _white_ref)
+                _bbox_c = _diff_c.getbbox()
+                if _bbox_c:
+                    _pad_c = max(20, int(min(img.width, img.height) * 0.015))
+                    _box_c = (
+                        max(0, _bbox_c[0] - _pad_c),
+                        max(0, _bbox_c[1] - _pad_c),
+                        min(img.width,  _bbox_c[2] + _pad_c),
+                        min(img.height, _bbox_c[3] + _pad_c),
+                    )
+                    _cw = _box_c[2] - _box_c[0]
+                    _ch = _box_c[3] - _box_c[1]
+                    # Only crop when the artwork noticeably smaller than the full page
+                    if _cw < img.width * 0.88 or _ch < img.height * 0.88:
+                        img_ocr_base = img.crop(_box_c)
+            except Exception:
+                pass
+
             # Grayscale + contrast boost + sharpen → significantly improves
             # Tesseract accuracy on small label text and mixed backgrounds
-            _gray = img.convert('L')
+            _gray = img_ocr_base.convert('L')
             _gray = ImageEnhance.Contrast(_gray).enhance(1.8)
             _gray = ImageEnhance.Sharpness(_gray).enhance(2.5)
             _enhanced_path = img_prefix + '_ocr.png'
@@ -477,9 +505,9 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
     # Adaptive thresholding converts the image to pure B&W which Tesseract reads
     # more reliably than grayscale on gradient/complex backgrounds.
     ocr_binary = ''
-    if PIL_AVAILABLE:
+    if PIL_AVAILABLE and img_ocr_base is not None:
         try:
-            _bin_img = Image.open(img_path).convert('L')
+            _bin_img = img_ocr_base.convert('L')
             _bin_img = _bin_img.point(lambda p: 255 if p > 140 else 0, '1').convert('L')
             _bin_path = img_prefix + '_ocr_bin.png'
             _bin_img.save(_bin_path)
