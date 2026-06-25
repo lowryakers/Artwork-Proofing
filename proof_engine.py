@@ -38,6 +38,12 @@ try:
 except ImportError:
     PYZBAR_AVAILABLE = False
 
+try:
+    import anthropic as _anthropic
+    ANTHROPIC_AVAILABLE = bool(os.environ.get('ANTHROPIC_API_KEY'))
+except ImportError:
+    ANTHROPIC_AVAILABLE = False
+
 _UPLOAD_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'uploads')
 
 # ── In-memory job store ───────────────────────────────────────────────────────
@@ -331,6 +337,39 @@ def _match_spec_row(gtin_list: list, fname: str, spec_rows: list) -> dict:
     return {}
 
 
+def _claude_vision_ocr(img_path: str) -> str:
+    """Use Claude Haiku vision to extract text from press-ready PDFs with outlined text."""
+    if not ANTHROPIC_AVAILABLE:
+        return ''
+    try:
+        import base64
+        with open(img_path, 'rb') as _f:
+            _img_b64 = base64.standard_b64encode(_f.read()).decode('utf-8')
+        _client = _anthropic.Anthropic(api_key=os.environ['ANTHROPIC_API_KEY'])
+        _msg = _client.messages.create(
+            model='claude-haiku-4-5-20251001',
+            max_tokens=1024,
+            messages=[{
+                'role': 'user',
+                'content': [
+                    {'type': 'image', 'source': {'type': 'base64', 'media_type': 'image/png', 'data': _img_b64}},
+                    {'type': 'text', 'text': (
+                        'This is a food packaging artwork proof. '
+                        'Extract ALL readable text exactly as it appears, '
+                        'including the Nutrition Facts panel, front callout badges '
+                        '(calories, protein, added sugar), brand name, flavor name, '
+                        'ingredients list, and allergen declarations. '
+                        'Output only the raw extracted text, one element per line, '
+                        'no commentary.'
+                    )},
+                ],
+            }],
+        )
+        return _msg.content[0].text if _msg.content else ''
+    except Exception:
+        return ''
+
+
 # ── Single-file proofing ──────────────────────────────────────────────────────
 
 def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
@@ -519,6 +558,13 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
         except Exception:
             pass
 
+    ocr_claude = ''
+    _tesseract_combined = (
+        ocr_left + ocr_right + ocr_sparse + ocr_inv_left + ocr_inv_right + ocr_binary
+    )
+    if ANTHROPIC_AVAILABLE and _ocr_is_sparse(_tesseract_combined):
+        ocr_claude = _claude_vision_ocr(img_path)
+
     combined_text = (
         pdfplumber_text + '\n' +
         native_text     + '\n' +
@@ -527,7 +573,8 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
         ocr_sparse      + '\n' +
         ocr_inv_left    + '\n' +
         ocr_inv_right   + '\n' +
-        ocr_binary
+        ocr_binary      + '\n' +
+        ocr_claude
     )
 
     # Scan barcode stripes directly from rendered image (primary GTIN source)

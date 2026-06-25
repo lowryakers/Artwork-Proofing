@@ -6,6 +6,7 @@ gunicorn>=21.2.0
 pyzbar>=0.1.9
 pymupdf>=1.24.0
 pdfplumber>=0.11.0
+anthropic>=0.40.0
 # System tools are installed via Dockerfile (not pip):
 #   poppler-utils  →  pdftoppm
 #   tesseract-ocr  →  tesseract
