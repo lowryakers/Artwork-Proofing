@@ -649,10 +649,11 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
         ocr_left + '\n' + ocr_right + '\n' + ocr_sparse + '\n' +
         ocr_inv_left + '\n' + ocr_inv_right + '\n' + ocr_binary
     )
+    _front_ocr = ocr_left + '\n' + ocr_inv_left + '\n' + ocr_inv_right
     if not ANTHROPIC_AVAILABLE:
         _vision_diag = 'vision: skipped — ANTHROPIC_API_KEY not set / anthropic not installed'
-    elif not _ocr_lacks_nutrition(_pre_claude_text):
-        _vision_diag = 'vision: not needed — Tesseract read nutrition anchors'
+    elif not _ocr_needs_vision(_pre_claude_text, front_text=_front_ocr):
+        _vision_diag = 'vision: not needed — Tesseract read all front + NFP values'
     else:
         _vision = _claude_vision_ocr(img_path)
         ocr_claude = _vision.get('raw_text', '')
@@ -1450,6 +1451,31 @@ def _ocr_lacks_nutrition(ocr_text: str) -> bool:
     ]
     hits = sum(1 for a in anchors if a in tl)
     return hits < 2
+
+
+def _ocr_needs_vision(combined_text: str, front_text: str = '') -> bool:
+    """Decide whether to escalate to Claude Vision for nutrition extraction.
+
+    Anchor WORDS reading is not enough — Check 2 needs the actual numeric
+    VALUES from both panels. On these designs the front-callout badges are
+    circular outlined graphics that Tesseract never reads, and the NFP values
+    are frequently outlined too. We escalate unless Tesseract already produced
+    a complete numeric read of BOTH panels:
+        • NFP:   "Calories 130" + "Protein 26g"   (label-before-value)
+        • Front: "130 ... Calories" + "25g ... Protein" (badge: value-first)
+    Missing any of the four → run vision. Also escalates on the no-anchor
+    outlined / mirror-printed case (lacks nutrition entirely).
+    """
+    if _ocr_lacks_nutrition(combined_text):
+        return True
+    tl = combined_text.lower()
+    nfp_cal  = re.search(r'calories?\s+\d{2,3}\b', tl)
+    nfp_prot = re.search(r'protein\s+\d{1,2}\s*g\b', tl)
+    fl = (front_text or combined_text).lower()
+    # Front badge: a number followed (within a few chars / next line) by the label
+    front_cal  = re.search(r'\b\d{2,3}\b[^a-z0-9]{0,12}cal(?:ories?)?', fl)
+    front_prot = re.search(r'\b\d{1,2}\s*g?\b[^a-z0-9]{0,12}protein', fl)
+    return not (nfp_cal and nfp_prot and front_cal and front_prot)
 
 
 def _check_fda(ocr_text: str, fname: str, vision_allergens: dict = None) -> dict:
