@@ -355,62 +355,93 @@ def _claude_vision_ocr(img_path: str) -> dict:
         return dict(_empty, status='unavailable (ANTHROPIC_API_KEY not set or anthropic not installed)')
     try:
         import base64, io
-        # The 400-DPI render can exceed Claude's hard limits (max 8000px per side,
-        # ~5MB base64). Downscale to a safe long-edge before sending — the API
-        # processes vision at ≤1568px anyway, so this loses no usable resolution
-        # while guaranteeing the request is accepted. JPEG keeps the payload small.
-        _media_type = 'image/png'
+
+        def _enc(pim):
+            # Encode a PIL image to base64 JPEG, capped at ~1.1MP (the vision API's
+            # effective processing resolution) so each view keeps maximum detail.
+            im = pim
+            _cap = 1_140_000
+            _mp = im.width * im.height
+            if _mp > _cap:
+                _s = (_cap / float(_mp)) ** 0.5
+                im = im.resize((max(1, int(im.width * _s)), max(1, int(im.height * _s))))
+            _b = io.BytesIO()
+            im.save(_b, format='JPEG', quality=88)
+            return base64.standard_b64encode(_b.getvalue()).decode('utf-8')
+
+        _img_b64_list = []
         if PIL_AVAILABLE:
-            _vimg = Image.open(img_path).convert('RGB')
-            _max_edge = 1568
-            if max(_vimg.size) > _max_edge:
-                _scale = _max_edge / float(max(_vimg.size))
-                _vimg = _vimg.resize(
-                    (max(1, int(_vimg.width * _scale)), max(1, int(_vimg.height * _scale)))
-                )
-            _buf = io.BytesIO()
-            _vimg.save(_buf, format='JPEG', quality=90)
-            _img_b64 = base64.standard_b64encode(_buf.getvalue()).decode('utf-8')
-            _media_type = 'image/jpeg'
+            _base = Image.open(img_path).convert('RGB')
+            # View 1: the whole package (layout + large front-callout badges).
+            _img_b64_list.append(_enc(_base))
+            # Views 2..N: higher-resolution slices so small text (NFP values, the
+            # FDA disclaimer, ingredients) stays legible. A whole pouch squashed to
+            # ~1MP renders the NFP fine print unreadable — slicing the long axis
+            # multiplies effective resolution on each region.
+            _W, _H = _base.size
+            _longer, _shorter = max(_W, _H), min(_W, _H)
+            if _longer >= 1.5 * _shorter:
+                _n = min(3, max(2, round(_longer / float(_shorter))))
+                _ov = 0.08
+                if _H >= _W:
+                    _step = _H / float(_n)
+                    for _i in range(_n):
+                        _y0 = max(0, int(_i * _step - _ov * _step))
+                        _y1 = min(_H, int((_i + 1) * _step + _ov * _step))
+                        _img_b64_list.append(_enc(_base.crop((0, _y0, _W, _y1))))
+                else:
+                    _step = _W / float(_n)
+                    for _i in range(_n):
+                        _x0 = max(0, int(_i * _step - _ov * _step))
+                        _x1 = min(_W, int((_i + 1) * _step + _ov * _step))
+                        _img_b64_list.append(_enc(_base.crop((_x0, 0, _x1, _H))))
         else:
             with open(img_path, 'rb') as _f:
-                _img_b64 = base64.standard_b64encode(_f.read()).decode('utf-8')
+                _img_b64_list.append(base64.standard_b64encode(_f.read()).decode('utf-8'))
+
+        _content = [
+            {'type': 'image', 'source': {'type': 'base64', 'media_type': 'image/jpeg', 'data': _b64}}
+            for _b64 in _img_b64_list
+        ]
+        _content.append({'type': 'text', 'text': (
+            'These images are multiple views of ONE single food/supplement package '
+            'artwork proof: the FIRST image is the whole package; any additional images '
+            'are higher-resolution slices of that same package (top-to-bottom or '
+            'left-to-right). They are NOT different products — combine them into one '
+            'reading, and rely on the slices to read small text precisely. '
+            'Some text may be mirror-reversed (print film) — read it correctly oriented.\n\n'
+            'Return ONLY a JSON object (no markdown, no commentary) with this exact shape:\n'
+            '{\n'
+            '  "raw_text": "<every readable line of text on the package, newline-separated, '
+            'including brand name, flavor, full ingredient list, allergen declarations, and '
+            'any FDA disclaimer such as \\"These statements have not been evaluated...\\">",\n'
+            '  "front_callout": {"calories": <number or null>, "protein_g": <number or null>, '
+            '"added_sugar_g": <number or null>},\n'
+            '  "nfp": {"calories": <number or null>, "protein_g": <number or null>, '
+            '"added_sugar_g": <number or null>},\n'
+            '  "allergens": {"contains_statement": "<exact text after the word Contains, '
+            'e.g. \\"Milk\\", or null if no Contains: declaration is printed>", '
+            '"detected": ["<lowercase FALCPA allergens present in the ingredients/declarations: '
+            'milk, egg, fish, shellfish, tree nut, peanut, wheat, soybean, sesame>"]}\n'
+            '}\n\n'
+            'front_callout = the big circular badge numbers on the FRONT of the pack '
+            '(e.g. "130 Calories Per Serving", "25G Protein Per Serving", "0G Added Sugar"). '
+            'IGNORE marketing percentages like "100% Grass-Fed Whey" — that is NOT calories.\n'
+            'nfp = the values inside the Nutrition Facts / Supplement Facts panel — read these '
+            'digits CAREFULLY from the highest-resolution slice (e.g. "Calories 130", '
+            '"Protein 26g", "Added Sugars 0g"). Front and NFP protein can legitimately differ '
+            'by 1g — report exactly what each panel prints, do not assume they match.\n'
+            'allergens.contains_statement = the FALCPA "Contains:" line exactly as printed '
+            '(whey IS milk — if you see whey, milk is an allergen). '
+            'allergens.detected = every major allergen you can infer from the ingredient list.\n'
+            'Use null for any value not visible. Numbers only (no units) for nutrition.'
+        )})
+
         _client = _anthropic.Anthropic(api_key=os.environ['ANTHROPIC_API_KEY'])
         _msg = _client.messages.create(
             model='claude-haiku-4-5-20251001',
             max_tokens=1500,
-            messages=[{
-                'role': 'user',
-                'content': [
-                    {'type': 'image', 'source': {'type': 'base64', 'media_type': _media_type, 'data': _img_b64}},
-                    {'type': 'text', 'text': (
-                        'This is a food/supplement packaging artwork proof. Some text may be '
-                        'mirror-reversed (print film) — read it in its correct orientation.\n\n'
-                        'Return ONLY a JSON object (no markdown, no commentary) with this exact shape:\n'
-                        '{\n'
-                        '  "raw_text": "<every readable line of text on the package, newline-separated, '
-                        'including brand name, flavor, ingredients, and allergen declarations>",\n'
-                        '  "front_callout": {"calories": <number or null>, "protein_g": <number or null>, '
-                        '"added_sugar_g": <number or null>},\n'
-                        '  "nfp": {"calories": <number or null>, "protein_g": <number or null>, '
-                        '"added_sugar_g": <number or null>},\n'
-                        '  "allergens": {"contains_statement": "<exact text after the word Contains, '
-                        'e.g. \\"Milk\\", or null if no Contains: declaration is printed>", '
-                        '"detected": ["<lowercase FALCPA allergens present in the ingredients/declarations: '
-                        'milk, egg, fish, shellfish, tree nut, peanut, wheat, soybean, sesame>"]}\n'
-                        '}\n\n'
-                        'front_callout = the big circular badge numbers on the FRONT of the pack '
-                        '(e.g. "130 Calories Per Serving", "25G Protein Per Serving", "0G Added Sugar"). '
-                        'IGNORE marketing percentages like "100% Grass-Fed Whey" — that is NOT calories.\n'
-                        'nfp = the values inside the Nutrition Facts / Supplement Facts panel '
-                        '(e.g. "Calories 130", "Protein 26g", "Added Sugars 0g").\n'
-                        'allergens.contains_statement = the FALCPA "Contains:" line exactly as printed '
-                        '(whey IS milk — if you see whey, milk is an allergen). '
-                        'allergens.detected = every major allergen you can infer from the ingredient list.\n'
-                        'Use null for any value not visible. Numbers only (no units) for nutrition.'
-                    )},
-                ],
-            }],
+            messages=[{'role': 'user', 'content': _content}],
         )
         _txt = _msg.content[0].text if _msg.content else ''
         _out = _parse_vision_json(_txt)
@@ -1506,7 +1537,12 @@ def _check_fda(ocr_text: str, fname: str, vision_allergens: dict = None) -> dict
     _va_contains = (_va.get('contains_statement') or '').strip()
     _va_detected = [str(x).lower() for x in (_va.get('detected') or [])]
 
-    is_supplement = 'supplement facts' in tl
+    # A product with a Nutrition Facts panel is a conventional food, not a dietary
+    # supplement — the 21 CFR 101.93 structure/function disclaimer requirement does
+    # not apply to it. Only treat as a supplement when "Supplement Facts" appears
+    # and "Nutrition Facts" does not (avoids a false S/F-disclaimer critical when
+    # vision/OCR text happens to mention both).
+    is_supplement = 'supplement facts' in tl and 'nutrition facts' not in tl
     sparse = _ocr_is_sparse(ocr_text)
 
     if sparse:
