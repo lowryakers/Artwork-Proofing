@@ -337,10 +337,22 @@ def _match_spec_row(gtin_list: list, fname: str, spec_rows: list) -> dict:
     return {}
 
 
-def _claude_vision_ocr(img_path: str) -> str:
-    """Use Claude Haiku vision to extract text from press-ready PDFs with outlined text."""
+def _claude_vision_ocr(img_path: str) -> dict:
+    """Use Claude Haiku vision to read press-ready PDFs where text is outlined or
+    reverse/mirror-printed (Tesseract returns garbage or backwards words).
+
+    Returns a dict:
+      {
+        'raw_text': '<all readable text>',
+        'front_callout': {'calories': int|None, 'protein_g': int|None, 'added_sugar_g': int|None},
+        'nfp':           {'calories': int|None, 'protein_g': int|None, 'added_sugar_g': int|None},
+      }
+    The structured front/NFP values let the NFP check compare the two panels
+    directly instead of regex-parsing a blob (which can't tell front from back).
+    """
+    _empty = {'raw_text': '', 'front_callout': {}, 'nfp': {}}
     if not ANTHROPIC_AVAILABLE:
-        return ''
+        return _empty
     try:
         import base64
         with open(img_path, 'rb') as _f:
@@ -348,26 +360,68 @@ def _claude_vision_ocr(img_path: str) -> str:
         _client = _anthropic.Anthropic(api_key=os.environ['ANTHROPIC_API_KEY'])
         _msg = _client.messages.create(
             model='claude-haiku-4-5-20251001',
-            max_tokens=1024,
+            max_tokens=1500,
             messages=[{
                 'role': 'user',
                 'content': [
                     {'type': 'image', 'source': {'type': 'base64', 'media_type': 'image/png', 'data': _img_b64}},
                     {'type': 'text', 'text': (
-                        'This is a food packaging artwork proof. '
-                        'Extract ALL readable text exactly as it appears, '
-                        'including the Nutrition Facts panel, front callout badges '
-                        '(calories, protein, added sugar), brand name, flavor name, '
-                        'ingredients list, and allergen declarations. '
-                        'Output only the raw extracted text, one element per line, '
-                        'no commentary.'
+                        'This is a food/supplement packaging artwork proof. Some text may be '
+                        'mirror-reversed (print film) — read it in its correct orientation.\n\n'
+                        'Return ONLY a JSON object (no markdown, no commentary) with this exact shape:\n'
+                        '{\n'
+                        '  "raw_text": "<every readable line of text on the package, newline-separated, '
+                        'including brand name, flavor, ingredients, and allergen declarations>",\n'
+                        '  "front_callout": {"calories": <number or null>, "protein_g": <number or null>, '
+                        '"added_sugar_g": <number or null>},\n'
+                        '  "nfp": {"calories": <number or null>, "protein_g": <number or null>, '
+                        '"added_sugar_g": <number or null>}\n'
+                        '}\n\n'
+                        'front_callout = the big circular badge numbers on the FRONT of the pack '
+                        '(e.g. "130 Calories Per Serving", "25G Protein Per Serving", "0G Added Sugar"). '
+                        'IGNORE marketing percentages like "100% Grass-Fed Whey" — that is NOT calories.\n'
+                        'nfp = the values inside the Nutrition Facts / Supplement Facts panel '
+                        '(e.g. "Calories 130", "Protein 26g", "Added Sugars 0g").\n'
+                        'Use null for any value not visible. Numbers only (no units).'
                     )},
                 ],
             }],
         )
-        return _msg.content[0].text if _msg.content else ''
+        _txt = _msg.content[0].text if _msg.content else ''
+        return _parse_vision_json(_txt)
     except Exception:
-        return ''
+        return _empty
+
+
+def _parse_vision_json(txt: str) -> dict:
+    """Parse the JSON object returned by Claude Vision, tolerating stray markdown."""
+    _empty = {'raw_text': '', 'front_callout': {}, 'nfp': {}}
+    if not txt:
+        return _empty
+    try:
+        _m = re.search(r'\{.*\}', txt, re.DOTALL)
+        if not _m:
+            return {'raw_text': txt, 'front_callout': {}, 'nfp': {}}
+        _data = json.loads(_m.group(0))
+
+        def _clean(panel):
+            out = {}
+            for k in ('calories', 'protein_g', 'added_sugar_g'):
+                v = panel.get(k) if isinstance(panel, dict) else None
+                if isinstance(v, (int, float)):
+                    out[k] = int(v)
+                elif isinstance(v, str) and v.strip().isdigit():
+                    out[k] = int(v.strip())
+            return out
+
+        return {
+            'raw_text': str(_data.get('raw_text', '')) or txt,
+            'front_callout': _clean(_data.get('front_callout', {})),
+            'nfp': _clean(_data.get('nfp', {})),
+        }
+    except Exception:
+        # Fall back to treating the whole response as raw text
+        return {'raw_text': txt, 'front_callout': {}, 'nfp': {}}
 
 
 # ── Single-file proofing ──────────────────────────────────────────────────────
@@ -559,11 +613,25 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
             pass
 
     ocr_claude = ''
-    _tesseract_combined = (
-        ocr_left + ocr_right + ocr_sparse + ocr_inv_left + ocr_inv_right + ocr_binary
+    vision_nutrition = None
+    # Gate Claude Vision on whether the nutrition content actually came through —
+    # not raw word count. Outlined-text PDFs yield garbage; reverse/mirror-printed
+    # film yields readable-but-backwards words ("seirolaC", "noissimrep") that fool
+    # a word-count gate. Both cases lack the real nutrition anchor words, so use
+    # those as the trigger. pdfplumber/PyMuPDF native text is checked first so we
+    # skip the API call when the PDF still carries live text.
+    _pre_claude_text = (
+        pdfplumber_text + '\n' + native_text + '\n' +
+        ocr_left + '\n' + ocr_right + '\n' + ocr_sparse + '\n' +
+        ocr_inv_left + '\n' + ocr_inv_right + '\n' + ocr_binary
     )
-    if ANTHROPIC_AVAILABLE and _ocr_is_sparse(_tesseract_combined):
-        ocr_claude = _claude_vision_ocr(img_path)
+    if ANTHROPIC_AVAILABLE and _ocr_lacks_nutrition(_pre_claude_text):
+        _vision = _claude_vision_ocr(img_path)
+        ocr_claude = _vision.get('raw_text', '')
+        vision_nutrition = {
+            'front_callout': _vision.get('front_callout', {}),
+            'nfp': _vision.get('nfp', {}),
+        }
 
     combined_text = (
         pdfplumber_text + '\n' +
@@ -617,7 +685,7 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
         proof_type = brand_config.get('proof_type', 'press')
         checks = {
             'gtin':     _check_gtin(combined_text, fname, gtin_rows, barcode_gtins),
-            'nfp':      _check_nfp(combined_text, front_text=ocr_left + '\n' + ocr_inv_left + '\n' + ocr_inv_right),
+            'nfp':      _check_nfp(combined_text, front_text=ocr_left + '\n' + ocr_inv_left + '\n' + ocr_inv_right, vision_nutrition=vision_nutrition),
             'eyemark':  _check_eyemark(img, is_film, fname, required_eyemark),
             'spelling': _check_spelling(combined_text, fname),
             'fda':      _check_fda(combined_text, fname),
@@ -808,7 +876,7 @@ def _check_gtin(ocr_text: str, fname: str, gtin_rows: list,
 
 # ── Check 2: Front call-outs vs NFP ──────────────────────────────────────────
 
-def _check_nfp(ocr_text: str, front_text: str = '') -> dict:
+def _check_nfp(ocr_text: str, front_text: str = '', vision_nutrition: dict = None) -> dict:
     issues, notes = [], []
     tl = ocr_text.lower()
     # For front callout badge detection, use left-half OCR if provided (more
@@ -826,10 +894,16 @@ def _check_nfp(ocr_text: str, front_text: str = '') -> dict:
                         r'\btotal\s*carb\b', r'\bsaturated\s*fat\b',
                         r'\btrans\s*fat\b', r'\bcholesterol\b', r'\bsugars?\b']
 
+    # Claude Vision structured read (set when Tesseract couldn't parse outlined /
+    # reverse-printed art). Normalize up-front so it feeds NFP-presence detection.
+    _vfc = (vision_nutrition or {}).get('front_callout') or {}
+    _vnfp = (vision_nutrition or {}).get('nfp') or {}
+    _vision_has_nfp = _vnfp.get('calories') is not None or _vnfp.get('protein_g') is not None
+
     has_nfp_header  = 'nutrition facts' in tl or 'supplement facts' in tl
     has_nfp_numbers = bool(re.search(r'\bcalories?\b', tl)) or bool(re.search(r'\bprotein\b', tl))
     nfp_row_hits    = sum(1 for p in _nfp_row_signals if re.search(p, tl))
-    has_nfp         = has_nfp_header or has_nfp_numbers or nfp_row_hits >= 1
+    has_nfp         = has_nfp_header or has_nfp_numbers or nfp_row_hits >= 1 or _vision_has_nfp
 
     if not has_nfp:
         if sparse:
@@ -918,6 +992,23 @@ def _check_nfp(ocr_text: str, front_text: str = '') -> dict:
     front_proteins  = sorted(_fc_prots)
     front_zero_sugar = bool(re.search(r'\b0\s*g\s*\n?\s*added\s+sugar|\b0\s+added\s+sugar', fl))
 
+    # When Claude Vision read this file (outlined / reverse-printed art that
+    # Tesseract can't parse), its structured per-panel values are authoritative —
+    # they cleanly separate the front callout from the NFP, which regex on a mixed
+    # text blob cannot. Override the Tesseract-derived values with them.
+    if _vfc.get('calories') is not None:
+        front_calories = [int(_vfc['calories'])]
+    if _vfc.get('protein_g') is not None:
+        front_proteins = [int(_vfc['protein_g'])]
+    if _vfc.get('added_sugar_g') is not None:
+        front_zero_sugar = int(_vfc['added_sugar_g']) == 0
+    if _vnfp.get('calories') is not None:
+        nfp_calories = [int(_vnfp['calories'])]
+    if _vnfp.get('protein_g') is not None:
+        nfp_proteins = [int(_vnfp['protein_g'])]
+    if _vnfp.get('added_sugar_g') is not None:
+        nfp_zero_sugar = int(_vnfp['added_sugar_g']) == 0
+
     # Combined lists — used by the mismatch checks below
     calories = sorted(set(nfp_calories) | set(front_calories))
     proteins = sorted(set(nfp_proteins) | set(front_proteins))
@@ -934,19 +1025,44 @@ def _check_nfp(ocr_text: str, front_text: str = '') -> dict:
         tl
     ))
 
-    if len(set(calories)) > 1 and not has_dual_column:
-        diff = max(calories) - min(calories)
-        if diff > 1:
+    # Calorie mismatch — prefer a direct front-callout vs NFP comparison (most
+    # accurate). Fall back to a pooled range check when only one source read.
+    if not has_dual_column:
+        if front_calories and nfp_calories:
+            _fc = front_calories[0] if len(front_calories) == 1 else None
+            _nc = nfp_calories[0] if len(nfp_calories) == 1 else None
+            if _fc is not None and _nc is not None and _fc != _nc:
+                issues.append({
+                    'severity': 'warning',
+                    'message': (
+                        f'Calorie mismatch: front call-out shows {_fc} cal but NFP shows {_nc} cal. '
+                        'Front panel and NFP must declare identical calorie counts (FDA labeling requirement).'
+                    ),
+                })
+        elif len(set(calories)) > 1 and max(calories) - min(calories) > 1:
             issues.append({
                 'severity': 'warning',
                 'message': (
-                    f'Calorie mismatch: front call-out shows {min(calories)} cal but NFP shows {max(calories)} cal. '
+                    f'Calorie mismatch: values {", ".join(str(c) for c in calories)} cal detected. '
                     'Front panel and NFP must declare identical calorie counts (FDA labeling requirement).'
                 ),
             })
 
-    if len(set(proteins)) > 1 and not has_dual_column:
-        if max(proteins) - min(proteins) > 1:
+    # Protein mismatch — a 1g difference (e.g. 25g front vs 26g NFP) is exactly
+    # the error we need to catch, so any difference counts when both sources read.
+    if not has_dual_column:
+        if front_proteins and nfp_proteins:
+            _fp = front_proteins[0] if len(front_proteins) == 1 else None
+            _np = nfp_proteins[0] if len(nfp_proteins) == 1 else None
+            if _fp is not None and _np is not None and _fp != _np:
+                issues.append({
+                    'severity': 'warning',
+                    'message': (
+                        f'Protein mismatch: front call-out shows {_fp}g but NFP shows {_np}g. '
+                        'Front call-out must match the NFP protein grams.'
+                    ),
+                })
+        elif len(set(proteins)) > 1 and max(proteins) - min(proteins) > 1:
             issues.append({
                 'severity': 'warning',
                 'message': (
@@ -1280,6 +1396,25 @@ def _ocr_is_sparse(ocr_text: str) -> bool:
     # Rejects OCR garbage like "L-]", "2le=223|0", "S|Pac|ek", "ZZ", "[3022".
     real_words = [w for w in ocr_text.split() if re.match(r'^[A-Za-z]{4,}$', w)]
     return len(real_words) < 40
+
+
+def _ocr_lacks_nutrition(ocr_text: str) -> bool:
+    """True when the nutrition content did NOT come through OCR readably.
+
+    Catches two failure modes that both warrant the Claude Vision fallback:
+      • outlined-text PDFs → Tesseract returns garbage, no anchors present
+      • reverse/mirror-printed film → readable but backwards words, anchors absent
+    When fewer than 2 nutrition anchor words appear, the panel/callouts didn't
+    read and we should escalate to vision OCR.
+    """
+    tl = ocr_text.lower()
+    anchors = [
+        'calorie', 'nutrition facts', 'supplement facts', 'protein',
+        'serving size', 'servings per', 'total fat', 'added sugar',
+        'ingredient', 'amount per',
+    ]
+    hits = sum(1 for a in anchors if a in tl)
+    return hits < 2
 
 
 def _check_fda(ocr_text: str, fname: str) -> dict:
