@@ -354,9 +354,27 @@ def _claude_vision_ocr(img_path: str) -> dict:
     if not ANTHROPIC_AVAILABLE:
         return dict(_empty, status='unavailable (ANTHROPIC_API_KEY not set or anthropic not installed)')
     try:
-        import base64
-        with open(img_path, 'rb') as _f:
-            _img_b64 = base64.standard_b64encode(_f.read()).decode('utf-8')
+        import base64, io
+        # The 400-DPI render can exceed Claude's hard limits (max 8000px per side,
+        # ~5MB base64). Downscale to a safe long-edge before sending — the API
+        # processes vision at ≤1568px anyway, so this loses no usable resolution
+        # while guaranteeing the request is accepted. JPEG keeps the payload small.
+        _media_type = 'image/png'
+        if PIL_AVAILABLE:
+            _vimg = Image.open(img_path).convert('RGB')
+            _max_edge = 1568
+            if max(_vimg.size) > _max_edge:
+                _scale = _max_edge / float(max(_vimg.size))
+                _vimg = _vimg.resize(
+                    (max(1, int(_vimg.width * _scale)), max(1, int(_vimg.height * _scale)))
+                )
+            _buf = io.BytesIO()
+            _vimg.save(_buf, format='JPEG', quality=90)
+            _img_b64 = base64.standard_b64encode(_buf.getvalue()).decode('utf-8')
+            _media_type = 'image/jpeg'
+        else:
+            with open(img_path, 'rb') as _f:
+                _img_b64 = base64.standard_b64encode(_f.read()).decode('utf-8')
         _client = _anthropic.Anthropic(api_key=os.environ['ANTHROPIC_API_KEY'])
         _msg = _client.messages.create(
             model='claude-haiku-4-5-20251001',
@@ -364,7 +382,7 @@ def _claude_vision_ocr(img_path: str) -> dict:
             messages=[{
                 'role': 'user',
                 'content': [
-                    {'type': 'image', 'source': {'type': 'base64', 'media_type': 'image/png', 'data': _img_b64}},
+                    {'type': 'image', 'source': {'type': 'base64', 'media_type': _media_type, 'data': _img_b64}},
                     {'type': 'text', 'text': (
                         'This is a food/supplement packaging artwork proof. Some text may be '
                         'mirror-reversed (print film) — read it in its correct orientation.\n\n'
