@@ -350,7 +350,7 @@ def _claude_vision_ocr(img_path: str) -> dict:
     The structured front/NFP values let the NFP check compare the two panels
     directly instead of regex-parsing a blob (which can't tell front from back).
     """
-    _empty = {'raw_text': '', 'front_callout': {}, 'nfp': {}, 'status': ''}
+    _empty = {'raw_text': '', 'front_callout': {}, 'nfp': {}, 'allergens': {}, 'status': ''}
     if not ANTHROPIC_AVAILABLE:
         return dict(_empty, status='unavailable (ANTHROPIC_API_KEY not set or anthropic not installed)')
     try:
@@ -375,14 +375,21 @@ def _claude_vision_ocr(img_path: str) -> dict:
                         '  "front_callout": {"calories": <number or null>, "protein_g": <number or null>, '
                         '"added_sugar_g": <number or null>},\n'
                         '  "nfp": {"calories": <number or null>, "protein_g": <number or null>, '
-                        '"added_sugar_g": <number or null>}\n'
+                        '"added_sugar_g": <number or null>},\n'
+                        '  "allergens": {"contains_statement": "<exact text after the word Contains, '
+                        'e.g. \\"Milk\\", or null if no Contains: declaration is printed>", '
+                        '"detected": ["<lowercase FALCPA allergens present in the ingredients/declarations: '
+                        'milk, egg, fish, shellfish, tree nut, peanut, wheat, soybean, sesame>"]}\n'
                         '}\n\n'
                         'front_callout = the big circular badge numbers on the FRONT of the pack '
                         '(e.g. "130 Calories Per Serving", "25G Protein Per Serving", "0G Added Sugar"). '
                         'IGNORE marketing percentages like "100% Grass-Fed Whey" — that is NOT calories.\n'
                         'nfp = the values inside the Nutrition Facts / Supplement Facts panel '
                         '(e.g. "Calories 130", "Protein 26g", "Added Sugars 0g").\n'
-                        'Use null for any value not visible. Numbers only (no units).'
+                        'allergens.contains_statement = the FALCPA "Contains:" line exactly as printed '
+                        '(whey IS milk — if you see whey, milk is an allergen). '
+                        'allergens.detected = every major allergen you can infer from the ingredient list.\n'
+                        'Use null for any value not visible. Numbers only (no units) for nutrition.'
                     )},
                 ],
             }],
@@ -397,13 +404,13 @@ def _claude_vision_ocr(img_path: str) -> dict:
 
 def _parse_vision_json(txt: str) -> dict:
     """Parse the JSON object returned by Claude Vision, tolerating stray markdown."""
-    _empty = {'raw_text': '', 'front_callout': {}, 'nfp': {}}
+    _empty = {'raw_text': '', 'front_callout': {}, 'nfp': {}, 'allergens': {}}
     if not txt:
         return _empty
     try:
         _m = re.search(r'\{.*\}', txt, re.DOTALL)
         if not _m:
-            return {'raw_text': txt, 'front_callout': {}, 'nfp': {}}
+            return dict(_empty, raw_text=txt)
         _data = json.loads(_m.group(0))
 
         def _clean(panel):
@@ -416,14 +423,27 @@ def _parse_vision_json(txt: str) -> dict:
                     out[k] = int(v.strip())
             return out
 
+        def _clean_allergens(a):
+            if not isinstance(a, dict):
+                return {}
+            out = {}
+            cs = a.get('contains_statement')
+            if isinstance(cs, str) and cs.strip() and cs.strip().lower() not in ('null', 'none', 'n/a'):
+                out['contains_statement'] = cs.strip()
+            det = a.get('detected')
+            if isinstance(det, list):
+                out['detected'] = [str(x).strip().lower() for x in det if str(x).strip()]
+            return out
+
         return {
             'raw_text': str(_data.get('raw_text', '')) or txt,
             'front_callout': _clean(_data.get('front_callout', {})),
             'nfp': _clean(_data.get('nfp', {})),
+            'allergens': _clean_allergens(_data.get('allergens', {})),
         }
     except Exception:
         # Fall back to treating the whole response as raw text
-        return {'raw_text': txt, 'front_callout': {}, 'nfp': {}}
+        return dict(_empty, raw_text=txt)
 
 
 # ── Single-file proofing ──────────────────────────────────────────────────────
@@ -616,6 +636,7 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
 
     ocr_claude = ''
     vision_nutrition = None
+    vision_allergens = None
     _vision_diag = ''
     # Gate Claude Vision on whether the nutrition content actually came through —
     # not raw word count. Outlined-text PDFs yield garbage; reverse/mirror-printed
@@ -639,10 +660,12 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
             'front_callout': _vision.get('front_callout', {}),
             'nfp': _vision.get('nfp', {}),
         }
-        _vision_diag = 'vision: {} | front={} nfp={}'.format(
+        vision_allergens = _vision.get('allergens', {})
+        _vision_diag = 'vision: {} | front={} nfp={} allergens={}'.format(
             _vision.get('status', '?'),
             _vision.get('front_callout', {}),
             _vision.get('nfp', {}),
+            _vision.get('allergens', {}),
         )
 
     combined_text = (
@@ -700,7 +723,7 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
             'nfp':      _check_nfp(combined_text, front_text=ocr_left + '\n' + ocr_inv_left + '\n' + ocr_inv_right, vision_nutrition=vision_nutrition),
             'eyemark':  _check_eyemark(img, is_film, fname, required_eyemark),
             'spelling': _check_spelling(combined_text, fname),
-            'fda':      _check_fda(combined_text, fname),
+            'fda':      _check_fda(combined_text, fname, vision_allergens=vision_allergens),
         }
         # Print Specs and Wind Direction are press-proof checks — skip for art proofs
         if proof_type != 'art':
@@ -1429,9 +1452,15 @@ def _ocr_lacks_nutrition(ocr_text: str) -> bool:
     return hits < 2
 
 
-def _check_fda(ocr_text: str, fname: str) -> dict:
+def _check_fda(ocr_text: str, fname: str, vision_allergens: dict = None) -> dict:
     issues, notes = [], []
     tl = ocr_text.lower()
+
+    # Claude Vision structured allergen read (set when Tesseract couldn't parse
+    # outlined / reverse-printed art). Authoritative when present.
+    _va = vision_allergens or {}
+    _va_contains = (_va.get('contains_statement') or '').strip()
+    _va_detected = [str(x).lower() for x in (_va.get('detected') or [])]
 
     is_supplement = 'supplement facts' in tl
     sparse = _ocr_is_sparse(ocr_text)
@@ -1572,6 +1601,24 @@ def _check_fda(ocr_text: str, fname: str) -> dict:
     _shellfish_in_ocr = bool(re.search(r'\bshrimp\b|\bcrab\b|\blobster\b|\bscallop\b|\bclam\b|\bshellfish\b', tl))
     _sesame_in_ocr    = bool(re.search(r'\bsesame\b|\btahini\b', tl))
     _wheat_in_ocr     = bool(re.search(r'\bwheat\b|\bgluten\b', tl))
+
+    # Fold in Claude Vision's structured allergen read (authoritative on outlined /
+    # reverse-printed art that Tesseract can't parse). Vision knows whey ⇒ milk.
+    if _va_detected:
+        _vd = ' '.join(_va_detected)
+        if re.search(r'milk|dairy|whey|casein|lactose', _vd): _milk_in_ocr = True
+        if 'peanut' in _vd:                                   _peanut_in_ocr = True
+        if re.search(r'tree\s*nut|almond|cashew|walnut|pecan|hazelnut|pistachio|macadamia', _vd):
+            _tree_nut_in_ocr = True
+        if 'soy' in _vd:                                      _soy_in_ocr = True
+        if 'egg' in _vd:                                      _egg_in_ocr = True
+        if 'fish' in _vd and 'shellfish' not in _vd:          _fish_in_ocr = True
+        if re.search(r'shellfish|shrimp|crab|lobster', _vd):  _shellfish_in_ocr = True
+        if 'sesame' in _vd:                                   _sesame_in_ocr = True
+        if 'wheat' in _vd:                                    _wheat_in_ocr = True
+    # Vision read the printed "Contains:" declaration directly.
+    if _va_contains and re.search(_ALLERGEN_WORDS, _va_contains.lower()):
+        has_contains_stmt = True
 
     # Any of the 9 FALCPA major allergens found anywhere in OCR text
     _any_allergen_in_ocr = (
