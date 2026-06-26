@@ -350,9 +350,9 @@ def _claude_vision_ocr(img_path: str) -> dict:
     The structured front/NFP values let the NFP check compare the two panels
     directly instead of regex-parsing a blob (which can't tell front from back).
     """
-    _empty = {'raw_text': '', 'front_callout': {}, 'nfp': {}}
+    _empty = {'raw_text': '', 'front_callout': {}, 'nfp': {}, 'status': ''}
     if not ANTHROPIC_AVAILABLE:
-        return _empty
+        return dict(_empty, status='unavailable (ANTHROPIC_API_KEY not set or anthropic not installed)')
     try:
         import base64
         with open(img_path, 'rb') as _f:
@@ -388,9 +388,11 @@ def _claude_vision_ocr(img_path: str) -> dict:
             }],
         )
         _txt = _msg.content[0].text if _msg.content else ''
-        return _parse_vision_json(_txt)
-    except Exception:
-        return _empty
+        _out = _parse_vision_json(_txt)
+        _out['status'] = 'ok'
+        return _out
+    except Exception as _e:
+        return dict(_empty, status='error: {}: {}'.format(type(_e).__name__, str(_e)[:160]))
 
 
 def _parse_vision_json(txt: str) -> dict:
@@ -614,6 +616,7 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
 
     ocr_claude = ''
     vision_nutrition = None
+    _vision_diag = ''
     # Gate Claude Vision on whether the nutrition content actually came through —
     # not raw word count. Outlined-text PDFs yield garbage; reverse/mirror-printed
     # film yields readable-but-backwards words ("seirolaC", "noissimrep") that fool
@@ -625,13 +628,22 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
         ocr_left + '\n' + ocr_right + '\n' + ocr_sparse + '\n' +
         ocr_inv_left + '\n' + ocr_inv_right + '\n' + ocr_binary
     )
-    if ANTHROPIC_AVAILABLE and _ocr_lacks_nutrition(_pre_claude_text):
+    if not ANTHROPIC_AVAILABLE:
+        _vision_diag = 'vision: skipped — ANTHROPIC_API_KEY not set / anthropic not installed'
+    elif not _ocr_lacks_nutrition(_pre_claude_text):
+        _vision_diag = 'vision: not needed — Tesseract read nutrition anchors'
+    else:
         _vision = _claude_vision_ocr(img_path)
         ocr_claude = _vision.get('raw_text', '')
         vision_nutrition = {
             'front_callout': _vision.get('front_callout', {}),
             'nfp': _vision.get('nfp', {}),
         }
+        _vision_diag = 'vision: {} | front={} nfp={}'.format(
+            _vision.get('status', '?'),
+            _vision.get('front_callout', {}),
+            _vision.get('nfp', {}),
+        )
 
     combined_text = (
         pdfplumber_text + '\n' +
@@ -718,7 +730,7 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
         'filename': fname,
         'img_path': img_path,
         'img_web': img_path,
-        'ocr_preview': combined_text[:3000],
+        'ocr_preview': ('[' + _vision_diag + ']\n\n' + combined_text)[:3000] if _vision_diag else combined_text[:3000],
         'ocr_text': combined_text,
         'checks': checks,
         'severity': severity,
