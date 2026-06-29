@@ -350,7 +350,7 @@ def _claude_vision_ocr(img_path: str) -> dict:
     The structured front/NFP values let the NFP check compare the two panels
     directly instead of regex-parsing a blob (which can't tell front from back).
     """
-    _empty = {'raw_text': '', 'front_callout': {}, 'nfp': {}, 'allergens': {}, 'status': ''}
+    _empty = {'raw_text': '', 'front_callout': {}, 'nfp': {}, 'allergens': {}, 'eyemark': {}, 'status': ''}
     if not ANTHROPIC_AVAILABLE:
         return dict(_empty, status='unavailable (ANTHROPIC_API_KEY not set or anthropic not installed)')
     try:
@@ -425,7 +425,9 @@ def _claude_vision_ocr(img_path: str) -> dict:
             '  "allergens": {"contains_statement": "<exact text after the word Contains, '
             'e.g. \\"Milk\\", or null if no Contains: declaration is printed>", '
             '"detected": ["<lowercase FALCPA allergens present in the ingredients/declarations: '
-            'milk, egg, fish, shellfish, tree nut, peanut, wheat, soybean, sesame>"]}\n'
+            'milk, egg, fish, shellfish, tree nut, peanut, wheat, soybean, sesame>"]},\n'
+            '  "eyemark": {"present": <true or false>, "color": "<black, white, or other, '
+            'or null if none>"}\n'
             '}\n\n'
             'front_callout = the big circular badge numbers on the FRONT of the pack '
             '(e.g. "130 Calories Per Serving", "25G Protein Per Serving", "0G Added Sugar"). '
@@ -437,6 +439,12 @@ def _claude_vision_ocr(img_path: str) -> dict:
             'allergens.contains_statement = the FALCPA "Contains:" line exactly as printed '
             '(whey IS milk — if you see whey, milk is an allergen). '
             'allergens.detected = every major allergen you can infer from the ingredient list.\n'
+            'eyemark = a small SOLID-FILLED square or rectangle (the photo-eye registration '
+            'mark) printed near a CORNER or EDGE of the package, separate from the barcode and '
+            'from any text/logo. It is usually solid black or solid white. Report whether one is '
+            'present and its fill color. This is NOT the barcode and NOT a color swatch — it is a '
+            'single small filled block at the trim edge. If you cannot clearly see one, set '
+            'present=false and color=null.\n'
             'Use null for any value not visible. Numbers only (no units) for nutrition.'
         )})
 
@@ -458,7 +466,7 @@ def _claude_vision_ocr(img_path: str) -> dict:
 
 def _parse_vision_json(txt: str) -> dict:
     """Parse the JSON object returned by Claude Vision, tolerating stray markdown."""
-    _empty = {'raw_text': '', 'front_callout': {}, 'nfp': {}, 'allergens': {}}
+    _empty = {'raw_text': '', 'front_callout': {}, 'nfp': {}, 'allergens': {}, 'eyemark': {}}
     if not txt:
         return _empty
     try:
@@ -489,11 +497,22 @@ def _parse_vision_json(txt: str) -> dict:
                 out['detected'] = [str(x).strip().lower() for x in det if str(x).strip()]
             return out
 
+        def _clean_eyemark(e):
+            if not isinstance(e, dict):
+                return {}
+            out = {}
+            col = e.get('color')
+            if isinstance(col, str) and col.strip().lower() in ('black', 'white', 'other'):
+                out['color'] = col.strip().lower()
+            out['present'] = bool(e.get('present')) or ('color' in out)
+            return out
+
         return {
             'raw_text': str(_data.get('raw_text', '')) or txt,
             'front_callout': _clean(_data.get('front_callout', {})),
             'nfp': _clean(_data.get('nfp', {})),
             'allergens': _clean_allergens(_data.get('allergens', {})),
+            'eyemark': _clean_eyemark(_data.get('eyemark', {})),
         }
     except Exception:
         # Fall back to treating the whole response as raw text
@@ -691,6 +710,7 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
     ocr_claude = ''
     vision_nutrition = None
     vision_allergens = None
+    vision_eyemark = None
     _vision_diag = ''
     # Gate Claude Vision on whether the nutrition content actually came through —
     # not raw word count. Outlined-text PDFs yield garbage; reverse/mirror-printed
@@ -704,9 +724,13 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
         ocr_inv_left + '\n' + ocr_inv_right + '\n' + ocr_binary
     )
     _front_ocr = ocr_left + '\n' + ocr_inv_left + '\n' + ocr_inv_right
+    # Film/stick artwork needs the eyemark read even when Tesseract got the
+    # nutrition — the small registration square is unreadable by pixel heuristics,
+    # so vision is the reliable source for its color.
+    _fname_is_film = bool(re.search(r'\b(stick|sachet|film|rollstock)\b', fname.lower()))
     if not ANTHROPIC_AVAILABLE:
         _vision_diag = 'vision: skipped — ANTHROPIC_API_KEY not set / anthropic not installed'
-    elif not _ocr_needs_vision(_pre_claude_text, front_text=_front_ocr):
+    elif not _ocr_needs_vision(_pre_claude_text, front_text=_front_ocr) and not _fname_is_film:
         _vision_diag = 'vision: not needed — Tesseract read all front + NFP values'
     else:
         _vision = _claude_vision_ocr(img_path)
@@ -716,11 +740,13 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
             'nfp': _vision.get('nfp', {}),
         }
         vision_allergens = _vision.get('allergens', {})
-        _vision_diag = 'vision: {} | front={} nfp={} allergens={}'.format(
+        vision_eyemark = _vision.get('eyemark', {})
+        _vision_diag = 'vision: {} | front={} nfp={} allergens={} eyemark={}'.format(
             _vision.get('status', '?'),
             _vision.get('front_callout', {}),
             _vision.get('nfp', {}),
             _vision.get('allergens', {}),
+            _vision.get('eyemark', {}),
         )
 
     combined_text = (
@@ -763,7 +789,7 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
         brand_name = brand_config.get('brand_name', '')
         checks = {
             'gtin':     _check_gtin(combined_text, fname, gtin_rows, barcode_gtins),
-            'eyemark':  _check_eyemark(img, is_film, fname, required_eyemark),
+            'eyemark':  _check_eyemark(img, is_film, fname, required_eyemark, vision_eyemark=vision_eyemark),
             'spelling': _check_spelling_generic(combined_text, brand_name),
             'fda':      _check_fda_light(combined_text, fname),
             'specs':    _check_print_specs(pdf_path, brand_config, matched_spec),
@@ -776,7 +802,7 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
         checks = {
             'gtin':     _check_gtin(combined_text, fname, gtin_rows, barcode_gtins),
             'nfp':      _check_nfp(combined_text, front_text=ocr_left + '\n' + ocr_inv_left + '\n' + ocr_inv_right, vision_nutrition=vision_nutrition),
-            'eyemark':  _check_eyemark(img, is_film, fname, required_eyemark),
+            'eyemark':  _check_eyemark(img, is_film, fname, required_eyemark, vision_eyemark=vision_eyemark),
             'spelling': _check_spelling(combined_text, fname),
             'fda':      _check_fda(combined_text, fname, vision_allergens=vision_allergens),
         }
@@ -1198,7 +1224,7 @@ def _check_nfp(ocr_text: str, front_text: str = '', vision_nutrition: dict = Non
 # Any other color will cause unreliable photo-eye detection on the production line.
 
 def _check_eyemark(img, is_film: bool = False, fname: str = '',
-                   required_color: str = '') -> dict:
+                   required_color: str = '', vision_eyemark: dict = None) -> dict:
     issues, notes = [], []
 
     if not is_film:
@@ -1208,12 +1234,35 @@ def _check_eyemark(img, is_film: bool = False, fname: str = '',
         )
         return {'issues': issues, 'notes': notes, 'eyemark_color': None, 'skipped': True}
 
+    # Claude Vision is the authoritative source for the eyemark when it could read
+    # one: the registration square is small and often the same size as (or smaller
+    # than) the pixel-scan tile, so the heuristic below misses it and falls back to
+    # WHITE. Vision identifies the solid corner square reliably.
+    _ve = vision_eyemark or {}
+    _ve_color = _ve.get('color') if _ve.get('color') in ('black', 'white') else None
+
     if img is None:
-        issues.append({
-            'severity': 'warning',
-            'message': 'Image unavailable — eyemark color check could not be performed.',
-        })
-        return {'issues': issues, 'notes': notes, 'eyemark_color': None}
+        if not _ve_color:
+            issues.append({
+                'severity': 'warning',
+                'message': 'Image unavailable — eyemark color check could not be performed.',
+            })
+            return {'issues': issues, 'notes': notes, 'eyemark_color': None}
+        # No pixels to scan, but vision identified the eyemark — decide from it.
+        req = required_color.lower().strip() if required_color else ''
+        if req and _ve_color != req:
+            issues.append({
+                'severity': 'critical',
+                'message': (
+                    f'Wrong eyemark color — detected {_ve_color.upper()} but spec requires '
+                    f'{req.upper()}. The production line photo-eye sensor is calibrated for a '
+                    f'{req.upper()} eyemark. Change the eyemark fill to pure {req.upper()} '
+                    f'(#{"FFFFFF" if req == "white" else "000000"}) before going to press.'
+                ),
+            })
+        else:
+            notes.append(f'✔ {_ve_color.upper()} eyemark detected by vision — OK.')
+        return {'issues': issues, 'notes': notes, 'eyemark_color': _ve_color, 'required_color': req}
 
     # The render sits on a white page with margins around the die cut. If we scan
     # the full image, the border strips are just white page background — so the
@@ -1328,6 +1377,12 @@ def _check_eyemark(img, is_film: bool = False, fname: str = '',
         eyemark_color = 'white'
     else:
         eyemark_color = 'none'
+
+    # Vision wins when it identified a clear black/white eyemark — the pixel scan
+    # cannot reliably catch a registration square smaller than its tile.
+    if _ve_color:
+        eyemark_color = _ve_color
+        notes.append(f'Eyemark color read by vision: {_ve_color.upper()}.')
 
     req = required_color.lower().strip() if required_color else ''
 
