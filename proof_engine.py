@@ -16,6 +16,7 @@ import json
 import subprocess
 import threading
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -226,31 +227,50 @@ load_jobs_from_disk()
 
 # ── Main processing loop ──────────────────────────────────────────────────────
 
+# How many files to proof concurrently. Each file is mostly I/O wait (the Claude
+# Vision API call) interleaved with CPU-bound Tesseract; 4 overlaps the network
+# latency well without oversubscribing CPU with a stampede of tesseract processes.
+# Parallelism is at the FILE level only — _proof_single stays internally
+# sequential (a prior nested ThreadPoolExecutor inside it caused a hang).
+_BATCH_WORKERS = 4
+
+
 def _process_job(job_id: str, pdf_paths: list, gtin_rows: list, work_dir: str,
                  brand_config: dict = None, spec_rows: list = None):
     _update_job(job_id, status='running')
-    results = []
     total = len(pdf_paths)
+    results = [None] * total          # order-safe: fill by index, never append
+    _done = {'n': 0}
+    _progress_lock = threading.Lock()
+
+    def _proof_one(i, pdf_path):
+        fname = os.path.basename(pdf_path)
+        try:
+            res = _proof_single(pdf_path, gtin_rows, work_dir, brand_config=brand_config,
+                                spec_rows=spec_rows)
+        except Exception as exc:
+            res = {
+                'filename': fname,
+                'error': str(exc),
+                'checks': {},
+                'severity': 'error',
+                'critical_count': 0,
+                'warning_count': 0,
+                'info_count': 0,
+                'img_web': None,
+            }
+        results[i] = res
+        with _progress_lock:
+            _done['n'] += 1
+            _update_job(job_id, current_file=fname,
+                        progress=int(_done['n'] / max(1, total) * 90))
 
     try:
-        for i, pdf_path in enumerate(pdf_paths):
-            fname = os.path.basename(pdf_path)
-            _update_job(job_id, current_file=fname, progress=int(i / total * 90))
-            try:
-                result = _proof_single(pdf_path, gtin_rows, work_dir, brand_config=brand_config,
-                                       spec_rows=spec_rows)
-            except Exception as exc:
-                result = {
-                    'filename': fname,
-                    'error': str(exc),
-                    'checks': {},
-                    'severity': 'error',
-                    'critical_count': 0,
-                    'warning_count': 0,
-                    'info_count': 0,
-                    'img_web': None,
-                }
-            results.append(result)
+        workers = min(_BATCH_WORKERS, max(1, total))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(_proof_one, i, p) for i, p in enumerate(pdf_paths)]
+            for f in as_completed(futures):
+                f.result()  # surface any unexpected error from the worker wrapper
 
         summary = _build_summary(results)
         _update_job(job_id, status='done', progress=100,
@@ -543,7 +563,10 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
                   brand_config: dict = None, spec_rows: list = None) -> dict:
     brand_config = brand_config or {}
     fname = os.path.basename(pdf_path)
-    stem = Path(pdf_path).stem
+    # Prefix intermediate filenames with a short unique token so that files which
+    # happen to share a stem (same name, re-upload) cannot collide on their
+    # _ocr*.png temp paths — required for safe concurrent processing.
+    stem = uuid.uuid4().hex[:8] + '_' + Path(pdf_path).stem
 
     # ── Convert PDF → PNG ────────────────────────────────────────────────────
     img_prefix = os.path.join(work_dir, stem)
