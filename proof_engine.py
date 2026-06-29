@@ -1557,7 +1557,7 @@ _GENERIC_MISSPELLINGS = {
     r'\brasberry\b':   'raspberry',
     r'\braspbery\b':   'raspberry',
     r'\bprotien\b':    'protein',
-    r'\bingrediant':   'ingredient',
+    r'\bingrediant\b': 'ingredient',
     r'\bartifical\b':  'artificial',
     r'\bnatrual\b':    'natural',
     r'\bexellent\b':   'excellent',
@@ -2230,7 +2230,9 @@ def _check_fda_light(ocr_text: str, fname: str) -> dict:
     issues, notes = [], []
     tl = ocr_text.lower()
 
-    is_supplement = 'supplement facts' in tl
+    # A Nutrition Facts panel means conventional food, not a dietary supplement —
+    # matches the refinement in _check_fda so both paths classify identically.
+    is_supplement = 'supplement facts' in tl and 'nutrition facts' not in tl
     sparse = _ocr_is_sparse(ocr_text)
 
     if sparse:

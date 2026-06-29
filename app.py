@@ -2,7 +2,6 @@ import os
 import io
 import json
 import re
-import subprocess
 import time
 import urllib.request
 import openpyxl
