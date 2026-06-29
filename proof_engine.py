@@ -458,7 +458,14 @@ def _claude_vision_ocr(img_path: str) -> dict:
             'by 1g — report exactly what each panel prints, do not assume they match.\n'
             'allergens.contains_statement = the FALCPA "Contains:" line exactly as printed '
             '(whey IS milk — if you see whey, milk is an allergen). '
-            'allergens.detected = every major allergen you can infer from the ingredient list.\n'
+            'allergens.detected = list ONLY the FALCPA major allergens that are present as '
+            'ACTUAL INGREDIENTS in the ingredient list (or named in a printed "Contains:" line). '
+            'Include one only if it, or a clear source of it (whey/casein/milk powder → milk), '
+            'literally appears in the ingredients. EXCLUDE allergens that appear only in a '
+            '"may contain", "may also contain", or "manufactured/produced in a facility that also '
+            'processes ..." cross-contact advisory — those are NOT ingredient allergens. Do NOT '
+            'list allergens defensively or to be safe: a plant / pea / rice protein with no dairy, '
+            'egg, soy, wheat, peanut, or tree-nut ingredient must return an EMPTY list.\n'
             'eyemark = a small SOLID-FILLED square or rectangle (the photo-eye registration '
             'mark) printed near a CORNER or EDGE of the package, separate from the barcode and '
             'from any text/logo. It is usually solid black or solid white. Report whether one is '
@@ -1842,23 +1849,25 @@ def _check_fda(ocr_text: str, fname: str, vision_allergens: dict = None) -> dict
     _TREE_NUTS = r'\balmond\b|\bcashew\b|\bwalnut\b|\bpecan\b|\bhazelnut\b|\bpistachio\b|\bmacadamia\b'
     is_tree_nut_product = bool(re.search(_TREE_NUTS, fname_tl))
 
-    # Allergen words inside directions / serving-suggestion text are NOT ingredient
-    # allergens — e.g. "Mix 1 scoop into 6-8oz of water or milk" must not register
-    # a milk allergen and then fire a "missing Contains:" critical. Strip those
-    # segments before scanning for allergen presence. (Contains:/advisory detection
-    # below still scans the full text — we want those found wherever they appear.)
+    # Strip segments that are NOT the ingredient list before scanning for allergen
+    # PRESENCE, so they can't fire a false "missing Contains:" critical:
+    #   • directions / serving suggestions — "Mix 1 scoop into water or milk"
+    #   • cross-contact advisories — "manufactured in a facility that also processes
+    #     milk, egg, soy, wheat, peanuts, tree nuts" / "may contain ...". These are
+    #     NOT ingredient allergens; FALCPA "Contains:" applies only to ingredients.
+    # (Contains:/advisory *declaration* detection below still scans the full text.)
     # NB: avoid bare "blend" — it matches the ingredient "Digestive Enzyme Blend".
-    # scoop/shake/stir already capture the serving directions reliably.
     _alg_text = re.sub(
         r'[^.\n]*\b(?:directions?|serving\s+suggestion|shake|stir|dissolve|'
-        r'scoop|mix(?:es|ed)?\s+\d)\b[^.\n]*',
+        r'scoop|mix(?:es|ed)?\s+\d|may\s+(?:also\s+)?contain|facility|'
+        r'shared\s+(?:equipment|lines?))\b[^.\n]*',
         ' ', tl,
     )
 
     # Per-allergen ingredient presence (directions text removed)
     _milk_in_ocr      = bool(re.search(r'\bmilk\b|\bnon.fat\s+milk\b|\bmilk\s+powder\b|\bskim\s+milk\b|\bdairy\b|\bcasein\b|\bwhey\b|\blactose\b', _alg_text))
     _peanut_in_ocr    = bool(re.search(r'\bpeanut\b', _alg_text))
-    _tree_nut_in_ocr  = bool(re.search(_TREE_NUTS + r'|\btree\s+nut\b', _alg_text))
+    _tree_nut_in_ocr  = bool(re.search(_TREE_NUTS + r'|\btree\s+nut\b|\bcoconut\b', _alg_text))
     _soy_in_ocr       = bool(re.search(r'\bsoy(?:bean)?\b|\bsoy\s+lecithin\b', _alg_text))
     _egg_in_ocr       = bool(re.search(r'\begg\b|\begg\s+white\b|\balbumin\b', _alg_text))
     _fish_in_ocr      = bool(re.search(r'\bfish\b|\bsalmon\b|\btuna\b|\bpollock\b|\bcod\b|\btilapia\b', _alg_text))
@@ -1866,20 +1875,25 @@ def _check_fda(ocr_text: str, fname: str, vision_allergens: dict = None) -> dict
     _sesame_in_ocr    = bool(re.search(r'\bsesame\b|\btahini\b', _alg_text))
     _wheat_in_ocr     = bool(re.search(r'\bwheat\b|\bgluten\b', _alg_text))
 
-    # Fold in Claude Vision's structured allergen read (authoritative on outlined /
-    # reverse-printed art that Tesseract can't parse). Vision knows whey ⇒ milk.
+    # Cross-validate Claude Vision's structured allergen read against the actual
+    # ingredient text. Vision sometimes over-reports — it lists allergens from a
+    # facility cross-contact advisory (or defensively), e.g. flagging all 6 majors
+    # on a pea/rice plant protein. Since the FDA check now reads the clean vision
+    # label text, the per-allergen regexes above already scan it; we only let a
+    # vision-detected allergen reinforce a flag when its source actually appears in
+    # the (directions/advisory-stripped) ingredient text — never invent one.
+    _vd = ' '.join(_va_detected)
     if _va_detected:
-        _vd = ' '.join(_va_detected)
-        if re.search(r'milk|dairy|whey|casein|lactose', _vd): _milk_in_ocr = True
-        if 'peanut' in _vd:                                   _peanut_in_ocr = True
-        if re.search(r'tree\s*nut|almond|cashew|walnut|pecan|hazelnut|pistachio|macadamia', _vd):
+        if 'milk' in _vd and re.search(r'milk|dairy|whey|casein|lactose', _alg_text):
+            _milk_in_ocr = True
+        if 'peanut' in _vd and 'peanut' in _alg_text:        _peanut_in_ocr = True
+        if re.search(r'tree\s*nut|coconut|almond|cashew|walnut|pecan|hazelnut|pistachio|macadamia', _vd) \
+           and re.search(_TREE_NUTS + r'|\btree\s+nut\b|\bcoconut\b', _alg_text):
             _tree_nut_in_ocr = True
-        if 'soy' in _vd:                                      _soy_in_ocr = True
-        if 'egg' in _vd:                                      _egg_in_ocr = True
-        if 'fish' in _vd and 'shellfish' not in _vd:          _fish_in_ocr = True
-        if re.search(r'shellfish|shrimp|crab|lobster', _vd):  _shellfish_in_ocr = True
-        if 'sesame' in _vd:                                   _sesame_in_ocr = True
-        if 'wheat' in _vd:                                    _wheat_in_ocr = True
+        if 'soy' in _vd and re.search(r'\bsoy', _alg_text):  _soy_in_ocr = True
+        if 'egg' in _vd and 'egg' in _alg_text:              _egg_in_ocr = True
+        if 'wheat' in _vd and re.search(r'wheat|gluten', _alg_text): _wheat_in_ocr = True
+        if 'sesame' in _vd and re.search(r'sesame|tahini', _alg_text): _sesame_in_ocr = True
     # Vision read the printed "Contains:" declaration directly.
     if _va_contains and re.search(_ALLERGEN_WORDS, _va_contains.lower()):
         has_contains_stmt = True
