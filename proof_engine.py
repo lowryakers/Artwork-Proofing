@@ -1832,16 +1832,29 @@ def _check_fda(ocr_text: str, fname: str, vision_allergens: dict = None) -> dict
     _TREE_NUTS = r'\balmond\b|\bcashew\b|\bwalnut\b|\bpecan\b|\bhazelnut\b|\bpistachio\b|\bmacadamia\b'
     is_tree_nut_product = bool(re.search(_TREE_NUTS, fname_tl))
 
-    # Per-allergen OCR presence
-    _milk_in_ocr      = bool(re.search(r'\bmilk\b|\bnon.fat\s+milk\b|\bmilk\s+powder\b|\bskim\s+milk\b|\bdairy\b|\bcasein\b|\bwhey\b|\blactose\b', tl))
-    _peanut_in_ocr    = bool(re.search(r'\bpeanut\b', tl))
-    _tree_nut_in_ocr  = bool(re.search(_TREE_NUTS + r'|\btree\s+nut\b', tl))
-    _soy_in_ocr       = bool(re.search(r'\bsoy(?:bean)?\b|\bsoy\s+lecithin\b', tl))
-    _egg_in_ocr       = bool(re.search(r'\begg\b|\begg\s+white\b|\balbumin\b', tl))
-    _fish_in_ocr      = bool(re.search(r'\bfish\b|\bsalmon\b|\btuna\b|\bpollock\b|\bcod\b|\btilapia\b', tl))
-    _shellfish_in_ocr = bool(re.search(r'\bshrimp\b|\bcrab\b|\blobster\b|\bscallop\b|\bclam\b|\bshellfish\b', tl))
-    _sesame_in_ocr    = bool(re.search(r'\bsesame\b|\btahini\b', tl))
-    _wheat_in_ocr     = bool(re.search(r'\bwheat\b|\bgluten\b', tl))
+    # Allergen words inside directions / serving-suggestion text are NOT ingredient
+    # allergens — e.g. "Mix 1 scoop into 6-8oz of water or milk" must not register
+    # a milk allergen and then fire a "missing Contains:" critical. Strip those
+    # segments before scanning for allergen presence. (Contains:/advisory detection
+    # below still scans the full text — we want those found wherever they appear.)
+    # NB: avoid bare "blend" — it matches the ingredient "Digestive Enzyme Blend".
+    # scoop/shake/stir already capture the serving directions reliably.
+    _alg_text = re.sub(
+        r'[^.\n]*\b(?:directions?|serving\s+suggestion|shake|stir|dissolve|'
+        r'scoop|mix(?:es|ed)?\s+\d)\b[^.\n]*',
+        ' ', tl,
+    )
+
+    # Per-allergen ingredient presence (directions text removed)
+    _milk_in_ocr      = bool(re.search(r'\bmilk\b|\bnon.fat\s+milk\b|\bmilk\s+powder\b|\bskim\s+milk\b|\bdairy\b|\bcasein\b|\bwhey\b|\blactose\b', _alg_text))
+    _peanut_in_ocr    = bool(re.search(r'\bpeanut\b', _alg_text))
+    _tree_nut_in_ocr  = bool(re.search(_TREE_NUTS + r'|\btree\s+nut\b', _alg_text))
+    _soy_in_ocr       = bool(re.search(r'\bsoy(?:bean)?\b|\bsoy\s+lecithin\b', _alg_text))
+    _egg_in_ocr       = bool(re.search(r'\begg\b|\begg\s+white\b|\balbumin\b', _alg_text))
+    _fish_in_ocr      = bool(re.search(r'\bfish\b|\bsalmon\b|\btuna\b|\bpollock\b|\bcod\b|\btilapia\b', _alg_text))
+    _shellfish_in_ocr = bool(re.search(r'\bshrimp\b|\bcrab\b|\blobster\b|\bscallop\b|\bclam\b|\bshellfish\b', _alg_text))
+    _sesame_in_ocr    = bool(re.search(r'\bsesame\b|\btahini\b', _alg_text))
+    _wheat_in_ocr     = bool(re.search(r'\bwheat\b|\bgluten\b', _alg_text))
 
     # Fold in Claude Vision's structured allergen read (authoritative on outlined /
     # reverse-printed art that Tesseract can't parse). Vision knows whey ⇒ milk.
@@ -2094,11 +2107,15 @@ def _check_fda(ocr_text: str, fname: str, vision_allergens: dict = None) -> dict
 
     # ── "All Natural" / "Natural" claim ──────────────────────────────────────
     if re.search(r'\ball\s+natural\b|\bnatural\s+ingredients?\b|\b100%\s+natural\b', tl):
+        # Word-boundary match, not substring — short markers like "bha"/"bht"/
+        # "fdc"/"tbhq" otherwise match inside unrelated words, lot/date codes, or
+        # the mirrored print-spec sidebar and fire a false "All Natural" critical.
         artificial_markers = [
-            'artificial', 'synthetic', 'fd&c', 'fdc', 'acesulfame', 'sucralose',
-            'aspartame', 'sodium benzoate', 'bht', 'bha', 'tbhq', 'carrageenan',
+            r'artificial', r'synthetic', r'fd&c', r'fdc', r'acesulfame', r'sucralose',
+            r'aspartame', r'sodium\s+benzoate', r'bht', r'bha', r'tbhq', r'carrageenan',
         ]
-        if any(m in tl for m in artificial_markers):
+        _art_re = re.compile(r'(?<![a-z0-9])(?:' + '|'.join(artificial_markers) + r')(?![a-z0-9])')
+        if _art_re.search(tl):
             issues.append({
                 'severity': 'critical',
                 'message': (
