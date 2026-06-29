@@ -687,25 +687,34 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
         except Exception:
             pass
 
+    # If the cheap reads (native text + PSM 6 columns) already show this is an
+    # outlined press-ready file — no nutrition anchors — the 4 remaining Tesseract
+    # passes will only produce garbage that Claude Vision overrides anyway. Skip
+    # them when vision is available to supply the values (halves CPU per outlined
+    # file). When vision is NOT configured, keep every pass — they're all we have.
+    _early_text = pdfplumber_text + '\n' + native_text + '\n' + ocr_left + '\n' + ocr_right
+    _skip_extra_ocr = ANTHROPIC_AVAILABLE and _ocr_lacks_nutrition(_early_text)
+
     # ── OCR: PSM 11 sparse — full-page catchall ──────────────────────────────
     # Catches any isolated text the region passes miss (e.g. single-column
     # layouts, rotated text, corner stamps).
     ocr_sparse = ''
-    try:
-        r2 = subprocess.run(
-            ['tesseract', img_for_ocr, 'stdout', '--oem', '3', '--psm', '11', '-l', 'eng'],
-            capture_output=True, text=True, timeout=90,
-        )
-        ocr_sparse = r2.stdout
-    except Exception:
-        pass
+    if not _skip_extra_ocr:
+        try:
+            r2 = subprocess.run(
+                ['tesseract', img_for_ocr, 'stdout', '--oem', '3', '--psm', '11', '-l', 'eng'],
+                capture_output=True, text=True, timeout=90,
+            )
+            ocr_sparse = r2.stdout
+        except Exception:
+            pass
 
     # ── OCR: inverted halves — catches white text on colored backgrounds ────────
     # ProDough badge callouts (e.g. "117 Calories", "25G Protein") use white
     # text inside colored circles. We invert both halves independently so badges
     # on either the front or back panel are captured.
     ocr_inv_left = ocr_inv_right = ''
-    if PIL_AVAILABLE:
+    if PIL_AVAILABLE and not _skip_extra_ocr:
         try:
             from PIL import ImageOps as _ImageOps
             _inv_left = _ImageOps.invert(_left_img.convert('RGB'))
@@ -734,7 +743,7 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
     # Adaptive thresholding converts the image to pure B&W which Tesseract reads
     # more reliably than grayscale on gradient/complex backgrounds.
     ocr_binary = ''
-    if PIL_AVAILABLE and img_ocr_base is not None:
+    if PIL_AVAILABLE and img_ocr_base is not None and not _skip_extra_ocr:
         try:
             _bin_img = img_ocr_base.convert('L')
             _bin_img = _bin_img.point(lambda p: 255 if p > 140 else 0, '1').convert('L')
