@@ -1272,14 +1272,21 @@ def _check_eyemark(img, is_film: bool = False, fname: str = '',
         nonlocal best_black, best_white, avg_luma
         for yy in range(y0, max(y0 + 1, y1 - tw + 1), step):
             for xx in range(x0, max(x0 + 1, x1 - tw + 1), step):
-                if _in_barcode(xx, yy):
-                    continue
                 px = list(gray.crop((xx, yy, min(xx + tw, x1), min(yy + tw, y1))).getdata())
                 sc, col = _em_score(px)
                 if col == 'black' and sc > best_black:
+                    # Allow black anywhere — a striped barcode cannot produce a
+                    # solid-black tile (bars+gaps exceed the range threshold), so a
+                    # solid black square next to the barcode IS the eyemark, not the
+                    # code. Excluding the barcode zone here was hiding eyemarks
+                    # printed in the corner beside the UPC.
                     best_black = sc
                     avg_luma = sum(px) / max(1, len(px))
                 elif col == 'white' and sc > best_white:
+                    # White spaces between barcode bars score like a solid white
+                    # patch — only here do we need the barcode exclusion.
+                    if _in_barcode(xx, yy):
+                        continue
                     best_white = sc
 
     _scan_zone(0,       0,       w,      by)       # top strip
