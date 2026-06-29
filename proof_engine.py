@@ -2131,15 +2131,25 @@ def _check_fda(ocr_text: str, fname: str, vision_allergens: dict = None) -> dict
 
     # ── "All Natural" / "Natural" claim ──────────────────────────────────────
     if re.search(r'\ball\s+natural\b|\bnatural\s+ingredients?\b|\b100%\s+natural\b', tl):
-        # Word-boundary match, not substring — short markers like "bha"/"bht"/
-        # "fdc"/"tbhq" otherwise match inside unrelated words, lot/date codes, or
-        # the mirrored print-spec sidebar and fire a false "All Natural" critical.
+        # Scan ONLY the ingredient list for an artificial ingredient — a marker
+        # elsewhere on the label (print-spec codes, the FDA disclaimer, unrelated
+        # text) must not fire this. A product whose color comes from beet root /
+        # natural sources is compliant. Word boundaries also prevent short markers
+        # (bha/bht/tbhq) from matching inside other words.
+        _ing_m = re.search(
+            r'ingredients?\s*:(.*?)(?:\bcontains?\s*:|these\s+statements|'
+            r'manufactured|distributed|net\s+wt|\Z)',
+            tl, re.DOTALL,
+        )
+        _ing_region = _ing_m.group(1) if _ing_m else ''
         artificial_markers = [
-            r'artificial', r'synthetic', r'fd&c', r'fdc', r'acesulfame', r'sucralose',
+            r'artificial', r'synthetic', r'fd\s*&\s*c', r'acesulfame', r'sucralose',
             r'aspartame', r'sodium\s+benzoate', r'bht', r'bha', r'tbhq', r'carrageenan',
+            # certified color additives — synthetic dyes by name
+            r'red\s*(?:40|3|no\.?\s*\d)', r'yellow\s*(?:5|6)', r'blue\s*[12]',
         ]
         _art_re = re.compile(r'(?<![a-z0-9])(?:' + '|'.join(artificial_markers) + r')(?![a-z0-9])')
-        if _art_re.search(tl):
+        if _ing_region and _art_re.search(_ing_region):
             issues.append({
                 'severity': 'critical',
                 'message': (
