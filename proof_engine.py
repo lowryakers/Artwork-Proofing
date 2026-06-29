@@ -819,6 +819,16 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
         ocr_claude
     )
 
+    # Consumer-label text only — excludes the production print-spec sidebar
+    # (dielines, seal dimensions, CMYK separations, material, unwind, approver,
+    # phone/part numbers) that Tesseract reads off press-ready proofs. That sidebar
+    # is relevant ONLY to Wind Direction and Print Specs; feeding it into the
+    # content/compliance checks caused false positives (e.g. a print code matching
+    # an "artificial ingredient" marker). When Claude Vision read the artwork its
+    # raw_text IS the clean label, so use it; otherwise (live-text labels with no
+    # vision pass) fall back to the full OCR, which carries the label itself.
+    label_text = ocr_claude if len(ocr_claude.strip()) > 40 else combined_text
+
     # Scan barcode stripes directly from rendered image (primary GTIN source)
     barcode_gtins = _scan_barcodes(img_path)
 
@@ -848,8 +858,8 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
         checks = {
             'gtin':     _check_gtin(combined_text, fname, gtin_rows, barcode_gtins),
             'eyemark':  _check_eyemark(img, is_film, fname, required_eyemark, vision_eyemark=vision_eyemark),
-            'spelling': _check_spelling_generic(combined_text, brand_name),
-            'fda':      _check_fda_light(combined_text, fname),
+            'spelling': _check_spelling_generic(label_text, brand_name),
+            'fda':      _check_fda_light(label_text, fname),
             'specs':    _check_print_specs(pdf_path, brand_config, matched_spec),
         }
         if is_film:
@@ -859,10 +869,10 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
         proof_type = brand_config.get('proof_type', 'press')
         checks = {
             'gtin':     _check_gtin(combined_text, fname, gtin_rows, barcode_gtins),
-            'nfp':      _check_nfp(combined_text, front_text=ocr_left + '\n' + ocr_inv_left + '\n' + ocr_inv_right, vision_nutrition=vision_nutrition),
+            'nfp':      _check_nfp(label_text, front_text=ocr_left + '\n' + ocr_inv_left + '\n' + ocr_inv_right, vision_nutrition=vision_nutrition),
             'eyemark':  _check_eyemark(img, is_film, fname, required_eyemark, vision_eyemark=vision_eyemark),
-            'spelling': _check_spelling(combined_text, fname),
-            'fda':      _check_fda(combined_text, fname, vision_allergens=vision_allergens),
+            'spelling': _check_spelling(label_text, fname),
+            'fda':      _check_fda(label_text, fname, vision_allergens=vision_allergens),
         }
         # Print Specs and Wind Direction are press-proof checks — skip for art proofs
         if proof_type != 'art':
