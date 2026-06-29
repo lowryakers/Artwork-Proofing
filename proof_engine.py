@@ -1215,6 +1215,30 @@ def _check_eyemark(img, is_film: bool = False, fname: str = '',
         })
         return {'issues': issues, 'notes': notes, 'eyemark_color': None}
 
+    # The render sits on a white page with margins around the die cut. If we scan
+    # the full image, the border strips are just white page background — so the
+    # scan always reports WHITE and never reaches the artwork edge where the
+    # eyemark actually lives. Crop to the non-white bounding box (the die cut)
+    # first so the border scan sees the real artwork edges.
+    if PIL_AVAILABLE:
+        try:
+            from PIL import ImageChops as _EMChops
+            _emg = img.convert('L')
+            _emdiff = _EMChops.difference(_emg, Image.new('L', img.size, 255))
+            _embb = _emdiff.getbbox()
+            if _embb:
+                _empad = max(2, int(min(img.width, img.height) * 0.005))
+                _embox = (
+                    max(0, _embb[0] - _empad), max(0, _embb[1] - _empad),
+                    min(img.width, _embb[2] + _empad), min(img.height, _embb[3] + _empad),
+                )
+                # Only crop if it meaningfully shrinks the frame (real margins present)
+                if (_embox[2] - _embox[0]) < img.width * 0.95 or \
+                   (_embox[3] - _embox[1]) < img.height * 0.95:
+                    img = img.crop(_embox)
+        except Exception:
+            pass
+
     w, h = img.size
 
     # Detect barcode location so we can exclude it from the eyemark scan.
