@@ -338,7 +338,7 @@ def _match_spec_row(gtin_list: list, fname: str, spec_rows: list) -> dict:
 
 
 def _claude_vision_ocr(img_path: str) -> dict:
-    """Use Claude Haiku vision to read press-ready PDFs where text is outlined or
+    """Use Claude Sonnet vision to read press-ready PDFs where text is outlined or
     reverse/mirror-printed (Tesseract returns garbage or backwards words).
 
     Returns a dict:
@@ -366,7 +366,10 @@ def _claude_vision_ocr(img_path: str) -> dict:
                 _s = (_cap / float(_mp)) ** 0.5
                 im = im.resize((max(1, int(im.width * _s)), max(1, int(im.height * _s))))
             _b = io.BytesIO()
-            im.save(_b, format='JPEG', quality=88)
+            # High quality — JPEG artifacts on small NFP digits cause misreads
+            # (e.g. 130→180, 26→24). PNG would be lossless but much larger; q95
+            # preserves digit edges well within the payload budget.
+            im.save(_b, format='JPEG', quality=95)
             return base64.standard_b64encode(_b.getvalue()).decode('utf-8')
 
         _img_b64_list = []
@@ -438,8 +441,10 @@ def _claude_vision_ocr(img_path: str) -> dict:
         )})
 
         _client = _anthropic.Anthropic(api_key=os.environ['ANTHROPIC_API_KEY'])
+        # Sonnet, not Haiku — this is a compliance tool and digit-reading accuracy
+        # on small NFP text matters more than the per-image cost difference.
         _msg = _client.messages.create(
-            model='claude-haiku-4-5-20251001',
+            model='claude-sonnet-4-6',
             max_tokens=1500,
             messages=[{'role': 'user', 'content': _content}],
         )
@@ -1101,12 +1106,16 @@ def _check_nfp(ocr_text: str, front_text: str = '', vision_nutrition: dict = Non
     nw_hits = re.findall(r'net\s*wt\.?\s*([\d.]+)\s*g', tl)
 
     # Dual-column NFPs ("Amount per serving" + "As Prepared") legitimately show
-    # two different calorie/protein values — don't flag as a mismatch.
-    # Also suppress when preparation/directions text is present (powder products).
-    has_dual_column = bool(re.search(
-        r'as\s+prepared|when\s+prepared|with\s+(?:whole\s+|2%\s+|skim\s+)?milk|'
-        r'prepared\s+with|per\s+serving\s+prepared|with\s+water|mix(?:ed)?\s+with|'
-        r'directions|serving\s+suggestion|prepared\s+product',
+    # two different calorie/protein values — don't flag those as a mismatch.
+    # Only a genuine prepared-column NFP qualifies; plain "Directions: mix with
+    # water" text does NOT (it was over-suppressing real front-vs-NFP mismatches).
+    # And when Claude Vision supplied structured per-panel values, it already
+    # reports the single canonical value for each panel, so dual-column logic
+    # doesn't apply at all.
+    _vision_provided = bool(_vfc or _vnfp)
+    has_dual_column = (not _vision_provided) and bool(re.search(
+        r'as\s+prepared|when\s+prepared|as\s+packaged|prepared\s+product|'
+        r'per\s+serving\s+prepared',
         tl
     ))
 
