@@ -456,9 +456,18 @@ def _claude_vision_ocr(img_path: str) -> dict:
             max_tokens=1500,
             messages=[{'role': 'user', 'content': _content}],
         )
-        _txt = _msg.content[0].text if _msg.content else ''
+        # Pick the first content block that actually carries text (a future model
+        # could return a thinking/tool block first; .text on it would raise).
+        _txt = ''
+        for _blk in (_msg.content or []):
+            if getattr(_blk, 'text', None):
+                _txt = _blk.text
+                break
         _out = _parse_vision_json(_txt)
-        _out['status'] = 'ok'
+        # Surface a parse failure instead of masquerading as a clean read — if the
+        # JSON didn't parse, the structured fields are empty and a caller must know.
+        _out['status'] = 'ok' if _out.get('_parsed') else 'parse_error (raw text only)'
+        _out.pop('_parsed', None)
         return _out
     except Exception as _e:
         return dict(_empty, status='error: {}: {}'.format(type(_e).__name__, str(_e)[:160]))
@@ -470,10 +479,13 @@ def _parse_vision_json(txt: str) -> dict:
     if not txt:
         return _empty
     try:
-        _m = re.search(r'\{.*\}', txt, re.DOTALL)
-        if not _m:
+        # Decode from the first '{' with raw_decode rather than a greedy /\{.*\}/
+        # match — greedy matching spans to the LAST '}' anywhere in the response,
+        # which mis-parses when raw_text contains braces or the model appends prose.
+        _start = txt.find('{')
+        if _start < 0:
             return dict(_empty, raw_text=txt)
-        _data = json.loads(_m.group(0))
+        _data, _ = json.JSONDecoder().raw_decode(txt[_start:])
 
         def _clean(panel):
             out = {}
@@ -500,6 +512,11 @@ def _parse_vision_json(txt: str) -> dict:
         def _clean_eyemark(e):
             if not isinstance(e, dict):
                 return {}
+            # Honor an explicit present:false — the model sometimes names a color
+            # it considered then rejected; treating that as a confirmed eyemark
+            # would let it override the pixel scan with a phantom mark.
+            if e.get('present') is False:
+                return {'present': False}
             out = {}
             col = e.get('color')
             if isinstance(col, str) and col.strip().lower() in ('black', 'white', 'other'):
@@ -513,6 +530,7 @@ def _parse_vision_json(txt: str) -> dict:
             'nfp': _clean(_data.get('nfp', {})),
             'allergens': _clean_allergens(_data.get('allergens', {})),
             'eyemark': _clean_eyemark(_data.get('eyemark', {})),
+            '_parsed': True,
         }
     except Exception:
         # Fall back to treating the whole response as raw text
@@ -724,14 +742,22 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
         ocr_inv_left + '\n' + ocr_inv_right + '\n' + ocr_binary
     )
     _front_ocr = ocr_left + '\n' + ocr_inv_left + '\n' + ocr_inv_right
-    # Film/stick artwork needs the eyemark read even when Tesseract got the
-    # nutrition — the small registration square is unreadable by pixel heuristics,
-    # so vision is the reliable source for its color.
-    _fname_is_film = bool(re.search(r'\b(stick|sachet|film|rollstock)\b', fname.lower()))
+    # Decide whether to escalate to Claude Vision. Run it when ANY of the three
+    # compliance reads is incomplete from Tesseract — not just nutrition:
+    #   • nutrition values missing (front callout / NFP)               → Check 2
+    #   • the FALCPA "Contains:" allergen line didn't OCR              → Check 5
+    #   • film/stick art (eyemark square unreadable by pixel scan)     → Check 3
+    # Using _is_film_rollstock (not a narrower regex) keeps the eyemark trigger in
+    # lockstep with the check that actually consumes it, so legitimate film files
+    # (flowwrap, sleeve, OCR-identified) always get the vision eyemark read.
+    _needs_nutrition_vision = _ocr_needs_vision(_pre_claude_text, front_text=_front_ocr)
+    _is_film_for_vision = _is_film_rollstock(fname, _pre_claude_text)
+    _has_contains_decl = bool(re.search(r'\bcontains?\s*:', _pre_claude_text.lower()))
+    _run_vision = _needs_nutrition_vision or _is_film_for_vision or not _has_contains_decl
     if not ANTHROPIC_AVAILABLE:
         _vision_diag = 'vision: skipped — ANTHROPIC_API_KEY not set / anthropic not installed'
-    elif not _ocr_needs_vision(_pre_claude_text, front_text=_front_ocr) and not _fname_is_film:
-        _vision_diag = 'vision: not needed — Tesseract read all front + NFP values'
+    elif not _run_vision:
+        _vision_diag = 'vision: not needed — Tesseract read nutrition, allergens, and (n/a) eyemark'
     else:
         _vision = _claude_vision_ocr(img_path)
         ocr_claude = _vision.get('raw_text', '')
@@ -1099,9 +1125,15 @@ def _check_nfp(ocr_text: str, front_text: str = '', vision_nutrition: dict = Non
                 _fc_cals.add(_vi)
     for _km in re.finditer(r'\bprotein\b', fl):
         _before = fl[max(0, _km.start() - 60): _km.start()]
-        for _v in re.findall(r'\b(\d{1,2})\b', _before):
-            _vi = int(_v)
+        for _vm in re.finditer(r'\b(\d{1,2})\b', _before):
+            _vi = int(_vm.group(1))
             if 5 < _vi < 120:
+                # Skip percentages (e.g. "50%", "%DV") — same guard the calorie
+                # window uses. Without it a stray %DV digit becomes a phantom
+                # front-panel protein value and fires a false mismatch.
+                _trail = _before[_vm.end(): _vm.end() + 4].lstrip()
+                if _trail.startswith('%'):
+                    continue
                 _fc_prots.add(_vi)
 
     front_calories  = sorted(_fc_cals)
@@ -1135,11 +1167,13 @@ def _check_nfp(ocr_text: str, front_text: str = '', vision_nutrition: dict = Non
     # two different calorie/protein values — don't flag those as a mismatch.
     # Only a genuine prepared-column NFP qualifies; plain "Directions: mix with
     # water" text does NOT (it was over-suppressing real front-vs-NFP mismatches).
-    # And when Claude Vision supplied structured per-panel values, it already
-    # reports the single canonical value for each panel, so dual-column logic
-    # doesn't apply at all.
-    _vision_provided = bool(_vfc or _vnfp)
-    has_dual_column = (not _vision_provided) and bool(re.search(
+    # And when Claude Vision supplied canonical values for BOTH panels, the
+    # dual-column ambiguity is resolved (it reports one value per panel), so the
+    # suppression can be turned off. If vision only read one panel, keep the
+    # "as prepared" suppression — otherwise a one-sided vision value compared
+    # against a legitimately dual-valued Tesseract NFP fires a false mismatch.
+    _vision_both_panels = bool(_vfc) and bool(_vnfp)
+    has_dual_column = (not _vision_both_panels) and bool(re.search(
         r'as\s+prepared|when\s+prepared|as\s+packaged|prepared\s+product|'
         r'per\s+serving\s+prepared',
         tl
@@ -2507,8 +2541,16 @@ def _check_print_specs(pdf_path: str, brand_config: dict = None,
         else:
             notes.append('No spot colors detected (process CMYK / RGB only).')
 
-        # Validate required spot colors from spec sheet
-        req_spots_raw = matched_spec.get('spot_colors', '')
+        # Validate required spot colors from spec sheet. The sheet parser emits
+        # the key as 'pms_spot_colors' (app.py) — the old 'spot_colors' lookup
+        # never matched, so this whole validation was silently dead. Check the
+        # real key first, with the legacy spellings as fallbacks.
+        req_spots_raw = (
+            matched_spec.get('pms_spot_colors')
+            or matched_spec.get('spot_colors')
+            or matched_spec.get('pms colors')
+            or ''
+        )
         if req_spots_raw:
             # Filter out blank/placeholder values like "PMS --", "--", "-", "N/A", "TBD"
             _PLACEHOLDER = re.compile(r'^[-–—]+$|^n/?a$|^tbd$|^none$|^pms\s*[-–—]+$', re.I)
