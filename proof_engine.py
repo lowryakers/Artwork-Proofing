@@ -275,6 +275,14 @@ def _process_job(job_id: str, pdf_paths: list, gtin_rows: list, work_dir: str,
         summary = _build_summary(results)
         _update_job(job_id, status='done', progress=100,
                     results=results, summary=summary, current_file='')
+        # File the results into ReadyDoc's artwork history. Off unless
+        # READYDOC_URL/READYDOC_TOKEN are set, and asynchronous either way — a
+        # ReadyDoc outage must not fail a proofing run that already succeeded.
+        try:
+            from readydoc import publish_job_async
+            publish_job_async(job_id, results)
+        except Exception as exc:
+            print(f'[readydoc] publish skipped: {exc}')
     except Exception as exc:
         _update_job(job_id, status='error', error=str(exc), progress=0)
 
@@ -329,20 +337,46 @@ _SPEC_GENERIC = {
 }
 
 
+def _spec_format(row: dict) -> str:
+    """'film', 'pouch' or '' — which physical format a spec row describes."""
+    blob = ' '.join(str(row.get(k, '') or '') for k in ('packaging_type', 'flavor')).lower()
+    # Pouch words are tested first: a row labelled "Stick pack" contains "pack",
+    # which is harmless, but "Pouch" must never be read as film.
+    if any(kw in blob for kw in _POUCH_KEYWORDS):
+        return 'pouch'
+    if any(kw in blob for kw in _FILM_KEYWORDS):
+        return 'film'
+    return ''
+
+
 def _match_spec_row(gtin_list: list, fname: str, spec_rows: list) -> dict:
-    """Match a spec row by GTIN first, then by filename keyword matching."""
+    """Match a spec row by GTIN first, then by filename keyword matching.
+
+    Filename matching cannot be trusted on its own to pick a FORMAT. Flavour
+    keywords are compared with the format words stripped out (_SPEC_GENERIC
+    holds both 'pouch' and 'stick'), so a stick file and a pouch file for the
+    same flavour reduce to identical keyword sets. This used to return whichever
+    row came first, which meant a stick could be checked against pouch trim
+    dimensions and fail confidently for the wrong reason.
+
+    So: collect every candidate, then split them on format. When the filename
+    does not say which format it is and the candidates would be checked
+    differently, return nothing — no spec check beats a wrong one, and the
+    caller already treats an empty spec as "skip those checks".
+    """
     if not spec_rows:
         return {}
 
-    # 1. Exact GTIN match
+    # 1. Exact GTIN match. A decoded barcode is unambiguous; nothing below is.
     for gtin in (gtin_list or []):
         gtin_str = str(gtin).strip()
         for row in spec_rows:
             if str(row.get('gtin', '')).strip() == gtin_str:
                 return row
 
-    # 2. Keyword match against filename
+    # 2. Keyword match against the filename — every candidate, not the first.
     fname_lower = fname.lower()
+    candidates = []
     for row in spec_rows:
         flavor = str(row.get('flavor', '')).strip().lower()
         if not flavor:
@@ -352,8 +386,34 @@ def _match_spec_row(gtin_list: list, fname: str, spec_rows: list) -> dict:
         if not keywords:
             continue
         if all(kw in fname_lower for kw in keywords):
-            return row
+            candidates.append(row)
 
+    if not candidates:
+        return {}
+    if len(candidates) == 1:
+        return candidates[0]
+
+    # 3. Several flavour matches — separate them by format.
+    want = ''
+    if any(kw in fname_lower for kw in _POUCH_KEYWORDS):
+        want = 'pouch'
+    elif any(kw in fname_lower for kw in _FILM_KEYWORDS):
+        want = 'film'
+    if want:
+        same = [r for r in candidates if _spec_format(r) == want]
+        if len(same) == 1:
+            return same[0]
+        if same:
+            candidates = same
+
+    # 4. Still ambiguous. If the survivors would all check identically, any of
+    # them will do; otherwise decline rather than guess.
+    def _shape(r):
+        return (r.get('trim_length_mm'), r.get('trim_width_mm'),
+                r.get('gusset_mm'), r.get('wind_direction'), r.get('material'))
+
+    if len({_shape(r) for r in candidates}) == 1:
+        return candidates[0]
     return {}
 
 
