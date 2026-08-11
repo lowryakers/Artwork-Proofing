@@ -129,8 +129,18 @@ def _save_sheet_config(cfg: dict):
 
 
 def _sheet_url_to_csv(url: str) -> str:
-    """Convert any Google Sheets share/edit/published URL to a direct CSV export URL."""
+    """Resolve a master-list URL to something that returns CSV.
+
+    Handles Google Sheets in any of its share/edit/published shapes, and also a
+    plain endpoint that already serves CSV — which is what ReadyDoc's
+    /api/products/master.csv is. Before, anything that was not a Google Sheets
+    link raised unless it happened to contain 'output=csv', so pointing this at
+    ReadyDoc silently fell back to the last cached copy.
+    """
     import re
+    url = (url or '').strip()
+    if not url:
+        raise ValueError('No master list URL is configured.')
     if 'export?format=csv' in url or 'output=csv' in url:
         return url
     # Published-to-web format: /spreadsheets/d/e/LONG_KEY/pubhtml
@@ -144,7 +154,14 @@ def _sheet_url_to_csv(url: str) -> str:
         gid_m = re.search(r'[#&?]gid=(\d+)', url)
         gid_part = f'&gid={gid_m.group(1)}' if gid_m else ''
         return f'https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv{gid_part}'
-    raise ValueError('Not a recognized Google Sheets URL. Paste the share/edit URL from your browser address bar.')
+    # Not Google Sheets. Accept it if it plausibly serves CSV directly; the
+    # fetch will fail loudly enough on its own if it does not.
+    path = re.sub(r'[?#].*$', '', url)
+    if url.startswith(('http://', 'https://')) and (path.endswith('.csv') or '/master.csv' in path):
+        return url
+    raise ValueError(
+        'Not a recognized master list URL. Paste a Google Sheets share URL, '
+        'or a link that serves CSV directly (ending in .csv).')
 
 
 def _fetch_sheet_rows(csv_url: str) -> list:
