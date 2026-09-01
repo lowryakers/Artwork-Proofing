@@ -40,6 +40,7 @@ ALLOWED_EXTS = {'.pdf', '.ai', '.png', '.jpg', '.jpeg', '.tiff', '.tif', '.eps'}
 
 CHECK_LABELS = {
     'gtin':     'GTIN / Barcode',
+    'netwt':    'Nutrition Panel vs Net Weight',
     'nfp':      'Front Call-Out vs NFP',
     'eyemark':  'Eyemark Contrast',
     'spelling': 'Spelling / Brand Name',
@@ -212,6 +213,14 @@ def _fetch_sheet_rows(csv_url: str) -> list:
         wind_raw    = _get('wind direction', 'wind', 'winding')
         wind        = re.sub(r'[^\d]', '', wind_raw)[:1]
 
+        # Actual fill weight per the production formula — the external truth the
+        # nutrition-panel-vs-net-weight check reconciles against. Not on the
+        # artwork; it belongs here in the master list next to the rest of the SKU
+        # data. Absent for a SKU → that check degrades to UNVERIFIED.
+        fill_weight = _to_float(_get('fill weight (g)', 'fill weight', 'fill weight g',
+                                     'fill wt (g)', 'fill wt', 'fill_weight_g',
+                                     'net fill weight', 'net fill (g)'))
+
         pms_colors  = _get('pms spot colors', 'pms colors', 'spot colors', 'pantone')
         hex_colors  = _get('hex spot colors', 'hex colors')
         eye_mark    = _get('eye mark color', 'eye mark', 'eyemark color', 'eyemark')
@@ -251,6 +260,7 @@ def _fetch_sheet_rows(csv_url: str) -> list:
             'trim_width_mm':     trim_width,
             'gusset_mm':         gusset,
             'front_panel_mm':    front_panel,
+            'fill_weight_g':     fill_weight,
             'wind_direction':    wind,
             'pms_spot_colors':   pms_colors,
             'hex_spot_colors':   hex_colors,
@@ -764,7 +774,54 @@ def _generate_report(job: dict, brand_name: str = 'ProDough') -> io.BytesIO:
     for col in ['B', 'C', 'D', 'E']:
         ws1.column_dimensions[col].width = 14
 
-    # ── Sheet 2: Issues to Fix (non-dismissed) ────────────────────────────────
+    # ── Sheet 2: Nutrition Panel vs Net Weight ────────────────────────────────
+    # Placed directly after the summary — this class of error outranks everything
+    # except a wrong barcode. One row per SKU with the full reconciliation.
+    def _g(v):
+        return '' if v in (None, '') else (f'{v:g}' if isinstance(v, (int, float)) else v)
+
+    nw_rows = [(r['filename'], r.get('checks', {}).get('netwt'))
+               for r in job['results'] if r.get('checks', {}).get('netwt')]
+    if nw_rows:
+        wsn = wb.create_sheet('Net Weight', 1)
+        n_fail = sum(1 for _, nw in nw_rows if nw.get('status') == 'FAIL')
+        n_unv  = sum(1 for _, nw in nw_rows if nw.get('status') == 'UNVERIFIED')
+        wsn.merge_cells('A1:H1')
+        wsn['A1'] = 'NUTRITION PANEL vs NET WEIGHT (must reconcile before print)'
+        wsn['A1'].font = Font(bold=True, size=12)
+        if n_fail:
+            banner = f'{n_fail} SKU(s) DO NOT reconcile — see rows below.'
+        elif n_unv:
+            banner = f'All computable panels reconcile; {n_unv} SKU(s) checked against declared net weight only (no fill weight supplied).'
+        else:
+            banner = 'All panels reconcile to actual fill weight.'
+        wsn.merge_cells('A2:H2')
+        wsn['A2'] = banner
+        hdrs = ['File', 'Serving (g)', 'Servings/Container', 'Implied Total (g)',
+                'Declared Net (g)', 'Actual Fill (g)', 'Status', 'Diagnosis / Notes']
+        for col, hdr in enumerate(hdrs, 1):
+            c = wsn.cell(row=4, column=col, value=hdr)
+            c.font = hdr_font
+            c.fill = hdr_blue
+            c.alignment = center
+        row_idx = 5
+        for fname, nw in nw_rows:
+            diag = nw.get('diagnosis') or (nw.get('notes') or [''])[0]
+            vals = [fname, _g(nw.get('serving_size_g')), _g(nw.get('servings_per_container')),
+                    _g(nw.get('implied_total_g')), _g(nw.get('declared_net_weight_g')),
+                    _g(nw.get('actual_fill_weight_g')), nw.get('status', ''), diag]
+            for col, val in enumerate(vals, 1):
+                c = wsn.cell(row=row_idx, column=col, value=val)
+                c.alignment = wrap if col == 8 else center
+            st = nw.get('status')
+            fillc = fill_crit if st == 'FAIL' else fill_warn if st == 'UNVERIFIED' else fill_ok
+            for col in range(1, 9):
+                wsn.cell(row=row_idx, column=col).fill = fillc
+            row_idx += 1
+        for col, w in zip('ABCDEFGH', [40, 11, 16, 15, 14, 13, 12, 70]):
+            wsn.column_dimensions[col].width = w
+
+    # ── Sheet: Issues to Fix (non-dismissed) ──────────────────────────────────
     ws2 = wb.create_sheet('Issues to Fix')
     for col, hdr in enumerate(['File', 'Check', 'Severity', 'Issue / Required Action'], 1):
         c = ws2.cell(row=1, column=col, value=hdr)

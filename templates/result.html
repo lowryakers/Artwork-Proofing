@@ -131,6 +131,7 @@
       <div class="btn-group btn-group-sm" id="checkFilterBar" role="group">
         <button type="button" class="btn btn-dark active" onclick="setCheckFilter('all')">All</button>
         <button type="button" class="btn btn-outline-dark" onclick="setCheckFilter('gtin')">GTIN</button>
+        <button type="button" class="btn btn-outline-dark" onclick="setCheckFilter('netwt')">Net Wt</button>
         <button type="button" class="btn btn-outline-dark" onclick="setCheckFilter('nfp')">NFP</button>
         <button type="button" class="btn btn-outline-dark" onclick="setCheckFilter('eyemark')">Eyemark</button>
         <button type="button" class="btn btn-outline-dark" onclick="setCheckFilter('spelling')">Spelling</button>
@@ -256,16 +257,19 @@
 
     <div class="checks-container">
     {{ _check_card('1','GTIN / Barcode',        'bi-upc-scan',           r.checks.gtin,     idx, r.filename, 'gtin',     dismissals, confirmations) }}
+    {% if r.checks.get('netwt') is not none %}
+    {{ _check_card('2','Nutrition Panel vs Net Weight', 'bi-calculator', r.checks.netwt,    idx, r.filename, 'netwt',    dismissals, confirmations, always_open=true) }}
+    {% endif %}
     {% if r.checks.get('nfp') is not none %}
-    {{ _check_card('2','Front Call-Out vs NFP', 'bi-clipboard2-pulse',   r.checks.nfp,      idx, r.filename, 'nfp',      dismissals, confirmations) }}
+    {{ _check_card('3','Front Call-Out vs NFP', 'bi-clipboard2-pulse',   r.checks.nfp,      idx, r.filename, 'nfp',      dismissals, confirmations) }}
     {% endif %}
-    {{ _check_card('3','Eyemark Contrast',       'bi-eye',                r.checks.eyemark,  idx, r.filename, 'eyemark',  dismissals, confirmations) }}
-    {{ _check_card('4','Spelling / Brand Name', 'bi-spellcheck',         r.checks.spelling, idx, r.filename, 'spelling', dismissals, confirmations) }}
-    {{ _check_card('5','FDA Audit Risk',         'bi-shield-exclamation', r.checks.fda,      idx, r.filename, 'fda',      dismissals, confirmations, always_open=true) }}
+    {{ _check_card('4','Eyemark Contrast',       'bi-eye',                r.checks.eyemark,  idx, r.filename, 'eyemark',  dismissals, confirmations) }}
+    {{ _check_card('5','Spelling / Brand Name', 'bi-spellcheck',         r.checks.spelling, idx, r.filename, 'spelling', dismissals, confirmations) }}
+    {{ _check_card('6','FDA Audit Risk',         'bi-shield-exclamation', r.checks.fda,      idx, r.filename, 'fda',      dismissals, confirmations, always_open=true) }}
     {% if r.checks.get('wind') is not none %}
-    {{ _check_card('6','Wind Direction',         'bi-arrow-repeat',       r.checks.wind,     idx, r.filename, 'wind',     dismissals, confirmations) }}
+    {{ _check_card('7','Wind Direction',         'bi-arrow-repeat',       r.checks.wind,     idx, r.filename, 'wind',     dismissals, confirmations) }}
     {% endif %}
-    {{ _check_card('7','Print Specifications',  'bi-rulers',             r.checks.specs,    idx, r.filename, 'specs',    dismissals, confirmations) }}
+    {{ _check_card('8','Print Specifications',  'bi-rulers',             r.checks.specs,    idx, r.filename, 'specs',    dismissals, confirmations) }}
     </div>
 
     <!-- Manual verify items -->
@@ -607,6 +611,7 @@
   /* ── Per-check filter ── */
   #reportRoot[data-check-filter] .check-card                             { display:none!important; }
   #reportRoot[data-check-filter="gtin"]     .check-card[data-check="gtin"]     { display:block!important; }
+  #reportRoot[data-check-filter="netwt"]    .check-card[data-check="netwt"]    { display:block!important; }
   #reportRoot[data-check-filter="nfp"]      .check-card[data-check="nfp"]      { display:block!important; }
   #reportRoot[data-check-filter="eyemark"]  .check-card[data-check="eyemark"]  { display:block!important; }
   #reportRoot[data-check-filter="spelling"] .check-card[data-check="spelling"] { display:block!important; }
@@ -1134,12 +1139,13 @@ function fileResult(r, jobId, idx) {
 
   let checksHtml = '';
   checksHtml += checkCard('1','GTIN / Barcode',        'bi-upc-scan',           checks.gtin,     uid, r.filename, 'gtin',     false);
-  if (checks.nfp != null) checksHtml += checkCard('2','Front Call-Out vs NFP','bi-clipboard2-pulse', checks.nfp, uid, r.filename, 'nfp', false);
-  checksHtml += checkCard('3','Eyemark Contrast',       'bi-eye',                checks.eyemark,  uid, r.filename, 'eyemark',  false);
-  checksHtml += checkCard('4','Spelling / Brand Name', 'bi-spellcheck',         checks.spelling, uid, r.filename, 'spelling', false);
-  checksHtml += checkCard('5','FDA Audit Risk',         'bi-shield-exclamation', checks.fda,      uid, r.filename, 'fda',      true);
-  if (checks.wind != null) checksHtml += checkCard('6','Wind Direction','bi-arrow-repeat', checks.wind, uid, r.filename, 'wind', false);
-  checksHtml += checkCard('7','Print Specifications',  'bi-rulers',             checks.specs,    uid, r.filename, 'specs',    false);
+  if (checks.netwt != null) checksHtml += checkCard('2','Nutrition Panel vs Net Weight','bi-calculator', checks.netwt, uid, r.filename, 'netwt', true);
+  if (checks.nfp != null) checksHtml += checkCard('3','Front Call-Out vs NFP','bi-clipboard2-pulse', checks.nfp, uid, r.filename, 'nfp', false);
+  checksHtml += checkCard('4','Eyemark Contrast',       'bi-eye',                checks.eyemark,  uid, r.filename, 'eyemark',  false);
+  checksHtml += checkCard('5','Spelling / Brand Name', 'bi-spellcheck',         checks.spelling, uid, r.filename, 'spelling', false);
+  checksHtml += checkCard('6','FDA Audit Risk',         'bi-shield-exclamation', checks.fda,      uid, r.filename, 'fda',      true);
+  if (checks.wind != null) checksHtml += checkCard('7','Wind Direction','bi-arrow-repeat', checks.wind, uid, r.filename, 'wind', false);
+  checksHtml += checkCard('8','Print Specifications',  'bi-rulers',             checks.specs,    uid, r.filename, 'specs',    false);
 
   const content = r.error
     ? `<div class="alert alert-danger"><strong>Error:</strong> ${esc(r.error)}</div>`
