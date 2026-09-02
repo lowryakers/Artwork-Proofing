@@ -266,10 +266,13 @@
     {{ _check_card('4','Eyemark Contrast',       'bi-eye',                r.checks.eyemark,  idx, r.filename, 'eyemark',  dismissals, confirmations) }}
     {{ _check_card('5','Spelling / Brand Name', 'bi-spellcheck',         r.checks.spelling, idx, r.filename, 'spelling', dismissals, confirmations) }}
     {{ _check_card('6','FDA Audit Risk',         'bi-shield-exclamation', r.checks.fda,      idx, r.filename, 'fda',      dismissals, confirmations, always_open=true) }}
-    {% if r.checks.get('wind') is not none %}
-    {{ _check_card('7','Wind Direction',         'bi-arrow-repeat',       r.checks.wind,     idx, r.filename, 'wind',     dismissals, confirmations) }}
+    {% if r.checks.get('prep') is not none %}
+    {{ _check_card('7','Prep Block Type',        'bi-card-checklist',     r.checks.prep,     idx, r.filename, 'prep',     dismissals, confirmations) }}
     {% endif %}
-    {{ _check_card('8','Print Specifications',  'bi-rulers',             r.checks.specs,    idx, r.filename, 'specs',    dismissals, confirmations) }}
+    {% if r.checks.get('wind') is not none %}
+    {{ _check_card('8','Wind Direction',         'bi-arrow-repeat',       r.checks.wind,     idx, r.filename, 'wind',     dismissals, confirmations) }}
+    {% endif %}
+    {{ _check_card('9','Print Specifications',  'bi-rulers',             r.checks.specs,    idx, r.filename, 'specs',    dismissals, confirmations) }}
     </div>
 
     <!-- Manual verify items -->
@@ -1144,8 +1147,9 @@ function fileResult(r, jobId, idx) {
   checksHtml += checkCard('4','Eyemark Contrast',       'bi-eye',                checks.eyemark,  uid, r.filename, 'eyemark',  false);
   checksHtml += checkCard('5','Spelling / Brand Name', 'bi-spellcheck',         checks.spelling, uid, r.filename, 'spelling', false);
   checksHtml += checkCard('6','FDA Audit Risk',         'bi-shield-exclamation', checks.fda,      uid, r.filename, 'fda',      true);
-  if (checks.wind != null) checksHtml += checkCard('7','Wind Direction','bi-arrow-repeat', checks.wind, uid, r.filename, 'wind', false);
-  checksHtml += checkCard('8','Print Specifications',  'bi-rulers',             checks.specs,    uid, r.filename, 'specs',    false);
+  if (checks.prep != null) checksHtml += checkCard('7','Prep Block Type','bi-card-checklist', checks.prep, uid, r.filename, 'prep', false);
+  if (checks.wind != null) checksHtml += checkCard('8','Wind Direction','bi-arrow-repeat', checks.wind, uid, r.filename, 'wind', false);
+  checksHtml += checkCard('9','Print Specifications',  'bi-rulers',             checks.specs,    uid, r.filename, 'specs',    false);
 
   const content = r.error
     ? `<div class="alert alert-danger"><strong>Error:</strong> ${esc(r.error)}</div>`

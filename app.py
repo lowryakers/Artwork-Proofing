@@ -45,6 +45,7 @@ CHECK_LABELS = {
     'eyemark':  'Eyemark Contrast',
     'spelling': 'Spelling / Brand Name',
     'fda':      'FDA Audit Risk',
+    'prep':     'Prep Block Type',
     'wind':     'Wind Direction',
     'specs':    'Print Specs',
 }
@@ -820,6 +821,32 @@ def _generate_report(job: dict, brand_name: str = 'ProDough') -> io.BytesIO:
             row_idx += 1
         for col, w in zip('ABCDEFGH', [40, 11, 16, 15, 14, 13, 12, 70]):
             wsn.column_dimensions[col].width = w
+
+    # ── Sheet: Prep Block Classification ──────────────────────────────────────
+    # Per-serving prep must be revised on a serving-size change; batch prep must
+    # not. This tells the designer which SKUs actually need prep-copy edits.
+    prep_rows = [(r['filename'], r.get('checks', {}).get('prep'))
+                 for r in job['results'] if r.get('checks', {}).get('prep')]
+    if prep_rows:
+        wsp = wb.create_sheet('Prep Blocks')
+        wsp.merge_cells('A1:C1')
+        wsp['A1'] = 'PREP BLOCK CLASSIFICATION'
+        wsp['A1'].font = Font(bold=True, size=12)
+        for col, hdr in enumerate(['File', 'Type', 'Detail'], 1):
+            c = wsp.cell(row=3, column=col, value=hdr)
+            c.font = hdr_font
+            c.fill = hdr_blue
+            c.alignment = center
+        ridx = 4
+        for fname, prep in prep_rows:
+            cls = (prep.get('classification') or 'undetermined')
+            detail = (prep.get('notes') or [''])[0]
+            for col, val in enumerate([fname, cls.upper(), detail], 1):
+                c = wsp.cell(row=ridx, column=col, value=val)
+                c.alignment = wrap if col == 3 else center
+            ridx += 1
+        for col, w in zip('ABC', [40, 14, 90]):
+            wsp.column_dimensions[col].width = w
 
     # ── Sheet: Issues to Fix (non-dismissed) ──────────────────────────────────
     ws2 = wb.create_sheet('Issues to Fix')

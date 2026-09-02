@@ -972,6 +972,7 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
             'eyemark':  _check_eyemark(img, is_film, fname, required_eyemark, vision_eyemark=vision_eyemark),
             'spelling': _check_spelling_generic(label_text, brand_name),
             'fda':      _check_fda_light(label_text, fname),
+            'prep':     _check_prep_block(label_text, _panel),
             'specs':    _check_print_specs(pdf_path, brand_config, matched_spec),
         }
         if is_film:
@@ -986,6 +987,7 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
             'eyemark':  _check_eyemark(img, is_film, fname, required_eyemark, vision_eyemark=vision_eyemark),
             'spelling': _check_spelling(label_text, fname),
             'fda':      _check_fda(label_text, fname, vision_allergens=vision_allergens),
+            'prep':     _check_prep_block(label_text, _panel),
         }
         # Print Specs and Wind Direction are press-proof checks — skip for art proofs
         if proof_type != 'art':
@@ -1646,6 +1648,79 @@ def _check_net_weight(panel: dict, fill_weight_g=None, fname: str = '') -> dict:
         'serving_size_cups': cups,
         'implied_density': implied_density,
         'diagnosis': diagnosis,
+        'issues': issues,
+        'notes': notes,
+    }
+
+
+# ── Check: Prep block — per-serving or batch ──────────────────────────────────
+# Before anyone reports that a prep block needs revision after a serving-size
+# change, classify it. Per-serving quantities scale with the NFP serving size (a
+# serving-size change DOES require prep-copy edits). Batch quantities are fixed by
+# a yield and are independent of the serving declaration (a serving-size-only
+# change does NOT touch them). Getting this wrong sends the designer work that
+# isn't needed, or misses work that is.
+#   Heuristic: a "Makes N ..." yield, or a mix quantity that does not match the
+#   serving size, means batch; otherwise per-serving.
+
+_PREP_HEADERS = (r'directions?|to\s+prepare|preparation|mixing\s+instructions?|'
+                 r'how\s+to\s+(?:make|prepare|use)|instructions?|recipe')
+
+
+def _check_prep_block(text: str, panel: dict = None) -> dict:
+    issues, notes = [], []
+    panel = panel or {}
+    tl = (text or '').lower()
+
+    # Locate a prep/directions block: prefer an explicit header, else the first
+    # run of instruction verbs.
+    block = ''
+    m = re.search(r'(?:' + _PREP_HEADERS + r')\b[:\s\-]*(.{0,400})', tl, re.DOTALL)
+    if m and m.group(1).strip():
+        block = m.group(1)
+    else:
+        m2 = re.search(r'((?:\bmix\b|combine|whisk|blend|stir|add\s+\d).{0,300})', tl, re.DOTALL)
+        block = m2.group(1) if m2 else ''
+    if not block.strip():
+        notes.append('No prep / directions block detected to classify.')
+        return {'classification': None, 'yield': None, 'issues': issues, 'notes': notes}
+
+    # Signal 1 — an explicit yield statement ("Makes 12 cupcakes").
+    yield_m = re.search(r'\bmakes\s+(?:about\s+)?(\d+)\s+([a-z]+)', block)
+
+    # Signal 2 — mix quantity that does not correspond to a single serving. Compare
+    # the prep's cup measure of dry mix to the serving size (cups), when both read.
+    mix_cups = None
+    mm = re.search(r'(\d+\s+\d+\s*/\s*\d+|\d+\s*/\s*\d+|\d+(?:\.\d+)?)\s*cups?\s+(?:of\s+)?'
+                   r'(?:mix|powder|blend|dry\s+mix)', block)
+    if mm:
+        mix_cups = _frac_to_float(mm.group(1))
+    serving_cups = panel.get('serving_size_cups')
+    quantity_mismatch = (
+        mix_cups is not None and serving_cups
+        and abs(mix_cups - serving_cups) / serving_cups > 0.25
+    )
+
+    if yield_m or quantity_mismatch:
+        classification = 'batch'
+        why = (f'it states a fixed yield ("{yield_m.group(0)}")' if yield_m
+               else f'its mix quantity ({mix_cups:g} cup) makes several servings, not one '
+                    f'({serving_cups:g} cup)')
+        notes.append(
+            f'Prep block is a BATCH recipe — {why}. Batch quantities are independent of the '
+            'serving declaration, so a serving-size-only change does NOT require prep-copy edits.')
+    else:
+        classification = 'per-serving'
+        notes.append(
+            'Prep block is PER-SERVING — quantities scale with the NFP serving size, so a '
+            'serving-size change DOES require updating these quantities (and the back-panel '
+            'prep copy).')
+
+    return {
+        'classification': classification,
+        'yield': (yield_m.group(0) if yield_m else None),
+        'mix_cups': mix_cups,
+        'serving_cups': serving_cups,
         'issues': issues,
         'notes': notes,
     }
