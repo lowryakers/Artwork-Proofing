@@ -46,6 +46,8 @@ CHECK_LABELS = {
     'spelling': 'Spelling / Brand Name',
     'fda':      'FDA Audit Risk',
     'prep':     'Prep Block Type',
+    'ingredients': 'Ingredient Statement Changes',
+    'claims':   'Claims Review',
     'wind':     'Wind Direction',
     'specs':    'Print Specs',
 }
@@ -847,6 +849,44 @@ def _generate_report(job: dict, brand_name: str = 'ProDough') -> io.BytesIO:
             ridx += 1
         for col, w in zip('ABC', [40, 14, 90]):
             wsp.column_dimensions[col].width = w
+
+    # ── Sheets: revision-comparison findings (ingredients, claims) ────────────
+    def _findings_sheet(title, heading, check_key):
+        rows = []
+        for r in job['results']:
+            chk = r.get('checks', {}).get(check_key)
+            if not chk:
+                continue
+            lines = ([f'[{i["severity"].upper()}] {i["message"]}' for i in chk.get('issues', [])]
+                     + list(chk.get('notes', [])))
+            for line in lines:
+                rows.append((r['filename'], line))
+        if not rows:
+            return
+        ws = wb.create_sheet(title)
+        ws.merge_cells('A1:B1')
+        ws['A1'] = heading
+        ws['A1'].font = Font(bold=True, size=12)
+        for col, hdr in enumerate(['File', 'Finding'], 1):
+            c = ws.cell(row=3, column=col, value=hdr)
+            c.font = hdr_font
+            c.fill = hdr_blue
+            c.alignment = center
+        ridx = 4
+        for fname, line in rows:
+            ws.cell(row=ridx, column=1, value=fname).alignment = center
+            c = ws.cell(row=ridx, column=2, value=line)
+            c.alignment = wrap
+            if line.startswith('[CRITICAL]'):
+                c.fill = fill_crit
+            elif line.startswith('[WARNING]'):
+                c.fill = fill_warn
+            ridx += 1
+        ws.column_dimensions['A'].width = 40
+        ws.column_dimensions['B'].width = 100
+
+    _findings_sheet('Ingredient Changes', 'INGREDIENT STATEMENT CHANGES', 'ingredients')
+    _findings_sheet('Claims Review', 'CLAIMS REVIEW', 'claims')
 
     # ── Sheet: Issues to Fix (non-dismissed) ──────────────────────────────────
     ws2 = wb.create_sheet('Issues to Fix')

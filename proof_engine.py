@@ -272,6 +272,10 @@ def _process_job(job_id: str, pdf_paths: list, gtin_rows: list, work_dir: str,
             for f in as_completed(futures):
                 f.result()  # surface any unexpected error from the worker wrapper
 
+        # Cross-file pass: flag distinct SKUs in this batch that share an
+        # ingredient statement (Check 7.4). Runs once all files are in.
+        _flag_duplicate_ingredients(results)
+
         summary = _build_summary(results)
         _update_job(job_id, status='done', progress=100,
                     results=results, summary=summary, current_file='')
@@ -963,6 +967,13 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
     if _fill_weight is None:
         _fill_weight = brand_config.get('fill_weight_g')
 
+    # Revision comparison (Checks 7 & 8): snapshot this label's content and pull
+    # the prior proofed version for this SKU from stored history (ReadyDoc → local).
+    _snapshot = _build_label_snapshot(label_text, _panel, vision_nutrition)
+    _gtin_lookup = barcode_gtins[0] if (barcode_gtins and len(set(barcode_gtins)) == 1) else None
+    _sku_lookup = matched_spec.get('sku') if matched_spec else None
+    _prior_snapshot = _fetch_prior_snapshot(_gtin_lookup, _sku_lookup)
+
     if brand_mode == 'generic':
         is_film = brand_config.get('packaging_type', 'other') == 'stick'
         brand_name = brand_config.get('brand_name', '')
@@ -973,6 +984,8 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
             'spelling': _check_spelling_generic(label_text, brand_name),
             'fda':      _check_fda_light(label_text, fname),
             'prep':     _check_prep_block(label_text, _panel),
+            'ingredients': _check_ingredient_drift(_snapshot, _prior_snapshot),
+            'claims':   _check_claims(_snapshot, _prior_snapshot),
             'specs':    _check_print_specs(pdf_path, brand_config, matched_spec),
         }
         if is_film:
@@ -988,6 +1001,8 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
             'spelling': _check_spelling(label_text, fname),
             'fda':      _check_fda(label_text, fname, vision_allergens=vision_allergens),
             'prep':     _check_prep_block(label_text, _panel),
+            'ingredients': _check_ingredient_drift(_snapshot, _prior_snapshot),
+            'claims':   _check_claims(_snapshot, _prior_snapshot),
         }
         # Print Specs and Wind Direction are press-proof checks — skip for art proofs
         if proof_type != 'art':
@@ -1026,6 +1041,7 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
         'info_count': len(infos),
         'error': None,
         'matched_spec': matched_spec,
+        'snapshot': _snapshot,
         'page_rotation': page_rotation,
     }
 
@@ -1724,6 +1740,300 @@ def _check_prep_block(text: str, panel: dict = None) -> dict:
         'issues': issues,
         'notes': notes,
     }
+
+
+# ── Label content snapshot (for revision comparison) ──────────────────────────
+# Checks 7 & 8 compare a panel against its prior proofed version. That comparison
+# needs the label CONTENT preserved, not just the check verdicts — so each proof
+# stores this compact snapshot, which is filed to history and read back next time.
+
+_COMPARATIVE_PATTERNS = [
+    r'\b(?:\d+\s*(?:g|grams?|%)?\s*)?(?:more|less|fewer|extra|higher|lower|reduced|added|increased|most)\s+'
+    r'(?:protein|calcium|fiber|fibre|iron|calories|vitamin)\b',
+    r'\b(?:protein|fiber|calcium)\s+(?:packed|boost(?:ed)?)\b',
+]
+
+
+def _ingredient_statement(text: str) -> str:
+    """The raw text of the ingredient declaration, if present."""
+    m = re.search(
+        r'ingredients?\s*:\s*(.+?)(?:\bcontains?\s*:|these\s+statements|manufactured|'
+        r'distributed|\bnet\s+wt|\*these|\Z)',
+        text or '', re.IGNORECASE | re.DOTALL)
+    return re.sub(r'\s+', ' ', m.group(1)).strip(' .') if m else ''
+
+
+def _split_ingredients(statement: str) -> list:
+    """Split an ingredient statement on top-level commas (respecting parentheses,
+    so "Enzyme Blend (Protease, Lipase)" stays one item)."""
+    out, buf, depth = [], '', 0
+    for ch in statement:
+        if ch in '([':
+            depth += 1
+        elif ch in ')]':
+            depth = max(0, depth - 1)
+        if ch == ',' and depth == 0:
+            if buf.strip():
+                out.append(buf.strip())
+            buf = ''
+        else:
+            buf += ch
+    if buf.strip():
+        out.append(buf.strip())
+    return out
+
+
+def _norm_ing(s: str) -> str:
+    """Normalize an ingredient name for comparison: lowercase, drop parenthetical
+    detail, collapse whitespace, strip a leading "less than 2% of" preamble."""
+    s = re.sub(r'\([^)]*\)', '', s or '').lower()
+    s = re.sub(r'contains?\s+less\s+than\s+\d+\s*%?\s*(?:of)?\s*:?', '', s)
+    return re.sub(r'[^a-z0-9 ]', ' ', s).strip()
+
+
+def _build_label_snapshot(text: str, panel: dict, vision_nutrition: dict) -> dict:
+    """Compact record of the label content used for revision comparison."""
+    tl = (text or '').lower()
+    stmt = _ingredient_statement(text)
+    sf = []
+    for p in _SF_CLAIM_PATTERNS:
+        for m in re.finditer(p, tl):
+            sf.append(m.group(0).strip())
+    comp = []
+    for p in _COMPARATIVE_PATTERNS:
+        for m in re.finditer(p, tl):
+            comp.append(m.group(0).strip())
+    vn = vision_nutrition or {}
+    return {
+        'ingredients_raw': stmt,
+        'ingredients': [_norm_ing(x) for x in _split_ingredients(stmt) if _norm_ing(x)],
+        'has_less_than_2pct': bool(re.search(r'less\s+than\s+\d+\s*%', stmt.lower())),
+        'front_callout': vn.get('front_callout', {}) or {},
+        'nfp': vn.get('nfp', {}) or {},
+        'nfp_extra_columns': _detect_extra_nfp_columns(tl),
+        'serving_size_g': (panel or {}).get('serving_size_g'),
+        'structure_function_claims': sorted(set(sf)),
+        'comparative_claims': sorted(set(comp)),
+    }
+
+
+def _detect_extra_nfp_columns(tl: str) -> list:
+    """Names of secondary NFP columns beyond the plain per-serving column
+    ("As Prepared", "Protein Plus", "Dry Mix" dual columns)."""
+    cols = []
+    for pat, name in [
+        (r'as\s+prepared', 'As Prepared'),
+        (r'when\s+prepared', 'When Prepared'),
+        (r'protein\s+plus', 'Protein Plus'),
+        (r'as\s+packaged', 'As Packaged'),
+        (r'dry\s+mix', 'Dry Mix'),
+    ]:
+        if re.search(pat, tl):
+            cols.append(name)
+    return cols
+
+
+# ── Prior-version sourcing (stored job history) ───────────────────────────────
+
+def _result_gtin_sku(res: dict):
+    """The single decoded GTIN and matched SKU that identify a stored result."""
+    g = (res.get('checks', {}).get('gtin', {}) or {}).get('found_gtins') or []
+    uniq = {str(x).strip() for x in g if str(x).strip()}
+    gtin = uniq.pop() if len(uniq) == 1 else None
+    sku = (res.get('matched_spec') or {}).get('sku')
+    return gtin, (str(sku).strip().lower() if sku else None)
+
+
+def _find_prior_snapshot(gtin=None, sku=None, exclude_job_id=None) -> dict:
+    """Most recent prior label snapshot for this SKU/GTIN from stored job history
+    (the on-disk job store loaded at startup). None if this is the first proof."""
+    gtin = str(gtin).strip() if gtin else None
+    sku = str(sku).strip().lower() if sku else None
+    if not gtin and not sku:
+        return None
+    with _jobs_lock:
+        jobs = list(_jobs.values())
+    for job in sorted(jobs, key=lambda j: j.get('created', ''), reverse=True):
+        if exclude_job_id and job.get('id') == exclude_job_id:
+            continue
+        for res in job.get('results', []):
+            snap = res.get('snapshot')
+            if not snap:
+                continue
+            r_gtin, r_sku = _result_gtin_sku(res)
+            if (gtin and r_gtin == gtin) or (sku and r_sku == sku):
+                return snap
+    return None
+
+
+def _fetch_prior_snapshot(gtin=None, sku=None) -> dict:
+    """Prior label snapshot for revision comparison. Prefers ReadyDoc (the QA
+    team's canonical artwork history); falls back to the local job store. Never
+    raises — a missing prior version just means the comparison is skipped."""
+    try:
+        import readydoc
+        snap = readydoc.fetch_prior_snapshot(gtin, sku)
+        if snap:
+            return snap
+    except Exception as _e:
+        print(f'[readydoc] prior-snapshot fetch skipped: {_e}')
+    return _find_prior_snapshot(gtin, sku)
+
+
+def _recount_result(res: dict) -> None:
+    """Recompute a result's severity and issue counts from its checks — used after
+    a cross-file pass appends issues post-hoc."""
+    all_issues = [i for c in (res.get('checks') or {}).values()
+                  if isinstance(c, dict) for i in c.get('issues', [])]
+    crit = [i for i in all_issues if i.get('severity') == 'critical']
+    warns = [i for i in all_issues if i.get('severity') == 'warning']
+    infos = [i for i in all_issues if i.get('severity') == 'info']
+    res['critical_count'] = len(crit)
+    res['warning_count'] = len(warns)
+    res['info_count'] = len(infos)
+    res['severity'] = ('critical' if crit else 'warning' if warns
+                       else 'info' if infos else 'clean')
+
+
+def _flag_duplicate_ingredients(results: list) -> None:
+    """Check 7.4 — two distinct SKUs in the same batch with identical (or nearly
+    identical) ingredient statements. Usually a copy-paste in whatever generated
+    the panel. Appends a warning to each involved file's 'ingredients' check."""
+    entries = []
+    for res in results or []:
+        snap = res.get('snapshot') or {}
+        ings = snap.get('ingredients') or []
+        if len(ings) >= 3:
+            entries.append((res, ings))
+    for i in range(len(entries)):
+        for j in range(i + 1, len(entries)):
+            res_a, a = entries[i]
+            res_b, b = entries[j]
+            if res_a.get('filename') == res_b.get('filename'):
+                continue
+            sa, sb = set(a), set(b)
+            overlap = len(sa & sb) / max(1, len(sa | sb))
+            # Identical sets, or same items in a different order → flag.
+            if overlap >= 0.92:
+                same_order = a == b
+                detail = ('identical' if same_order else
+                          'identical apart from ingredient order')
+                for res, other in ((res_a, res_b), (res_b, res_a)):
+                    chk = res.setdefault('checks', {}).setdefault(
+                        'ingredients', {'issues': [], 'notes': []})
+                    chk.setdefault('issues', []).append({'severity': 'warning', 'message': (
+                        f'Ingredient statement is {detail} to {other.get("filename")}. Two '
+                        'distinct SKUs with the same ingredient list is usually a copy-paste in '
+                        'whatever generated the panel — confirm each flavor\'s statement is correct.')})
+                    _recount_result(res)
+
+
+# ── Check: Ingredient statement drift between revisions ───────────────────────
+
+def _check_ingredient_drift(current: dict, prior: dict) -> dict:
+    """Compare the current ingredient statement against the prior proofed version.
+    Order changes and dropped descriptors are reported as questions, not verdicts —
+    either the formula changed or one of the two statements is wrong."""
+    issues, notes = [], []
+    cur = (current or {}).get('ingredients') or []
+    old = (prior or {}).get('ingredients') or []
+    if not old:
+        notes.append('No prior proofed version on file for this SKU — ingredient drift '
+                     'comparison skipped (duplicate-across-flavors is still checked).')
+        return {'issues': issues, 'notes': notes, 'compared': False}
+    if not cur:
+        notes.append('Could not read an ingredient statement to compare against the prior version.')
+        return {'issues': issues, 'notes': notes, 'compared': False}
+
+    # 1. Headline order changes — an ingredient among the first three that moves.
+    for i, ing in enumerate(old[:3]):
+        if ing in cur:
+            j = cur.index(ing)
+            if abs(j - i) >= 2:
+                issues.append({'severity': 'warning', 'message': (
+                    f'Ingredient "{ing}" moved from #{i + 1} to #{j + 1} versus the prior '
+                    'version. Ingredients are listed by weight — either the formula changed '
+                    'or one of the two statements is wrong. Verify.')})
+
+    # 2. Dropped descriptors — the same ingredient with one or more qualifying
+    #    words removed anywhere in the name ("Organic Brown Rice Flour" → "Brown
+    #    Rice Flour", "Non-Fat Dried Milk Powder" → "Non-Fat Milk Powder"). Match a
+    #    current ingredient whose words are a proper subset of the prior's.
+    cur_set = set(cur)
+    cur_wordsets = [(c, set(c.split())) for c in cur]
+    for oing in old:
+        if oing in cur_set:
+            continue
+        ow = set(oing.split())
+        best = None
+        for c, cw in cur_wordsets:
+            if cw and cw < ow and (best is None or len(cw) > len(best[1])):
+                best = (c, cw)
+        if best:
+            dropped_words = ow - best[1]
+            dropped = ' '.join(w for w in oing.split() if w in dropped_words)
+            is_claim = 'organic' in dropped_words
+            sev = 'critical' if is_claim else 'warning'
+            issues.append({'severity': sev, 'message': (
+                f'Descriptor "{dropped}" dropped: "{oing}" → "{best[0]}". '
+                + ('A dropped "Organic" is either a lost claim or an unsupported one still '
+                   'printing elsewhere on-pack — resolve before print.'
+                   if is_claim else
+                   'Either the ingredient changed or a qualifier was lost. Verify.'))})
+
+    # 3. Format change — introduction/removal of "contains less than 2% of".
+    if bool(current.get('has_less_than_2pct')) != bool(prior.get('has_less_than_2pct')):
+        added = current.get('has_less_than_2pct')
+        notes.append(
+            f'The "contains less than 2%" construction was {"added" if added else "removed"} '
+            'versus the prior version — confirm the reformatting is intentional.')
+
+    if not issues and not notes:
+        notes.append('Ingredient statement matches the prior proofed version.')
+    return {'issues': issues, 'notes': notes, 'compared': True}
+
+
+# ── Check: Claims that lose substantiation ────────────────────────────────────
+
+def _check_claims(current: dict, prior: dict = None) -> dict:
+    """Structure/function claims, comparative nutrition language, and front callouts
+    that quoted an NFP column dropped in the revision."""
+    issues, notes = [], []
+    cur = current or {}
+
+    # 1. A front callout that quoted a now-removed second NFP column → CRITICAL.
+    #    The prior panel had an extra column (e.g. "Protein Plus"); the revision is
+    #    single-column and the front protein no longer matches the panel.
+    if prior:
+        fc = (cur.get('front_callout') or {}).get('protein_g')
+        nfp = (cur.get('nfp') or {}).get('protein_g')
+        prior_cols = prior.get('nfp_extra_columns') or []
+        cur_cols = cur.get('nfp_extra_columns') or []
+        dropped_cols = [c for c in prior_cols if c not in cur_cols]
+        if fc is not None and nfp is not None and fc != nfp and dropped_cols:
+            issues.append({'severity': 'critical', 'message': (
+                f'Front callout "{fc}G Protein" no longer matches the NFP ({nfp}g). The prior '
+                f'version had a second column ({", ".join(dropped_cols)}) that the revision '
+                'dropped — the callout appears to quote that removed column and is now '
+                'unsubstantiated. Requantify the callout against the single-column panel.')})
+
+    # 2. Structure/function claims — list for labeling review (no judgment).
+    sf = cur.get('structure_function_claims') or []
+    if sf:
+        notes.append('Structure/function claims for your labeling review (substantiation not '
+                     'checked by this tool): ' + '; '.join(f'"{c}"' for c in sf) + '.')
+
+    # 3. Comparative nutrition language — nutrient content claims with requirements.
+    comp = cur.get('comparative_claims') or []
+    for c in comp:
+        issues.append({'severity': 'warning', 'message': (
+            f'Comparative nutrition language detected: "{c}". A comparison ("more/extra/higher") '
+            'is a nutrient content claim with its own FDA requirements (reference food, '
+            'quantified difference). An unquantified prep suggestion is fine; a comparison is not.')})
+
+    if not issues and not notes:
+        notes.append('No structure/function, comparative, or dropped-column claim concerns detected.')
+    return {'issues': issues, 'notes': notes}
 
 
 # ── Check 3: Eyemark color ────────────────────────────────────────────────────

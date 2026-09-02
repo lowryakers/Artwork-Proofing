@@ -269,10 +269,16 @@
     {% if r.checks.get('prep') is not none %}
     {{ _check_card('7','Prep Block Type',        'bi-card-checklist',     r.checks.prep,     idx, r.filename, 'prep',     dismissals, confirmations) }}
     {% endif %}
-    {% if r.checks.get('wind') is not none %}
-    {{ _check_card('8','Wind Direction',         'bi-arrow-repeat',       r.checks.wind,     idx, r.filename, 'wind',     dismissals, confirmations) }}
+    {% if r.checks.get('ingredients') is not none %}
+    {{ _check_card('8','Ingredient Statement Changes', 'bi-list-ul',      r.checks.ingredients, idx, r.filename, 'ingredients', dismissals, confirmations) }}
     {% endif %}
-    {{ _check_card('9','Print Specifications',  'bi-rulers',             r.checks.specs,    idx, r.filename, 'specs',    dismissals, confirmations) }}
+    {% if r.checks.get('claims') is not none %}
+    {{ _check_card('9','Claims Review',          'bi-patch-question',     r.checks.claims,   idx, r.filename, 'claims',   dismissals, confirmations) }}
+    {% endif %}
+    {% if r.checks.get('wind') is not none %}
+    {{ _check_card('10','Wind Direction',        'bi-arrow-repeat',       r.checks.wind,     idx, r.filename, 'wind',     dismissals, confirmations) }}
+    {% endif %}
+    {{ _check_card('11','Print Specifications', 'bi-rulers',             r.checks.specs,    idx, r.filename, 'specs',    dismissals, confirmations) }}
     </div>
 
     <!-- Manual verify items -->
@@ -1148,8 +1154,10 @@ function fileResult(r, jobId, idx) {
   checksHtml += checkCard('5','Spelling / Brand Name', 'bi-spellcheck',         checks.spelling, uid, r.filename, 'spelling', false);
   checksHtml += checkCard('6','FDA Audit Risk',         'bi-shield-exclamation', checks.fda,      uid, r.filename, 'fda',      true);
   if (checks.prep != null) checksHtml += checkCard('7','Prep Block Type','bi-card-checklist', checks.prep, uid, r.filename, 'prep', false);
-  if (checks.wind != null) checksHtml += checkCard('8','Wind Direction','bi-arrow-repeat', checks.wind, uid, r.filename, 'wind', false);
-  checksHtml += checkCard('9','Print Specifications',  'bi-rulers',             checks.specs,    uid, r.filename, 'specs',    false);
+  if (checks.ingredients != null) checksHtml += checkCard('8','Ingredient Statement Changes','bi-list-ul', checks.ingredients, uid, r.filename, 'ingredients', false);
+  if (checks.claims != null) checksHtml += checkCard('9','Claims Review','bi-patch-question', checks.claims, uid, r.filename, 'claims', false);
+  if (checks.wind != null) checksHtml += checkCard('10','Wind Direction','bi-arrow-repeat', checks.wind, uid, r.filename, 'wind', false);
+  checksHtml += checkCard('11','Print Specifications',  'bi-rulers',             checks.specs,    uid, r.filename, 'specs',    false);
 
   const content = r.error
     ? `<div class="alert alert-danger"><strong>Error:</strong> ${esc(r.error)}</div>`
