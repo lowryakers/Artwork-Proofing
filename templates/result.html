@@ -106,6 +106,15 @@
 </div>
 
 
+<!-- Master feed health — a broken/empty SKU feed must never look like a clean run -->
+{% set mf = job.get('master_feed') %}
+{% if mf and not mf.ok %}
+<div class="alert {{ 'alert-danger' if mf.level in ('error','none') else 'alert-warning' }} border d-flex align-items-center gap-2 mb-3" role="alert">
+  <i class="bi {{ 'bi-exclamation-octagon-fill' if mf.level in ('error','none') else 'bi-exclamation-triangle-fill' }} fs-5"></i>
+  <span><strong>Master list:</strong> {{ mf.message }}</span>
+</div>
+{% endif %}
+
 <!-- Dismiss tip + filter bars -->
 <div class="d-flex align-items-start gap-3 mb-3 flex-wrap">
   <div class="alert alert-light border small d-flex align-items-center gap-2 mb-0 py-2 flex-grow-1">

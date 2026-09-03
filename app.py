@@ -176,6 +176,24 @@ def _fetch_sheet_rows(csv_url: str) -> list:
     req = urllib.request.Request(csv_url, headers={'User-Agent': 'Mozilla/5.0'})
     with urllib.request.urlopen(req, timeout=15) as resp:
         content = resp.read().decode('utf-8-sig')
+
+    # A 200 response is not proof of a good feed. The master feed has answered
+    # "Not authenticated" (a plain-text 200, no HTTP error) and served login HTML;
+    # parsing either yields zero rows with no exception, so a broken feed looked
+    # exactly like an empty master list. Reject non-CSV bodies loudly so the
+    # failure surfaces instead of silently degrading every downstream check.
+    _head = content.lstrip()[:300].lower()
+    if not content.strip():
+        raise ValueError('Master feed returned an empty response.')
+    if _head.startswith(('<!doctype', '<html', '{', '[')):
+        raise ValueError('Master feed returned HTML/JSON, not CSV — likely a login or '
+                         'error page. Check the master list URL and access token.')
+    for _marker in ('not authenticated', 'unauthorized', 'access denied',
+                    'permission denied', 'sign in', 'error 401', 'error 403'):
+        if _marker in _head:
+            raise ValueError(f'Master feed responded "{_marker}" — check the ReadyDoc '
+                             'token / master list URL.')
+
     reader = _csv.DictReader(io.StringIO(content))
     rows = []
     for row in reader:
@@ -298,6 +316,40 @@ def _get_sheet_gtin_rows(force: bool = False) -> list:
         return _sheet_cache['rows'] if _sheet_cache['rows'] is not None else []
 
 
+def _master_feed_status(gtin_rows: list, from_upload: bool = False) -> dict:
+    """Health of the SKU master list for THIS proof run, so a broken or empty feed
+    can never masquerade as a clean run. A failed feed used to degrade silently:
+    GTIN, spec, and (now) fill-weight/net-weight checks simply had nothing to match
+    against, with no visible cause. This makes that state loud."""
+    cfg = _load_sheet_config()
+    has_url = bool(cfg.get('sheet_url'))
+    err = _sheet_cache.get('last_error')
+    n = len(gtin_rows or [])
+    source = ('uploaded GTIN file' if from_upload
+              else 'synced master list' if has_url else 'none')
+
+    if not from_upload and not has_url:
+        level = 'none'
+        msg = ('No master SKU list configured — GTIN, spec, and net-weight checks have '
+               'nothing to match against. Connect the master list on the SKU Master page.')
+    elif err and n == 0:
+        level = 'error'
+        msg = (f'Master list UNAVAILABLE ({err}) — proofed against 0 SKU rows. GTIN, spec, '
+               'and net-weight checks could not match. Fix the feed and re-proof.')
+    elif err and n > 0:
+        level = 'stale'
+        msg = (f'Master list refresh FAILED ({err}) — proofed against {n} cached rows, which '
+               'may be stale. Verify the feed, then re-proof for current data.')
+    elif n == 0:
+        level = 'empty'
+        msg = ('Master list returned 0 rows — GTIN, spec, and net-weight checks had nothing '
+               'to match against. Confirm the feed is serving data.')
+    else:
+        level = 'ok'
+        msg = f'Master list OK — {n} SKU rows from {source}.'
+
+    return {'ok': level == 'ok', 'level': level, 'row_count': n,
+            'error': err, 'source': source, 'message': msg}
 
 
 # ── Pages ─────────────────────────────────────────────────────────────────────
@@ -349,11 +401,13 @@ def upload():
 
     # GTIN data: uploaded file takes priority; fall back to synced Google Sheet
     gtin_rows = []
+    _used_upload = False
     if gtin_file and gtin_file.filename:
         try:
             gtin_rows = _parse_gtin_list(gtin_file.read(), gtin_file.filename)
             if gtin_rows:
                 _save_gtin_store(gtin_rows, gtin_file.filename)
+                _used_upload = True
             else:
                 flash('The uploaded GTIN file appears empty — falling back to synced sheet data.', 'warning')
         except Exception as exc:
@@ -389,6 +443,7 @@ def upload():
 
     job_id  = proof_engine.create_job([f.filename for f in artwork_files if f.filename],
                                       brand_config=prodough_config)
+    proof_engine._update_job(job_id, master_feed=_master_feed_status(gtin_rows, _used_upload))
     job_dir = os.path.join(UPLOAD_DIR, job_id)
     os.makedirs(job_dir, exist_ok=True)
 
@@ -454,6 +509,7 @@ def brand_upload():
 
     job_id  = proof_engine.create_job([f.filename for f in artwork_files if f.filename],
                                       brand_config=brand_config)
+    proof_engine._update_job(job_id, master_feed=_master_feed_status(gtin_rows, from_upload=True))
     job_dir = os.path.join(UPLOAD_DIR, job_id)
     os.makedirs(job_dir, exist_ok=True)
 
@@ -757,7 +813,18 @@ def _generate_report(job: dict, brand_name: str = 'ProDough') -> io.BytesIO:
     ws1['A2'] = f'Job: {job["id"]}'
     ws1['B2'] = f'Date: {job["created"][:10]}'
     ws1['C2'] = f'Files proofed: {len(job["results"])}'
-    ws1.append([])
+    # Master-feed health banner — a broken/empty SKU feed must be loud, not silent.
+    _mf = job.get('master_feed')
+    if _mf and not _mf.get('ok'):
+        ws1.merge_cells('A3:E3')
+        c = ws1.cell(row=3, column=1, value='⚠  MASTER LIST — ' + _mf.get('message', ''))
+        c.font = Font(bold=True, color='FFFFFF')
+        c.fill = PatternFill('solid',
+                             fgColor='C0392B' if _mf.get('level') in ('error', 'none') else 'B8860B')
+        c.alignment = Alignment(wrap_text=True, vertical='center')
+        ws1.row_dimensions[3].height = 30
+    else:
+        ws1.append([])
     for col, hdr in enumerate(['File', 'Overall Status', 'Critical', 'Warnings', 'Notes'], 1):
         c = ws1.cell(row=4, column=col, value=hdr)
         c.font = hdr_font
