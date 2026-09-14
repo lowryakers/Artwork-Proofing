@@ -66,6 +66,21 @@ def _run():
           any('not verified' in n.lower() for n in r['notes'])
           and not any('reconciles to the declared' in n.lower() for n in r['notes']))
 
+    # Regression (job ba9d3aee): an unreadable panel WITH a fill weight must not
+    # crash and must never default to PASS.
+    empty = {'serving_size_g': None, 'servings_per_container': None,
+             'declared_net_weight_g': None, 'unit_count': None,
+             'serving_size_cups': None, 'serving_size_desc': ''}
+    r = pe._check_net_weight(empty, fill_weight_g=380)
+    check('unreadable panel + fill → UNVERIFIED (no crash, never PASS)', r['status'] == 'UNVERIFIED')
+
+    # Partial panel (serving read, servings missing) + fill → not PASS.
+    r = pe._check_net_weight(
+        {'serving_size_g': 63, 'servings_per_container': None, 'declared_net_weight_g': 380,
+         'unit_count': 24, 'serving_size_cups': None, 'serving_size_desc': '4 Cupcakes'},
+        fill_weight_g=380)
+    check('partial panel + fill → not PASS', r['status'] in ('UNVERIFIED', 'SUSPECT', 'CRITICAL'))
+
     print()
     if fails:
         print('FAILURES:', *fails, sep='\n  - ')

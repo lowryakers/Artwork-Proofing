@@ -1597,6 +1597,11 @@ def _check_net_weight(panel: dict, fill_weight_g=None, fname: str = '') -> dict:
         d = _pct_off(a, b)
         return d is not None and d <= _NETWT_TOL
 
+    def _g(v):
+        # Belt-and-braces number format: a message must never crash on a None value.
+        # A wrong-looking message is recoverable; a crash discards the whole file.
+        return '—' if v is None else f'{v:g}'
+
     verified = fill is not None
     statuses = []   # sub-verdicts; overall status = the most severe
 
@@ -1607,8 +1612,8 @@ def _check_net_weight(panel: dict, fill_weight_g=None, fname: str = '') -> dict:
     # value derived from the panel rather than weighed.
     if dnw and ss and spc and abs(dnw - round(ss * spc)) < 0.5:
         issues.append({'severity': 'critical', 'message': (
-            f'Net weight appears DERIVED from the panel, not measured: declared {dnw:g}g equals '
-            f'serving × servings exactly ({ss:g} × {spc:g} = {round(ss * spc):g}). Net weight is a '
+            f'Net weight appears DERIVED from the panel, not measured: declared {_g(dnw)}g equals '
+            f'serving × servings exactly ({_g(ss)} × {_g(spc)} = {_g(round(ss * spc))}). Net weight is a '
             'measurement of contents — this exact match is the fingerprint of a back-calculated '
             '(and typically wrong) figure. Verify against actual fill weight.')})
         statuses.append('CRITICAL')
@@ -1623,13 +1628,13 @@ def _check_net_weight(panel: dict, fill_weight_g=None, fname: str = '') -> dict:
             pct = abs(diff) / fill * 100
             if diff > 0:
                 issues.append({'severity': 'critical', 'message': (
-                    f'Net weight OVERSTATED — declared {dnw:g}g but bags fill at {fill:g}g '
+                    f'Net weight OVERSTATED — declared {_g(dnw)}g but bags fill at {_g(fill)}g '
                     f'({pct:.1f}% over). Overstating net contents is materially worse than '
                     'understating — it is a short-measure / misbranding exposure. Correct the '
                     'declared net weight to the actual fill.')})
             else:
                 issues.append({'severity': 'critical', 'message': (
-                    f'Net weight understated — declared {dnw:g}g but bags fill at {fill:g}g '
+                    f'Net weight understated — declared {_g(dnw)}g but bags fill at {_g(fill)}g '
                     f'({pct:.1f}% under). Declared net weight must equal the actual fill.')})
             statuses.append('CRITICAL')
 
@@ -1640,8 +1645,8 @@ def _check_net_weight(panel: dict, fill_weight_g=None, fname: str = '') -> dict:
             # reconcile — the serving-size or servings read is the suspect, not
             # the label. Never assert a CRITICAL on a likely misread.
             issues.append({'severity': 'suspect', 'message': (
-                f'SUSPECT READ — net weight ({dnw:g}g) matches the fill, but serving × servings '
-                f'({ss:g} × {spc:g} = {implied:g}g) does not reconcile to it. The serving-size or '
+                f'SUSPECT READ — net weight ({_g(dnw)}g) matches the fill, but serving × servings '
+                f'({_g(ss)} × {_g(spc)} = {_g(implied)}g) does not reconcile to it. The serving-size or '
                 '"servings per container" value was probably misread — re-check those fields.')})
             statuses.append('SUSPECT')
         else:
@@ -1682,14 +1687,33 @@ def _check_net_weight(panel: dict, fill_weight_g=None, fname: str = '') -> dict:
             notes.append('NOT VERIFIED — could not obtain ' + ', '.join(_missing)
                          + '. Verify net weight against actual fill manually.')
 
-    # Overall status = most severe sub-verdict.
+    # Overall status = most severe sub-verdict. PASS is only earned when the panel
+    # reconciliation actually ran (implied computable). An empty statuses list with
+    # nothing computed means "no check could run" — UNVERIFIED, never PASS. "Nothing
+    # evaluated" must never read as "evaluated and fine."
     _rank = {'CRITICAL': 4, 'SUSPECT': 3, 'UNVERIFIED': 2, 'PASS': 1}
-    status = max(statuses, key=lambda s: _rank.get(s, 0)) if statuses else 'PASS'
-    if status == 'PASS' and verified:
-        notes.append(
-            f'Reconciles: net {dnw:g}g = fill {fill:g}g; {ss:g}g × {spc:g} = {implied:g}g '
-            f'(within 5% of fill).' if dnw else
-            f'Reconciles: {ss:g}g × {spc:g} = {implied:g}g ≈ fill {fill:g}g (within 5%).')
+    if statuses:
+        status = max(statuses, key=lambda s: _rank.get(s, 0))
+    elif implied is not None:
+        status = 'PASS'
+        if verified:
+            notes.append(
+                f'Reconciles: net {dnw:g}g = fill {fill:g}g; {ss:g}g × {spc:g} = {implied:g}g '
+                f'(within 5% of fill).' if dnw is not None else
+                f'Reconciles: {ss:g}g × {spc:g} = {implied:g}g ≈ fill {fill:g}g (within 5%).')
+    else:
+        # Could not compute serving × servings — reconciliation is incomplete even
+        # if the declared net weight happened to match fill.
+        status = 'UNVERIFIED'
+        if verified and dnw is not None and abs(dnw - fill) < 0.5:
+            notes.append(
+                f'NOT VERIFIED — declared net weight ({dnw:g}g) matches fill, but the serving '
+                'size or servings-per-container did not read, so the panel could not be '
+                'reconciled. Verify manually.')
+        else:
+            notes.append(
+                'NOT VERIFIED — could not read serving size, servings per container, or net '
+                'weight from this panel, so no reconciliation could run. Verify manually.')
 
     # ── Sub-check: grams of dry mix per declared unit ────────────────────────
     # Anchor on actual fill only — never derive g/unit from a front claim and use
@@ -1909,10 +1933,19 @@ def _build_label_snapshot(text: str, panel: dict, vision_nutrition: dict) -> dic
     for p in _SF_CLAIM_PATTERNS:
         for m in re.finditer(p, tl):
             sf.append(m.group(0).strip())
+    # Comparative claims are marketing copy, not ingredient names. Scan the label
+    # text with the ingredient statement REMOVED, so a standard ingredient like
+    # "Reduced Iron" (a form of elemental iron) is never read as "reduced ... iron"
+    # comparative language. Also drop known ingredient forms outright.
+    _non_ing = tl.replace(stmt.lower(), ' ') if stmt else tl
+    _ING_FORMS = ('reduced iron', 'reduced lactose')
     comp = []
     for p in _COMPARATIVE_PATTERNS:
-        for m in re.finditer(p, tl):
-            comp.append(m.group(0).strip())
+        for m in re.finditer(p, _non_ing):
+            phrase = m.group(0).strip()
+            if any(f in phrase for f in _ING_FORMS):
+                continue
+            comp.append(phrase)
     vn = vision_nutrition or {}
     return {
         'ingredients_raw': stmt,
@@ -3794,6 +3827,18 @@ def _build_summary(results: list) -> dict:
     total_crits = sum(r.get('critical_count', 0) for r in results)
     total_warns = sum(r.get('warning_count', 0) for r in results)
 
+    # Errored files produced NO checks — they are not "clean," and "0 Critical"
+    # is meaningless while any file crashed. Count and surface them separately so
+    # the dashboard can never show green over a run that half-failed.
+    errored = [r for r in results if r.get('error')]
+    errored_count = len(errored)
+    checked_count = total - errored_count
+    if errored_count:
+        run_line = (f'{total} proofed · {errored_count} errored · {checked_count} checked. '
+                    f'"0 Critical" does not apply — {errored_count} file(s) produced no results.')
+    else:
+        run_line = f'{total} proofed · {checked_count} checked.'
+
     # Verification completeness — "not checked" must never read as "checked and
     # fine." A reviewer sees, in one line, how many SKUs were fully verified.
     not_verified = [r for r in results if not r.get('fully_verified', True) and not r.get('error')]
@@ -3822,4 +3867,9 @@ def _build_summary(results: list) -> dict:
         'fully_verified_count': fully_verified_count,
         'not_fully_verified_count': len(not_verified),
         'verification_line': verification_line,
+        'errored_count': errored_count,
+        'checked_count': checked_count,
+        'errored_files': [{'file': r.get('filename', ''), 'error': str(r.get('error', ''))}
+                          for r in errored],
+        'run_line': run_line,
     }

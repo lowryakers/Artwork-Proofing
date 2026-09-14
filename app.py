@@ -858,6 +858,31 @@ def _generate_report(job: dict, brand_name: str = 'ProDough') -> io.BytesIO:
     for col in ['B', 'C', 'D', 'E']:
         ws1.column_dimensions[col].width = 14
 
+    # ── Errored files — their own section, never grey info rows ────────────────
+    # A file that crashed produced no checks. It must not read like a clean file
+    # with a note; it needs the exception text and its own place in the report.
+    _err = [r for r in job['results'] if r.get('error')]
+    if _err:
+        wse = wb.create_sheet('Errored Files', 1)
+        wse.merge_cells('A1:B1')
+        wse['A1'] = f'ERRORED FILES — {len(_err)} file(s) produced NO checks (not clean)'
+        wse['A1'].font = Font(bold=True, size=12, color='FFFFFF')
+        wse['A1'].fill = PatternFill('solid', fgColor='C0392B')
+        wse['A1'].alignment = Alignment(vertical='center')
+        wse.row_dimensions[1].height = 24
+        for col, hdr in enumerate(['File', 'Error'], 1):
+            c = wse.cell(row=3, column=col, value=hdr)
+            c.font = hdr_font
+            c.fill = hdr_blue
+            c.alignment = center
+        for ridx, r in enumerate(_err, start=4):
+            wse.cell(row=ridx, column=1, value=r.get('filename', '')).alignment = wrap
+            c = wse.cell(row=ridx, column=2, value=str(r.get('error', '')))
+            c.alignment = wrap
+            c.fill = fill_crit
+        wse.column_dimensions['A'].width = 40
+        wse.column_dimensions['B'].width = 90
+
     # ── Sheet 2: Nutrition Panel vs Net Weight ────────────────────────────────
     # Placed directly after the summary — this class of error outranks everything
     # except a wrong barcode. One row per SKU with the full reconciliation.

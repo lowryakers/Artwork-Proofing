@@ -58,6 +58,16 @@ def _run():
     clean = 'Instructions\n1. Preheat\n2. Mix\n3. Bake'
     check('7b clean sequence → no flag', not pe._check_instruction_steps(clean))
 
+    # "Reduced Iron" in the ingredient statement is a standard ingredient, not a
+    # comparative nutrition claim — must not be flagged.
+    snap = pe._build_label_snapshot(
+        'Ingredients: Enriched Flour (Reduced Iron, Niacin), Sugar, Salt.', {}, {})
+    check('reduced iron in ingredients is NOT a comparative claim',
+          not any('reduced iron' in c.lower() for c in snap['comparative_claims']))
+    # A real comparative claim in marketing copy still fires.
+    snap2 = pe._build_label_snapshot('10g more protein than the leading brand.\nIngredients: Whey.', {}, {})
+    check('genuine comparative claim still detected', bool(snap2['comparative_claims']))
+
     print()
     if fails:
         print('FAILURES:', *fails, sep='\n  - ')
