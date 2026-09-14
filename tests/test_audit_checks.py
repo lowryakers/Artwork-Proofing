@@ -58,6 +58,25 @@ def _run():
     clean = 'Instructions\n1. Preheat\n2. Mix\n3. Bake'
     check('7b clean sequence → no flag', not pe._check_instruction_steps(clean))
 
+    # Run e14f11f4 — two independent numbered lists (pancake + waffle) must NOT
+    # read as one duplicated [1,2,3,1,2,3].
+    two = ('PANCAKE INSTRUCTIONS\n1. Mix batter\n2. Heat griddle\n3. Pour batter\n'
+           'WAFFLE INSTRUCTIONS\n1. Mix batter\n2. Set waffle maker\n3. Pour into waffle maker')
+    check('two separate instruction lists → no false positive', not pe._check_instruction_steps(two))
+
+    # Anchored parse beats polluting numbers (Makes 24 / superseded 7).
+    tp = pe._parse_panel_from_text(
+        'Serving size 4 Cupcakes (63g)\nMakes 24 Cupcakes\nAbout 6 servings per container\nNet Wt 380g')
+    merged = pe._merge_panel(tp, {'servings_per_container': 24.0, 'serving_size_g': 32.0, 'unit_count': 24.0})
+    check('anchored text parse wins over vision structured servings',
+          merged['servings_per_container'] == 6.0 and merged['serving_size_g'] == 63.0)
+
+    # Net-carb gate — suspect inputs downgrade CRITICAL to SUSPECT.
+    r = pe._check_net_carbs('Total Net Carbs 16g\nTotal Carbohydrate 10g Dietary Fiber 1g '
+                            'Sugar Alcohol 0g\nIngredients: Erythritol, Whey', serving_g=40)
+    check('net carbs on suspect inputs → SUSPECT not CRITICAL',
+          any(i['severity'] == 'suspect' for i in r) and not any(i['severity'] == 'critical' for i in r))
+
     # "Reduced Iron" in the ingredient statement is a standard ingredient, not a
     # comparative nutrition claim — must not be flagged.
     snap = pe._build_label_snapshot(
