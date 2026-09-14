@@ -272,9 +272,10 @@ def _process_job(job_id: str, pdf_paths: list, gtin_rows: list, work_dir: str,
             for f in as_completed(futures):
                 f.result()  # surface any unexpected error from the worker wrapper
 
-        # Cross-file pass: flag distinct SKUs in this batch that share an
-        # ingredient statement (Check 7.4). Runs once all files are in.
+        # Cross-file passes: duplicate ingredient statements (Check 7.4) and
+        # front-value collisions across SKUs (Check E). Run once all files are in.
         _flag_duplicate_ingredients(results)
+        _flag_cross_sku_collisions(results)
 
         summary = _build_summary(results)
         _update_job(job_id, status='done', progress=100,
@@ -1009,6 +1010,13 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
             checks['specs'] = _check_print_specs(pdf_path, brand_config, matched_spec)
             if effective_wind:
                 checks['wind'] = _check_wind_direction(combined_text, effective_wind)
+
+    # Front-callout traceability (net carbs, Check D) and superseded-NFP (Fix 7a)
+    # attach to the front-vs-NFP check card when present.
+    if 'nfp' in checks and isinstance(checks['nfp'], dict):
+        extra = _check_net_carbs(label_text) + _check_superseded_nfp(_panel, matched_spec)
+        if extra:
+            checks['nfp'].setdefault('issues', []).extend(extra)
 
     # Inject spec GTIN so the UI can show detected-vs-spec comparison
     if matched_spec:
@@ -1829,8 +1837,13 @@ def _check_prep_block(text: str, panel: dict = None) -> dict:
             'quantity. Classify manually before assuming a serving-size change does or does not '
             'require prep-copy edits.')
 
+    # Structural check on the numbered instruction list (repeated/out-of-sequence
+    # steps, duplicated lines) — layout damage, independent of the classification.
+    issues.extend(_check_instruction_steps(text))
+
     return {
         'classification': classification,
+        'status': 'UNKNOWN' if classification == 'UNKNOWN' else 'OK',
         'yield': (yield_m.group(0) if yield_m else None),
         'mix_cups': mix_cups,
         'serving_cups': serving_cups,
@@ -1909,9 +1922,78 @@ def _build_label_snapshot(text: str, panel: dict, vision_nutrition: dict) -> dic
         'nfp': vn.get('nfp', {}) or {},
         'nfp_extra_columns': _detect_extra_nfp_columns(tl),
         'serving_size_g': (panel or {}).get('serving_size_g'),
+        'servings_per_container': (panel or {}).get('servings_per_container'),
         'structure_function_claims': sorted(set(sf)),
         'comparative_claims': sorted(set(comp)),
+        'dshea_disclaimer': bool(re.search(
+            r'these\s+statements\s+have\s+not\s+been\s+evaluated\s+by\s+the\s+(?:food\s+and\s+drug|fda)',
+            tl)),
     }
+
+
+def _check_net_carbs(text: str) -> list:
+    """Check D (derived value) — recompute Total Net Carbs from the CURRENT NFP
+    (total carbohydrate − dietary fiber − sugar alcohols) and compare to the front
+    'Net Carbs' claim. A derived callout must trace to the panel it ships with, not
+    to the previous artwork. Degrades to a REVIEW note if a component can't be read."""
+    issues = []
+    tl = (text or '').lower()
+    fm = re.search(r'(\d+(?:\.\d+)?)\s*g?\s*(?:total\s+)?net\s+carbs?', tl) \
+        or re.search(r'net\s+carbs?\s*[:\-]?\s*(\d+(?:\.\d+)?)', tl)
+    if not fm:
+        return issues  # no net-carb callout on this SKU
+    front_nc = float(fm.group(1))
+
+    def _grab(*pats):
+        for p in pats:
+            m = re.search(p, tl)
+            if m:
+                return float(m.group(1))
+        return None
+    total_carb = _grab(r'total\s+carb\w*\s*(\d+(?:\.\d+)?)\s*g')
+    fiber = _grab(r'(?:dietary\s+)?fib(?:er|re)\s*(\d+(?:\.\d+)?)\s*g') or 0.0
+    sugar_alc = _grab(r'sugar\s+alcohols?\s*(\d+(?:\.\d+)?)\s*g',
+                      r'erythritol\s*(\d+(?:\.\d+)?)\s*g') or 0.0
+    if total_carb is None:
+        issues.append({'severity': 'review', 'message': (
+            f'Front "Net Carbs" claim ({front_nc:g}g) could not be verified — the NFP total '
+            'carbohydrate did not read. Recompute net carbs (total carb − fiber − sugar alcohols) '
+            'from THIS panel and confirm the front figure.')})
+        return issues
+    recomputed = round(total_carb - fiber - sugar_alc, 1)
+    if abs(recomputed - front_nc) > 0.5:
+        issues.append({'severity': 'critical', 'message': (
+            f'Net Carbs mismatch: front shows {front_nc:g}g but the current NFP recomputes to '
+            f'{recomputed:g}g (total carb {total_carb:g} − fiber {fiber:g} − sugar alcohol '
+            f'{sugar_alc:g}). Recompute the derived front claim from this panel — it appears to '
+            'quote a prior revision.')})
+    return issues
+
+
+def _check_superseded_nfp(panel: dict, matched_spec: dict) -> list:
+    """Fix 7a — artwork embedding an OLD nutrition panel. Compares the servings-
+    per-container read from the artwork against the approved value on the master
+    list. A mismatch points at the root cause (a net weight derived from a stale
+    panel), not just the symptom. Degrades to nothing if no approved value exists."""
+    issues = []
+    spc = (panel or {}).get('servings_per_container')
+    approved = None
+    for k in ('approved_servings_per_container', 'approved servings per container',
+              'approved servings', 'nfp servings per container',
+              'servings per container (approved)'):
+        v = (matched_spec or {}).get(k)
+        if v not in (None, ''):
+            try:
+                approved = float(re.sub(r'[^\d.]', '', str(v)))
+                break
+            except ValueError:
+                pass
+    if spc is not None and approved and abs(spc - approved) > 0.05 * max(approved, 1):
+        issues.append({'severity': 'critical', 'message': (
+            f'Artwork is using a SUPERSEDED nutrition panel — it shows {spc:g} servings per '
+            f'container, but the approved NFP for this SKU is {approved:g}. A stale panel is the '
+            'root cause of a back-calculated net weight; drop in the current approved NFP.')})
+    return issues
 
 
 def _detect_extra_nfp_columns(tl: str) -> list:
@@ -1998,6 +2080,63 @@ def _recount_result(res: dict) -> None:
                                 if isinstance(c, dict)
                                 and str(c.get('status', '')).upper() in ('UNVERIFIED', 'UNKNOWN')]
     res['fully_verified'] = not res['unverified_checks']
+
+
+def _flag_cross_sku_collisions(results: list) -> None:
+    """Check E — a front call-out that matches ANOTHER SKU's NFP but not its own is
+    a value copied between files. When a file's front value contradicts its own NFP
+    (already a CRITICAL), name the sibling whose NFP equals that front value so the
+    designer knows where the copy came from (e.g. Pancake Chocolate's front 320 is
+    Buttermilk's calorie value)."""
+    snaps = [(r, r.get('snapshot') or {}) for r in results or [] if r.get('snapshot')]
+    for r, s in snaps:
+        fc = s.get('front_callout') or {}
+        nf = s.get('nfp') or {}
+        for field, label in (('calories', 'calorie'), ('protein_g', 'protein')):
+            fv, nv = fc.get(field), nf.get(field)
+            if fv is None or nv is None or fv == nv:
+                continue  # front agrees with its own NFP (or unreadable) — no collision
+            for r2, s2 in snaps:
+                if r2 is r:
+                    continue
+                if (s2.get('nfp') or {}).get(field) == fv:
+                    chk = r.setdefault('checks', {}).setdefault('nfp', {'issues': [], 'notes': []})
+                    chk.setdefault('issues', []).append({'severity': 'critical', 'message': (
+                        f'Cross-SKU value collision: this front {label} ({fv}) matches '
+                        f'{r2.get("filename")}\'s NFP {label} ({fv}) but not its own NFP ({nv}). '
+                        f'The value was likely copied from {r2.get("filename")}.')})
+                    _recount_result(r)
+                    break
+
+
+def _check_instruction_steps(text: str) -> list:
+    """Fix 7b — structural check on numbered instruction lists: repeated step
+    numbers, out-of-sequence numbering, identical consecutive steps. Catches
+    layout damage like the duplicated steps 2 and 3 on the buttermilk back panel."""
+    issues = []
+    lines = [ln.strip() for ln in (text or '').splitlines() if ln.strip()]
+    steps, prev = [], None
+    for ln in lines:
+        m = re.match(r'^(\d{1,2})[.)]\s+(.+)', ln)
+        if m:
+            steps.append((int(m.group(1)), m.group(2).strip().lower()))
+        if prev is not None and ln.lower() == prev and len(ln) > 12:
+            issues.append({'severity': 'warning', 'message': (
+                f'Duplicated consecutive line in the instructions: "{ln[:60]}". Often layout '
+                'damage from removing a block — verify the step list.')})
+        prev = ln.lower()
+    if steps:
+        nums = [n for n, _ in steps]
+        repeated = sorted({n for n in nums if nums.count(n) > 1})
+        if repeated:
+            issues.append({'severity': 'warning', 'message': (
+                f'Repeated instruction step number(s): {", ".join(map(str, repeated))}. '
+                'A step number appearing twice is layout damage — renumber the sequence.')})
+        seq = [n for n in nums if 1 <= n <= 20]
+        if seq and seq != sorted(seq):
+            issues.append({'severity': 'warning', 'message': (
+                f'Instruction steps out of sequence: read {seq}. Verify the numbering.')})
+    return issues
 
 
 def _flag_duplicate_ingredients(results: list) -> None:
@@ -2122,13 +2261,25 @@ def _check_claims(current: dict, prior: dict = None) -> dict:
                 'dropped — the callout appears to quote that removed column and is now '
                 'unsubstantiated. Requantify the callout against the single-column panel.')})
 
-    # 2. Structure/function claims — list for labeling review (no judgment).
+    # 2. Structure/function claims — surface for human labeling review (REVIEW,
+    #    not a verdict). On a conventional food these must derive from nutritive value.
     sf = cur.get('structure_function_claims') or []
     if sf:
-        notes.append('Structure/function claims for your labeling review (substantiation not '
-                     'checked by this tool): ' + '; '.join(f'"{c}"' for c in sf) + '.')
+        issues.append({'severity': 'review', 'message': (
+            'Structure/function claim(s) for labeling review (substantiation NOT checked by this '
+            'tool): ' + '; '.join(f'"{c}"' for c in sf) + '. On a conventional food these must '
+            'derive from nutritive value.')})
 
-    # 3. Comparative nutrition language — nutrient content claims with requirements.
+    # 3. DSHEA disclaimer (Check H) — flag for review, not as an error. It is
+    #    required only on dietary supplements making structure/function claims;
+    #    ProDough products are conventional foods, so it is not required here.
+    if cur.get('dshea_disclaimer'):
+        issues.append({'severity': 'review', 'message': (
+            'DSHEA disclaimer present ("These statements have not been evaluated by the FDA…"). '
+            'Required only on dietary SUPPLEMENTS making structure/function claims; it is not '
+            'required on a conventional food. Confirm it belongs on this product.')})
+
+    # 4. Comparative nutrition language — nutrient content claims with requirements.
     comp = cur.get('comparative_claims') or []
     for c in comp:
         issues.append({'severity': 'warning', 'message': (
@@ -2137,7 +2288,7 @@ def _check_claims(current: dict, prior: dict = None) -> dict:
             'quantified difference). An unquantified prep suggestion is fine; a comparison is not.')})
 
     if not issues and not notes:
-        notes.append('No structure/function, comparative, or dropped-column claim concerns detected.')
+        notes.append('No structure/function, comparative, DSHEA, or dropped-column claim concerns detected.')
     return {'issues': issues, 'notes': notes}
 
 
