@@ -242,6 +242,12 @@ def _fetch_sheet_rows(csv_url: str) -> list:
                                      'fill wt (g)', 'fill wt', 'fill_weight_g',
                                      'net fill weight', 'net fill (g)'))
 
+        # Approved servings-per-container from the current, approved NFP — lets the
+        # superseded-NFP check catch artwork embedding an old panel. Optional.
+        approved_servings = _to_float(_get('approved servings per container',
+                                           'approved servings', 'nfp servings per container',
+                                           'servings per container (approved)'))
+
         pms_colors  = _get('pms spot colors', 'pms colors', 'spot colors', 'pantone')
         hex_colors  = _get('hex spot colors', 'hex colors')
         eye_mark    = _get('eye mark color', 'eye mark', 'eyemark color', 'eyemark')
@@ -282,6 +288,7 @@ def _fetch_sheet_rows(csv_url: str) -> list:
             'gusset_mm':         gusset,
             'front_panel_mm':    front_panel,
             'fill_weight_g':     fill_weight,
+            'approved_servings_per_container': approved_servings,
             'wind_direction':    wind,
             'pms_spot_colors':   pms_colors,
             'hex_spot_colors':   hex_colors,
@@ -813,6 +820,13 @@ def _generate_report(job: dict, brand_name: str = 'ProDough') -> io.BytesIO:
     ws1['A2'] = f'Job: {job["id"]}'
     ws1['B2'] = f'Date: {job["created"][:10]}'
     ws1['C2'] = f'Files proofed: {len(job["results"])}'
+    # Verification completeness — one line: how many SKUs were fully checked.
+    _vline = (job.get('summary') or {}).get('verification_line')
+    if _vline:
+        cvl = ws1.cell(row=2, column=4, value=_vline)
+        cvl.alignment = Alignment(wrap_text=True, vertical='center')
+        if (job.get('summary') or {}).get('not_fully_verified_count'):
+            cvl.font = Font(bold=True, color='9C4200')
     # Master-feed health banner — a broken/empty SKU feed must be loud, not silent.
     _mf = job.get('master_feed')
     if _mf and not _mf.get('ok'):
@@ -967,11 +981,16 @@ def _generate_report(job: dict, brand_name: str = 'ProDough') -> io.BytesIO:
     for r in job['results']:
         for check_name, check in r.get('checks', {}).items():
             for i, issue in enumerate(check.get('issues', [])):
-                if is_dismissed(r['filename'], check_name, i):
-                    continue
                 sev = issue['severity']
-                vals = [r['filename'], CHECK_LABELS.get(check_name, check_name),
-                        sev.upper(), issue['message']]
+                dismissed = is_dismissed(r['filename'], check_name, i)
+                # A CRITICAL is never hidden — even if a human dismissed it, it stays
+                # visible here (annotated), and is never routed to "Reviewed OK".
+                if dismissed and sev != 'critical':
+                    continue
+                msg = issue['message']
+                if dismissed and sev == 'critical':
+                    msg = '[MARKED REVIEWED — still shown: a critical cannot be dismissed away] ' + msg
+                vals = [r['filename'], CHECK_LABELS.get(check_name, check_name), sev.upper(), msg]
                 for col, val in enumerate(vals, 1):
                     c = ws2.cell(row=row_idx, column=col, value=val)
                     c.fill = fill_crit if sev == 'critical' else fill_warn if sev == 'warning' else PatternFill()
@@ -997,6 +1016,9 @@ def _generate_report(job: dict, brand_name: str = 'ProDough') -> io.BytesIO:
             for check_name, check in r.get('checks', {}).items():
                 for i, issue in enumerate(check.get('issues', [])):
                     if not is_dismissed(r['filename'], check_name, i):
+                        continue
+                    # A CRITICAL never lands in Reviewed OK — it stays in Issues to Fix.
+                    if issue['severity'] == 'critical':
                         continue
                     vals = [r['filename'], CHECK_LABELS.get(check_name, check_name),
                             issue['severity'].upper(), issue['message']]

@@ -64,10 +64,17 @@ def _run():
     check('8.2 dropped-column callout is critical',
           any(i['severity'] == 'critical' and 'unsubstantiated' in i['message'] for i in r['issues']))
 
-    # 8.3 — structure/function claims are listed (not judged).
+    # 8.3 — structure/function claims are listed for review (REVIEW severity, not judged).
     r = pe._check_claims(_snap('Supports Digestion and Supports Immunity.'))
-    check('8.3 structure/function listed',
-          any('labeling review' in n for n in r['notes']))
+    check('8.3 structure/function listed as REVIEW',
+          any(i['severity'] == 'review' and 'labeling review' in i['message'].lower()
+              for i in r['issues']))
+
+    # 8.5 (Check H) — DSHEA disclaimer surfaces as REVIEW on a conventional food.
+    r = pe._check_claims(_snap(
+        'These statements have not been evaluated by the Food and Drug Administration.'))
+    check('Check H DSHEA disclaimer → REVIEW',
+          any(i['severity'] == 'review' and 'dshea' in i['message'].lower() for i in r['issues']))
 
     # 8.4 — comparative nutrition language is flagged.
     r = pe._check_claims(_snap('Now with 10g more protein than the leading brand.'))

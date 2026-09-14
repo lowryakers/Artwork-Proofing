@@ -115,6 +115,15 @@
 </div>
 {% endif %}
 
+<!-- Verification completeness — "not checked" must never read as "checked and fine" -->
+{% set vsum = job.get('summary') or {} %}
+{% if vsum.get('not_fully_verified_count') %}
+<div class="alert alert-warning border d-flex align-items-center gap-2 mb-3" role="alert">
+  <i class="bi bi-patch-exclamation-fill fs-5"></i>
+  <span><strong>Not fully verified:</strong> {{ vsum.verification_line }}</span>
+</div>
+{% endif %}
+
 <!-- Dismiss tip + filter bars -->
 <div class="d-flex align-items-start gap-3 mb-3 flex-wrap">
   <div class="alert alert-light border small d-flex align-items-center gap-2 mb-0 py-2 flex-grow-1">
@@ -353,6 +362,8 @@
 {% set notes  = check.get('notes',  []) %}
 {% set crits  = issues | selectattr('severity','equalto','critical') | list %}
 {% set warns  = issues | selectattr('severity','equalto','warning')  | list %}
+{% set suspects = issues | selectattr('severity','equalto','suspect') | list %}
+{% set reviews  = issues | selectattr('severity','equalto','review')  | list %}
 {% set infos  = issues | selectattr('severity','equalto','info')     | list %}
 {% set card_id = 'chk' ~ num ~ '_' ~ idx %}
 
@@ -369,6 +380,8 @@
     <span class="fw-semibold small flex-grow-1">Check {{ num }}: {{ title }}</span>
     {% if   crits %}<span class="badge bg-danger">{{ crits|length }} critical</span>
     {% elif warns %}<span class="badge bg-warning text-dark">{{ warns|length }} warnings</span>
+    {% elif suspects %}<span class="badge bg-secondary">{{ suspects|length }} suspect read</span>
+    {% elif reviews %}<span class="badge bg-primary">{{ reviews|length }} review</span>
     {% elif infos %}<span class="badge bg-info text-dark">{{ infos|length }} notes</span>
     {% else        %}<span class="badge bg-success">OK</span>
     {% endif %}
@@ -389,6 +402,8 @@
           {% if confirmed %}bi-check-circle-fill text-success
           {% elif issue.severity == 'critical' %}bi-x-circle-fill text-danger
           {% elif issue.severity == 'warning' %}bi-exclamation-triangle-fill text-warning
+          {% elif issue.severity == 'suspect' %}bi-question-circle-fill text-secondary
+          {% elif issue.severity == 'review' %}bi-eye-fill text-primary
           {% else %}bi-info-circle-fill text-info{% endif %}
           flex-shrink-0 mt-1"></i>
         <span class="flex-grow-1">{{ issue.message }}</span>
