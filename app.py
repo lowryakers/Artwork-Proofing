@@ -40,10 +40,14 @@ ALLOWED_EXTS = {'.pdf', '.ai', '.png', '.jpg', '.jpeg', '.tiff', '.tif', '.eps'}
 
 CHECK_LABELS = {
     'gtin':     'GTIN / Barcode',
+    'netwt':    'Nutrition Panel vs Net Weight',
     'nfp':      'Front Call-Out vs NFP',
     'eyemark':  'Eyemark Contrast',
     'spelling': 'Spelling / Brand Name',
     'fda':      'FDA Audit Risk',
+    'prep':     'Prep Block Type',
+    'ingredients': 'Ingredient Statement Changes',
+    'claims':   'Claims Review',
     'wind':     'Wind Direction',
     'specs':    'Print Specs',
 }
@@ -172,6 +176,24 @@ def _fetch_sheet_rows(csv_url: str) -> list:
     req = urllib.request.Request(csv_url, headers={'User-Agent': 'Mozilla/5.0'})
     with urllib.request.urlopen(req, timeout=15) as resp:
         content = resp.read().decode('utf-8-sig')
+
+    # A 200 response is not proof of a good feed. The master feed has answered
+    # "Not authenticated" (a plain-text 200, no HTTP error) and served login HTML;
+    # parsing either yields zero rows with no exception, so a broken feed looked
+    # exactly like an empty master list. Reject non-CSV bodies loudly so the
+    # failure surfaces instead of silently degrading every downstream check.
+    _head = content.lstrip()[:300].lower()
+    if not content.strip():
+        raise ValueError('Master feed returned an empty response.')
+    if _head.startswith(('<!doctype', '<html', '{', '[')):
+        raise ValueError('Master feed returned HTML/JSON, not CSV — likely a login or '
+                         'error page. Check the master list URL and access token.')
+    for _marker in ('not authenticated', 'unauthorized', 'access denied',
+                    'permission denied', 'sign in', 'error 401', 'error 403'):
+        if _marker in _head:
+            raise ValueError(f'Master feed responded "{_marker}" — check the ReadyDoc '
+                             'token / master list URL.')
+
     reader = _csv.DictReader(io.StringIO(content))
     rows = []
     for row in reader:
@@ -212,6 +234,14 @@ def _fetch_sheet_rows(csv_url: str) -> list:
         wind_raw    = _get('wind direction', 'wind', 'winding')
         wind        = re.sub(r'[^\d]', '', wind_raw)[:1]
 
+        # Actual fill weight per the production formula — the external truth the
+        # nutrition-panel-vs-net-weight check reconciles against. Not on the
+        # artwork; it belongs here in the master list next to the rest of the SKU
+        # data. Absent for a SKU → that check degrades to UNVERIFIED.
+        fill_weight = _to_float(_get('fill weight (g)', 'fill weight', 'fill weight g',
+                                     'fill wt (g)', 'fill wt', 'fill_weight_g',
+                                     'net fill weight', 'net fill (g)'))
+
         pms_colors  = _get('pms spot colors', 'pms colors', 'spot colors', 'pantone')
         hex_colors  = _get('hex spot colors', 'hex colors')
         eye_mark    = _get('eye mark color', 'eye mark', 'eyemark color', 'eyemark')
@@ -251,6 +281,7 @@ def _fetch_sheet_rows(csv_url: str) -> list:
             'trim_width_mm':     trim_width,
             'gusset_mm':         gusset,
             'front_panel_mm':    front_panel,
+            'fill_weight_g':     fill_weight,
             'wind_direction':    wind,
             'pms_spot_colors':   pms_colors,
             'hex_spot_colors':   hex_colors,
@@ -285,6 +316,40 @@ def _get_sheet_gtin_rows(force: bool = False) -> list:
         return _sheet_cache['rows'] if _sheet_cache['rows'] is not None else []
 
 
+def _master_feed_status(gtin_rows: list, from_upload: bool = False) -> dict:
+    """Health of the SKU master list for THIS proof run, so a broken or empty feed
+    can never masquerade as a clean run. A failed feed used to degrade silently:
+    GTIN, spec, and (now) fill-weight/net-weight checks simply had nothing to match
+    against, with no visible cause. This makes that state loud."""
+    cfg = _load_sheet_config()
+    has_url = bool(cfg.get('sheet_url'))
+    err = _sheet_cache.get('last_error')
+    n = len(gtin_rows or [])
+    source = ('uploaded GTIN file' if from_upload
+              else 'synced master list' if has_url else 'none')
+
+    if not from_upload and not has_url:
+        level = 'none'
+        msg = ('No master SKU list configured — GTIN, spec, and net-weight checks have '
+               'nothing to match against. Connect the master list on the SKU Master page.')
+    elif err and n == 0:
+        level = 'error'
+        msg = (f'Master list UNAVAILABLE ({err}) — proofed against 0 SKU rows. GTIN, spec, '
+               'and net-weight checks could not match. Fix the feed and re-proof.')
+    elif err and n > 0:
+        level = 'stale'
+        msg = (f'Master list refresh FAILED ({err}) — proofed against {n} cached rows, which '
+               'may be stale. Verify the feed, then re-proof for current data.')
+    elif n == 0:
+        level = 'empty'
+        msg = ('Master list returned 0 rows — GTIN, spec, and net-weight checks had nothing '
+               'to match against. Confirm the feed is serving data.')
+    else:
+        level = 'ok'
+        msg = f'Master list OK — {n} SKU rows from {source}.'
+
+    return {'ok': level == 'ok', 'level': level, 'row_count': n,
+            'error': err, 'source': source, 'message': msg}
 
 
 # ── Pages ─────────────────────────────────────────────────────────────────────
@@ -336,11 +401,13 @@ def upload():
 
     # GTIN data: uploaded file takes priority; fall back to synced Google Sheet
     gtin_rows = []
+    _used_upload = False
     if gtin_file and gtin_file.filename:
         try:
             gtin_rows = _parse_gtin_list(gtin_file.read(), gtin_file.filename)
             if gtin_rows:
                 _save_gtin_store(gtin_rows, gtin_file.filename)
+                _used_upload = True
             else:
                 flash('The uploaded GTIN file appears empty — falling back to synced sheet data.', 'warning')
         except Exception as exc:
@@ -376,6 +443,7 @@ def upload():
 
     job_id  = proof_engine.create_job([f.filename for f in artwork_files if f.filename],
                                       brand_config=prodough_config)
+    proof_engine._update_job(job_id, master_feed=_master_feed_status(gtin_rows, _used_upload))
     job_dir = os.path.join(UPLOAD_DIR, job_id)
     os.makedirs(job_dir, exist_ok=True)
 
@@ -441,6 +509,7 @@ def brand_upload():
 
     job_id  = proof_engine.create_job([f.filename for f in artwork_files if f.filename],
                                       brand_config=brand_config)
+    proof_engine._update_job(job_id, master_feed=_master_feed_status(gtin_rows, from_upload=True))
     job_dir = os.path.join(UPLOAD_DIR, job_id)
     os.makedirs(job_dir, exist_ok=True)
 
@@ -744,7 +813,18 @@ def _generate_report(job: dict, brand_name: str = 'ProDough') -> io.BytesIO:
     ws1['A2'] = f'Job: {job["id"]}'
     ws1['B2'] = f'Date: {job["created"][:10]}'
     ws1['C2'] = f'Files proofed: {len(job["results"])}'
-    ws1.append([])
+    # Master-feed health banner — a broken/empty SKU feed must be loud, not silent.
+    _mf = job.get('master_feed')
+    if _mf and not _mf.get('ok'):
+        ws1.merge_cells('A3:E3')
+        c = ws1.cell(row=3, column=1, value='⚠  MASTER LIST — ' + _mf.get('message', ''))
+        c.font = Font(bold=True, color='FFFFFF')
+        c.fill = PatternFill('solid',
+                             fgColor='C0392B' if _mf.get('level') in ('error', 'none') else 'B8860B')
+        c.alignment = Alignment(wrap_text=True, vertical='center')
+        ws1.row_dimensions[3].height = 30
+    else:
+        ws1.append([])
     for col, hdr in enumerate(['File', 'Overall Status', 'Critical', 'Warnings', 'Notes'], 1):
         c = ws1.cell(row=4, column=col, value=hdr)
         c.font = hdr_font
@@ -764,7 +844,118 @@ def _generate_report(job: dict, brand_name: str = 'ProDough') -> io.BytesIO:
     for col in ['B', 'C', 'D', 'E']:
         ws1.column_dimensions[col].width = 14
 
-    # ── Sheet 2: Issues to Fix (non-dismissed) ────────────────────────────────
+    # ── Sheet 2: Nutrition Panel vs Net Weight ────────────────────────────────
+    # Placed directly after the summary — this class of error outranks everything
+    # except a wrong barcode. One row per SKU with the full reconciliation.
+    def _g(v):
+        return '' if v in (None, '') else (f'{v:g}' if isinstance(v, (int, float)) else v)
+
+    nw_rows = [(r['filename'], r.get('checks', {}).get('netwt'))
+               for r in job['results'] if r.get('checks', {}).get('netwt')]
+    if nw_rows:
+        wsn = wb.create_sheet('Net Weight', 1)
+        n_fail = sum(1 for _, nw in nw_rows if nw.get('status') == 'FAIL')
+        n_unv  = sum(1 for _, nw in nw_rows if nw.get('status') == 'UNVERIFIED')
+        wsn.merge_cells('A1:H1')
+        wsn['A1'] = 'NUTRITION PANEL vs NET WEIGHT (must reconcile before print)'
+        wsn['A1'].font = Font(bold=True, size=12)
+        if n_fail:
+            banner = f'{n_fail} SKU(s) DO NOT reconcile — see rows below.'
+        elif n_unv:
+            banner = f'All computable panels reconcile; {n_unv} SKU(s) checked against declared net weight only (no fill weight supplied).'
+        else:
+            banner = 'All panels reconcile to actual fill weight.'
+        wsn.merge_cells('A2:H2')
+        wsn['A2'] = banner
+        hdrs = ['File', 'Serving (g)', 'Servings/Container', 'Implied Total (g)',
+                'Declared Net (g)', 'Actual Fill (g)', 'Status', 'Diagnosis / Notes']
+        for col, hdr in enumerate(hdrs, 1):
+            c = wsn.cell(row=4, column=col, value=hdr)
+            c.font = hdr_font
+            c.fill = hdr_blue
+            c.alignment = center
+        row_idx = 5
+        for fname, nw in nw_rows:
+            diag = nw.get('diagnosis') or (nw.get('notes') or [''])[0]
+            vals = [fname, _g(nw.get('serving_size_g')), _g(nw.get('servings_per_container')),
+                    _g(nw.get('implied_total_g')), _g(nw.get('declared_net_weight_g')),
+                    _g(nw.get('actual_fill_weight_g')), nw.get('status', ''), diag]
+            for col, val in enumerate(vals, 1):
+                c = wsn.cell(row=row_idx, column=col, value=val)
+                c.alignment = wrap if col == 8 else center
+            st = nw.get('status')
+            fillc = fill_crit if st == 'FAIL' else fill_warn if st == 'UNVERIFIED' else fill_ok
+            for col in range(1, 9):
+                wsn.cell(row=row_idx, column=col).fill = fillc
+            row_idx += 1
+        for col, w in zip('ABCDEFGH', [40, 11, 16, 15, 14, 13, 12, 70]):
+            wsn.column_dimensions[col].width = w
+
+    # ── Sheet: Prep Block Classification ──────────────────────────────────────
+    # Per-serving prep must be revised on a serving-size change; batch prep must
+    # not. This tells the designer which SKUs actually need prep-copy edits.
+    prep_rows = [(r['filename'], r.get('checks', {}).get('prep'))
+                 for r in job['results'] if r.get('checks', {}).get('prep')]
+    if prep_rows:
+        wsp = wb.create_sheet('Prep Blocks')
+        wsp.merge_cells('A1:C1')
+        wsp['A1'] = 'PREP BLOCK CLASSIFICATION'
+        wsp['A1'].font = Font(bold=True, size=12)
+        for col, hdr in enumerate(['File', 'Type', 'Detail'], 1):
+            c = wsp.cell(row=3, column=col, value=hdr)
+            c.font = hdr_font
+            c.fill = hdr_blue
+            c.alignment = center
+        ridx = 4
+        for fname, prep in prep_rows:
+            cls = (prep.get('classification') or 'undetermined')
+            detail = (prep.get('notes') or [''])[0]
+            for col, val in enumerate([fname, cls.upper(), detail], 1):
+                c = wsp.cell(row=ridx, column=col, value=val)
+                c.alignment = wrap if col == 3 else center
+            ridx += 1
+        for col, w in zip('ABC', [40, 14, 90]):
+            wsp.column_dimensions[col].width = w
+
+    # ── Sheets: revision-comparison findings (ingredients, claims) ────────────
+    def _findings_sheet(title, heading, check_key):
+        rows = []
+        for r in job['results']:
+            chk = r.get('checks', {}).get(check_key)
+            if not chk:
+                continue
+            lines = ([f'[{i["severity"].upper()}] {i["message"]}' for i in chk.get('issues', [])]
+                     + list(chk.get('notes', [])))
+            for line in lines:
+                rows.append((r['filename'], line))
+        if not rows:
+            return
+        ws = wb.create_sheet(title)
+        ws.merge_cells('A1:B1')
+        ws['A1'] = heading
+        ws['A1'].font = Font(bold=True, size=12)
+        for col, hdr in enumerate(['File', 'Finding'], 1):
+            c = ws.cell(row=3, column=col, value=hdr)
+            c.font = hdr_font
+            c.fill = hdr_blue
+            c.alignment = center
+        ridx = 4
+        for fname, line in rows:
+            ws.cell(row=ridx, column=1, value=fname).alignment = center
+            c = ws.cell(row=ridx, column=2, value=line)
+            c.alignment = wrap
+            if line.startswith('[CRITICAL]'):
+                c.fill = fill_crit
+            elif line.startswith('[WARNING]'):
+                c.fill = fill_warn
+            ridx += 1
+        ws.column_dimensions['A'].width = 40
+        ws.column_dimensions['B'].width = 100
+
+    _findings_sheet('Ingredient Changes', 'INGREDIENT STATEMENT CHANGES', 'ingredients')
+    _findings_sheet('Claims Review', 'CLAIMS REVIEW', 'claims')
+
+    # ── Sheet: Issues to Fix (non-dismissed) ──────────────────────────────────
     ws2 = wb.create_sheet('Issues to Fix')
     for col, hdr in enumerate(['File', 'Check', 'Severity', 'Issue / Required Action'], 1):
         c = ws2.cell(row=1, column=col, value=hdr)

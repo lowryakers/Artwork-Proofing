@@ -272,6 +272,10 @@ def _process_job(job_id: str, pdf_paths: list, gtin_rows: list, work_dir: str,
             for f in as_completed(futures):
                 f.result()  # surface any unexpected error from the worker wrapper
 
+        # Cross-file pass: flag distinct SKUs in this batch that share an
+        # ingredient statement (Check 7.4). Runs once all files are in.
+        _flag_duplicate_ingredients(results)
+
         summary = _build_summary(results)
         _update_job(job_id, status='done', progress=100,
                     results=results, summary=summary, current_file='')
@@ -507,7 +511,15 @@ def _claude_vision_ocr(img_path: str) -> dict:
             '"detected": ["<lowercase FALCPA allergens present in the ingredients/declarations: '
             'milk, egg, fish, shellfish, tree nut, peanut, wheat, soybean, sesame>"]},\n'
             '  "eyemark": {"present": <true or false>, "color": "<black, white, or other, '
-            'or null if none>"}\n'
+            'or null if none>"},\n'
+            '  "panel": {"serving_size_g": <grams in the serving-size line, e.g. 98 from '
+            '"3/4 Cup (98g)", or null>, "serving_size_desc": "<the unit portion, e.g. '
+            '\\"3/4 Cup\\", \\"2 Cupcakes\\", \\"4 crepes\\", or null>", '
+            '"serving_size_cups": <the cup quantity as a decimal if the serving is given in cups, '
+            'e.g. 0.75 for 3/4 cup, else null>, "servings_per_container": <number, e.g. 7; parse '
+            '"about 4.5" as 4.5, or null>, "net_weight_g": <grams from the front Net Wt line, e.g. '
+            '454 from "Net Wt 1lb (16oz) 454g", or null>, "unit_count": <number from a front '
+            '"Makes N ..." yield, e.g. 24 from "Makes 24 Cupcakes", or null>}\n'
             '}\n\n'
             'front_callout = the big circular badge numbers on the FRONT of the pack '
             '(e.g. "130 Calories Per Serving", "25G Protein Per Serving", "0G Added Sugar"). '
@@ -532,6 +544,12 @@ def _claude_vision_ocr(img_path: str) -> dict:
             'present and its fill color. This is NOT the barcode and NOT a color swatch — it is a '
             'single small filled block at the trim edge. If you cannot clearly see one, set '
             'present=false and color=null.\n'
+            'panel = the serving-size line and container size, read precisely from the '
+            'Nutrition Facts panel and the front net-weight declaration. serving_size_g is the '
+            'grams in parentheses on the "Serving size" line; servings_per_container is the '
+            '"servings per container" count (strip the word "about"); net_weight_g is the metric '
+            'net weight on the front; unit_count is only from an explicit "Makes N" yield. Convert '
+            'all weights to grams (1 oz = 28.35g, 1 lb = 453.6g) and report grams only.\n'
             'Use null for any value not visible. Numbers only (no units) for nutrition.'
         )})
 
@@ -611,12 +629,31 @@ def _parse_vision_json(txt: str) -> dict:
             out['present'] = bool(e.get('present')) or ('color' in out)
             return out
 
+        def _clean_panel(p):
+            if not isinstance(p, dict):
+                return {}
+            out = {}
+            for k in ('serving_size_g', 'serving_size_cups', 'servings_per_container',
+                      'net_weight_g', 'unit_count'):
+                v = p.get(k)
+                if isinstance(v, (int, float)):
+                    out[k] = float(v)
+                elif isinstance(v, str):
+                    m = re.search(r'-?\d+(?:\.\d+)?', v)
+                    if m:
+                        out[k] = float(m.group(0))
+            desc = p.get('serving_size_desc')
+            if isinstance(desc, str) and desc.strip() and desc.strip().lower() not in ('null', 'none'):
+                out['serving_size_desc'] = desc.strip()
+            return out
+
         return {
             'raw_text': str(_data.get('raw_text', '')) or txt,
             'front_callout': _clean(_data.get('front_callout', {})),
             'nfp': _clean(_data.get('nfp', {})),
             'allergens': _clean_allergens(_data.get('allergens', {})),
             'eyemark': _clean_eyemark(_data.get('eyemark', {})),
+            'panel': _clean_panel(_data.get('panel', {})),
             '_parsed': True,
         }
     except Exception:
@@ -828,6 +865,7 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
     vision_nutrition = None
     vision_allergens = None
     vision_eyemark = None
+    vision_panel = None
     _vision_diag = ''
     # Gate Claude Vision on whether the nutrition content actually came through —
     # not raw word count. Outlined-text PDFs yield garbage; reverse/mirror-printed
@@ -866,12 +904,14 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
         }
         vision_allergens = _vision.get('allergens', {})
         vision_eyemark = _vision.get('eyemark', {})
-        _vision_diag = 'vision: {} | front={} nfp={} allergens={} eyemark={}'.format(
+        vision_panel = _vision.get('panel', {})
+        _vision_diag = 'vision: {} | front={} nfp={} allergens={} eyemark={} panel={}'.format(
             _vision.get('status', '?'),
             _vision.get('front_callout', {}),
             _vision.get('nfp', {}),
             _vision.get('allergens', {}),
             _vision.get('eyemark', {}),
+            _vision.get('panel', {}),
         )
 
     combined_text = (
@@ -919,14 +959,33 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
         brand_config.get('required_eyemark_color', '')
     ).strip().lower() if matched_spec else brand_config.get('required_eyemark_color', '').strip().lower()
 
+    # Nutrition-panel reconciliation inputs: the OCR text read overlaid with the
+    # authoritative vision panel, plus the external fill weight from the master list
+    # (spec sheet > brand_config). Fill weight absent → the check runs UNVERIFIED.
+    _panel = _merge_panel(_parse_panel_from_text(label_text), vision_panel)
+    _fill_weight = (matched_spec.get('fill_weight_g') if matched_spec else None)
+    if _fill_weight is None:
+        _fill_weight = brand_config.get('fill_weight_g')
+
+    # Revision comparison (Checks 7 & 8): snapshot this label's content and pull
+    # the prior proofed version for this SKU from stored history (ReadyDoc → local).
+    _snapshot = _build_label_snapshot(label_text, _panel, vision_nutrition)
+    _gtin_lookup = barcode_gtins[0] if (barcode_gtins and len(set(barcode_gtins)) == 1) else None
+    _sku_lookup = matched_spec.get('sku') if matched_spec else None
+    _prior_snapshot = _fetch_prior_snapshot(_gtin_lookup, _sku_lookup)
+
     if brand_mode == 'generic':
         is_film = brand_config.get('packaging_type', 'other') == 'stick'
         brand_name = brand_config.get('brand_name', '')
         checks = {
             'gtin':     _check_gtin(combined_text, fname, gtin_rows, barcode_gtins),
+            'netwt':    _check_net_weight(_panel, fill_weight_g=_fill_weight, fname=fname),
             'eyemark':  _check_eyemark(img, is_film, fname, required_eyemark, vision_eyemark=vision_eyemark),
             'spelling': _check_spelling_generic(label_text, brand_name),
             'fda':      _check_fda_light(label_text, fname),
+            'prep':     _check_prep_block(label_text, _panel),
+            'ingredients': _check_ingredient_drift(_snapshot, _prior_snapshot),
+            'claims':   _check_claims(_snapshot, _prior_snapshot),
             'specs':    _check_print_specs(pdf_path, brand_config, matched_spec),
         }
         if is_film:
@@ -936,10 +995,14 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
         proof_type = brand_config.get('proof_type', 'press')
         checks = {
             'gtin':     _check_gtin(combined_text, fname, gtin_rows, barcode_gtins),
+            'netwt':    _check_net_weight(_panel, fill_weight_g=_fill_weight, fname=fname),
             'nfp':      _check_nfp(label_text, front_text=ocr_left + '\n' + ocr_inv_left + '\n' + ocr_inv_right, vision_nutrition=vision_nutrition),
             'eyemark':  _check_eyemark(img, is_film, fname, required_eyemark, vision_eyemark=vision_eyemark),
             'spelling': _check_spelling(label_text, fname),
             'fda':      _check_fda(label_text, fname, vision_allergens=vision_allergens),
+            'prep':     _check_prep_block(label_text, _panel),
+            'ingredients': _check_ingredient_drift(_snapshot, _prior_snapshot),
+            'claims':   _check_claims(_snapshot, _prior_snapshot),
         }
         # Print Specs and Wind Direction are press-proof checks — skip for art proofs
         if proof_type != 'art':
@@ -978,6 +1041,7 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
         'info_count': len(infos),
         'error': None,
         'matched_spec': matched_spec,
+        'snapshot': _snapshot,
         'page_rotation': page_rotation,
     }
 
@@ -1360,6 +1424,616 @@ def _check_nfp(ocr_text: str, front_text: str = '', vision_nutrition: dict = Non
         'issues': issues,
         'notes': notes,
     }
+
+
+# ── Check: Nutrition panel reconciles to net weight ───────────────────────────
+# The highest-value check. Serving size, servings-per-container, and net weight
+# can all agree with each other on the printed panel yet describe a bag that is
+# not the one being filled — internally consistent, invisible to visual review.
+# The only way to catch it is arithmetic against a REAL fill weight sourced from
+# outside the artwork (the master-list FILL WEIGHT column).
+#
+#     implied_total = serving_size_g × servings_per_container
+#
+# compared against declared net weight (internal consistency) AND actual fill
+# weight (the dangerous case). Any mismatch beyond tolerance is CRITICAL.
+
+_NETWT_TOL = 0.05          # 5% — separates real 50-100% errors from FDA serving rounding
+_CUP_G     = 130.0         # ProDough dry blends ≈ 130 g per cup
+_CUP_TOL   = 0.20          # 20% band on the cup→gram density sanity check
+
+
+def _frac_to_float(s):
+    """Parse '3/4', '1 1/2', or '0.75' → float; None if unparseable."""
+    s = (s or '').strip()
+    m = re.match(r'^(\d+)\s+(\d+)\s*/\s*(\d+)$', s)      # mixed number "1 1/2"
+    if m:
+        return int(m.group(1)) + int(m.group(2)) / int(m.group(3))
+    m = re.match(r'^(\d+)\s*/\s*(\d+)$', s)              # simple fraction "3/4"
+    if m and int(m.group(2)):
+        return int(m.group(1)) / int(m.group(2))
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def _parse_panel_from_text(text: str) -> dict:
+    """Best-effort read of the serving/net-weight fields from OCR text — a
+    fallback for when Claude Vision did not supply the structured panel block."""
+    tl = (text or '').lower()
+    out = {}
+
+    # Serving size grams — grams in parentheses on/near the "serving size" line.
+    m = re.search(r'serving\s+size[^\n]{0,50}?\(?\s*(\d{1,4})\s*g\b', tl)
+    if m:
+        out['serving_size_g'] = float(m.group(1))
+    # Cups on the serving-size line ("3/4 Cup", "1 1/2 cups").
+    mc = re.search(r'serving\s+size[^\n]{0,50}?(\d+\s+\d+\s*/\s*\d+|\d+\s*/\s*\d+|\d+(?:\.\d+)?)\s*cups?\b', tl)
+    if mc:
+        _c = _frac_to_float(mc.group(1))
+        if _c:
+            out['serving_size_cups'] = _c
+    # Servings per container ("about 7 servings per container", either order).
+    ms = (re.search(r'(?:about\s+)?(\d+(?:\.\d+)?)\s+servings?\s+per\s+container', tl)
+          or re.search(r'servings?\s+per\s+container[:\s]+(?:about\s+)?(\d+(?:\.\d+)?)', tl))
+    if ms:
+        out['servings_per_container'] = float(ms.group(1))
+    # Net weight — prefer an explicit gram figure, else convert oz/lb.
+    mn = re.search(r'net\s*wt\.?[^\n]{0,40}?(\d{1,4}(?:\.\d+)?)\s*g\b', tl)
+    if mn:
+        out['net_weight_g'] = float(mn.group(1))
+    else:
+        moz = re.search(r'net\s*wt\.?[^\n]{0,30}?(\d{1,3}(?:\.\d+)?)\s*oz\b', tl)
+        mlb = re.search(r'net\s*wt\.?[^\n]{0,30}?(\d{1,2}(?:\.\d+)?)\s*lbs?\b', tl)
+        if moz:
+            out['net_weight_g'] = round(float(moz.group(1)) * 28.35, 1)
+        elif mlb:
+            out['net_weight_g'] = round(float(mlb.group(1)) * 453.6, 1)
+    # Front unit yield ("Makes 24 Cupcakes", "Makes about 21 Pancakes").
+    mu = re.search(r'makes\s+(?:about\s+)?(\d{1,3})\s+[a-z]', tl)
+    if mu:
+        out['unit_count'] = float(mu.group(1))
+    return out
+
+
+def _merge_panel(text_panel: dict, vision_panel: dict) -> dict:
+    """Combine OCR-parsed and vision-parsed panels — vision is authoritative on
+    outlined/reverse art, so it wins where present; OCR fills the gaps."""
+    out = dict(text_panel or {})
+    for k, v in (vision_panel or {}).items():
+        if v is not None:
+            out[k] = v
+    # Normalize the key the check expects for declared net weight.
+    if 'net_weight_g' in out and 'declared_net_weight_g' not in out:
+        out['declared_net_weight_g'] = out['net_weight_g']
+    return out
+
+
+def _pct_off(a, b):
+    """Relative difference of a from reference b, or None if not computable."""
+    if not a or not b:
+        return None
+    return abs(a - b) / float(b)
+
+
+def _check_net_weight(panel: dict, fill_weight_g=None, fname: str = '') -> dict:
+    """Reconcile the nutrition panel against net weight and real fill weight.
+
+    panel: serving_size_g, serving_size_desc, servings_per_container,
+           declared_net_weight_g, unit_count, serving_size_cups (any may be None).
+    fill_weight_g: actual fill per the production formula (external truth) or None.
+
+    Returns the usual {issues, notes, ...} plus structured fields the report and
+    UI card render. Status is PASS / FAIL / UNVERIFIED.
+    """
+    issues, notes = [], []
+
+    ss   = panel.get('serving_size_g')
+    spc  = panel.get('servings_per_container')
+    dnw  = panel.get('declared_net_weight_g')
+    fill = fill_weight_g
+    unit_count = panel.get('unit_count')
+    cups = panel.get('serving_size_cups')
+    desc = (panel.get('serving_size_desc') or '').strip()
+
+    implied = round(ss * spc, 1) if (ss and spc) else None
+
+    def _within(a, b):
+        d = _pct_off(a, b)
+        return d is not None and d <= _NETWT_TOL
+
+    # ── Core reconciliation ──────────────────────────────────────────────────
+    # Collect every comparison we can actually make, then decide severity.
+    fail_reasons = []          # human-readable mismatch lines
+    diagnosis = None           # single best root-cause line
+
+    imp_vs_dec  = _within(implied, dnw)  if (implied is not None and dnw) else None
+    imp_vs_fill = _within(implied, fill) if (implied is not None and fill) else None
+    dec_vs_fill = _within(dnw, fill)     if (dnw and fill) else None
+
+    if imp_vs_dec is False:
+        fail_reasons.append(
+            f'NFP implies {implied:g}g ({ss:g}g × {spc:g}) but net weight declares {dnw:g}g.')
+    if imp_vs_fill is False:
+        fail_reasons.append(
+            f'NFP implies {implied:g}g but the real fill weight is {fill:g}g.')
+    if dec_vs_fill is False:
+        fail_reasons.append(
+            f'Declared net weight {dnw:g}g does not match the real fill weight {fill:g}g.')
+
+    # ── Diagnose which input is wrong (brief's decision table) ───────────────
+    if fill:
+        r_imp = (implied / fill) if implied else None
+        r_dec = (dnw / fill) if dnw else None
+        if r_imp is not None and 0.40 <= r_imp <= 0.60:
+            factor = round(fill / implied, 1) if implied else 2
+            corrected = round(fill / spc, 1) if spc else None
+            diagnosis = (
+                f'Serving weight looks understated ~{factor:g}×. '
+                + (f'It should be about {corrected:g}g (fill {fill:g}g ÷ {spc:g} servings). '
+                   if corrected else '')
+                + 'EVERY per-serving nutrition value on this panel is understated by the same factor.')
+        elif r_imp is not None and 1.35 <= r_imp <= 1.70:
+            corrected = round(fill / ss, 1) if ss else None
+            diagnosis = (
+                f'Implied total is ~{r_imp:.2g}× the real fill — servings-per-container '
+                'likely carried over from a prior revision after the serving size changed. '
+                + (f'It should be about {corrected:g} servings (fill {fill:g}g ÷ {ss:g}g).'
+                   if corrected else ''))
+        elif r_dec is not None and 1.75 <= r_dec <= 2.25:
+            diagnosis = (
+                f'Net weight declaration is ~{r_dec:.2g}× the real fill — the panel describes a '
+                'container about twice the size actually filled (often a copy-paste from another '
+                f'SKU or a prior revision). Net weight should be about {fill:g}g.')
+        elif r_imp is not None and 1.75 <= r_imp <= 2.25:
+            corrected = round(fill / ss, 1) if ss else None
+            diagnosis = (
+                f'Implied total is ~{r_imp:.2g}× the real fill — serving size or servings count '
+                'describes about twice the real fill. '
+                + (f'Servings should be about {corrected:g} (fill {fill:g}g ÷ {ss:g}g).'
+                   if corrected else ''))
+
+    # ── Emit the verdict ─────────────────────────────────────────────────────
+    verified = fill is not None
+    if fail_reasons:
+        status = 'FAIL'
+        msg = 'Nutrition panel does not reconcile to net weight. ' + ' '.join(fail_reasons)
+        if diagnosis:
+            msg += ' ' + diagnosis
+        if not verified:
+            msg += (' (Checked against the declared net weight only — no fill weight supplied, '
+                    'so a panel that is self-consistent but wrong cannot be caught here.)')
+        issues.append({'severity': 'critical', 'message': msg})
+    elif implied is None:
+        status = 'UNVERIFIED'
+        _missing = [n for n, v in (('serving size (g)', ss),
+                                   ('servings per container', spc)) if not v]
+        notes.append(
+            'Net-weight reconciliation could not run — could not read '
+            + ' and '.join(_missing) + ' from the panel. Verify these manually.')
+    elif not verified:
+        status = 'UNVERIFIED'
+        notes.append(
+            f'NFP reconciles to the declared net weight ({implied:g}g ≈ {dnw:g}g) but no fill '
+            'weight was supplied for this SKU, so the self-consistent-but-wrong case is '
+            'unverified. Add a FILL WEIGHT (g) value to the master list to fully verify.'
+            if dnw else
+            f'NFP implies {implied:g}g total, but neither a net weight nor a fill weight was '
+            'available to reconcile against. Add a FILL WEIGHT (g) value to the master list.')
+    else:
+        status = 'PASS'
+        notes.append(
+            f'Reconciles: {ss:g}g × {spc:g} = {implied:g}g ≈ net {dnw:g}g ≈ fill {fill:g}g '
+            '(within 5%).' if dnw else
+            f'Reconciles: {ss:g}g × {spc:g} = {implied:g}g ≈ fill {fill:g}g (within 5%).')
+
+    # ── Sub-check: grams of dry mix per declared unit ────────────────────────
+    # Anchor on actual fill only — never derive g/unit from a front claim and use
+    # it to validate that same claim (circular; the count is itself unverified).
+    g_per_unit = None
+    if unit_count and fill:
+        g_per_unit = round(fill / unit_count, 1)
+        notes.append(
+            f'{fill:g}g fill ÷ {unit_count:g} declared units = {g_per_unit:g}g dry mix per unit.')
+
+    # ── Sub-check: cup → gram density (~130 g/cup) ───────────────────────────
+    implied_density = None
+    if ss and cups:
+        implied_density = round(ss / cups, 1)
+        if _pct_off(implied_density, _CUP_G) and _pct_off(implied_density, _CUP_G) > _CUP_TOL:
+            issues.append({
+                'severity': 'warning',
+                'message': (
+                    f'Serving declared as {desc or f"{cups:g} cup(s)"} = {ss:g}g implies '
+                    f'{implied_density:g}g per cup, but ProDough dry blends run ~{_CUP_G:g}g/cup. '
+                    'The grams can be right while the printed cup figure is wrong — and the cup '
+                    'figure is what goes into the back-panel prep instructions.'),
+            })
+
+    return {
+        'status': status,
+        'serving_size_g': ss,
+        'serving_size_desc': desc,
+        'servings_per_container': spc,
+        'declared_net_weight_g': dnw,
+        'actual_fill_weight_g': fill,
+        'implied_total_g': implied,
+        'unit_count': unit_count,
+        'g_per_unit': g_per_unit,
+        'serving_size_cups': cups,
+        'implied_density': implied_density,
+        'diagnosis': diagnosis,
+        'issues': issues,
+        'notes': notes,
+    }
+
+
+# ── Check: Prep block — per-serving or batch ──────────────────────────────────
+# Before anyone reports that a prep block needs revision after a serving-size
+# change, classify it. Per-serving quantities scale with the NFP serving size (a
+# serving-size change DOES require prep-copy edits). Batch quantities are fixed by
+# a yield and are independent of the serving declaration (a serving-size-only
+# change does NOT touch them). Getting this wrong sends the designer work that
+# isn't needed, or misses work that is.
+#   Heuristic: a "Makes N ..." yield, or a mix quantity that does not match the
+#   serving size, means batch; otherwise per-serving.
+
+_PREP_HEADERS = (r'directions?|to\s+prepare|preparation|mixing\s+instructions?|'
+                 r'how\s+to\s+(?:make|prepare|use)|instructions?|recipe')
+
+
+def _check_prep_block(text: str, panel: dict = None) -> dict:
+    issues, notes = [], []
+    panel = panel or {}
+    tl = (text or '').lower()
+
+    # Locate a prep/directions block: prefer an explicit header, else the first
+    # run of instruction verbs.
+    block = ''
+    m = re.search(r'(?:' + _PREP_HEADERS + r')\b[:\s\-]*(.{0,400})', tl, re.DOTALL)
+    if m and m.group(1).strip():
+        block = m.group(1)
+    else:
+        m2 = re.search(r'((?:\bmix\b|combine|whisk|blend|stir|add\s+\d).{0,300})', tl, re.DOTALL)
+        block = m2.group(1) if m2 else ''
+    if not block.strip():
+        notes.append('No prep / directions block detected to classify.')
+        return {'classification': None, 'yield': None, 'issues': issues, 'notes': notes}
+
+    # Signal 1 — an explicit yield statement ("Makes 12 cupcakes").
+    yield_m = re.search(r'\bmakes\s+(?:about\s+)?(\d+)\s+([a-z]+)', block)
+
+    # Signal 2 — mix quantity that does not correspond to a single serving. Compare
+    # the prep's cup measure of dry mix to the serving size (cups), when both read.
+    mix_cups = None
+    mm = re.search(r'(\d+\s+\d+\s*/\s*\d+|\d+\s*/\s*\d+|\d+(?:\.\d+)?)\s*cups?\s+(?:of\s+)?'
+                   r'(?:mix|powder|blend|dry\s+mix)', block)
+    if mm:
+        mix_cups = _frac_to_float(mm.group(1))
+    serving_cups = panel.get('serving_size_cups')
+    quantity_mismatch = (
+        mix_cups is not None and serving_cups
+        and abs(mix_cups - serving_cups) / serving_cups > 0.25
+    )
+
+    if yield_m or quantity_mismatch:
+        classification = 'batch'
+        why = (f'it states a fixed yield ("{yield_m.group(0)}")' if yield_m
+               else f'its mix quantity ({mix_cups:g} cup) makes several servings, not one '
+                    f'({serving_cups:g} cup)')
+        notes.append(
+            f'Prep block is a BATCH recipe — {why}. Batch quantities are independent of the '
+            'serving declaration, so a serving-size-only change does NOT require prep-copy edits.')
+    else:
+        classification = 'per-serving'
+        notes.append(
+            'Prep block is PER-SERVING — quantities scale with the NFP serving size, so a '
+            'serving-size change DOES require updating these quantities (and the back-panel '
+            'prep copy).')
+
+    return {
+        'classification': classification,
+        'yield': (yield_m.group(0) if yield_m else None),
+        'mix_cups': mix_cups,
+        'serving_cups': serving_cups,
+        'issues': issues,
+        'notes': notes,
+    }
+
+
+# ── Label content snapshot (for revision comparison) ──────────────────────────
+# Checks 7 & 8 compare a panel against its prior proofed version. That comparison
+# needs the label CONTENT preserved, not just the check verdicts — so each proof
+# stores this compact snapshot, which is filed to history and read back next time.
+
+_COMPARATIVE_PATTERNS = [
+    r'\b(?:\d+\s*(?:g|grams?|%)?\s*)?(?:more|less|fewer|extra|higher|lower|reduced|added|increased|most)\s+'
+    r'(?:protein|calcium|fiber|fibre|iron|calories|vitamin)\b',
+    r'\b(?:protein|fiber|calcium)\s+(?:packed|boost(?:ed)?)\b',
+]
+
+
+def _ingredient_statement(text: str) -> str:
+    """The raw text of the ingredient declaration, if present."""
+    m = re.search(
+        r'ingredients?\s*:\s*(.+?)(?:\bcontains?\s*:|these\s+statements|manufactured|'
+        r'distributed|\bnet\s+wt|\*these|\Z)',
+        text or '', re.IGNORECASE | re.DOTALL)
+    return re.sub(r'\s+', ' ', m.group(1)).strip(' .') if m else ''
+
+
+def _split_ingredients(statement: str) -> list:
+    """Split an ingredient statement on top-level commas (respecting parentheses,
+    so "Enzyme Blend (Protease, Lipase)" stays one item)."""
+    out, buf, depth = [], '', 0
+    for ch in statement:
+        if ch in '([':
+            depth += 1
+        elif ch in ')]':
+            depth = max(0, depth - 1)
+        if ch == ',' and depth == 0:
+            if buf.strip():
+                out.append(buf.strip())
+            buf = ''
+        else:
+            buf += ch
+    if buf.strip():
+        out.append(buf.strip())
+    return out
+
+
+def _norm_ing(s: str) -> str:
+    """Normalize an ingredient name for comparison: lowercase, drop parenthetical
+    detail, collapse whitespace, strip a leading "less than 2% of" preamble."""
+    s = re.sub(r'\([^)]*\)', '', s or '').lower()
+    s = re.sub(r'contains?\s+less\s+than\s+\d+\s*%?\s*(?:of)?\s*:?', '', s)
+    return re.sub(r'[^a-z0-9 ]', ' ', s).strip()
+
+
+def _build_label_snapshot(text: str, panel: dict, vision_nutrition: dict) -> dict:
+    """Compact record of the label content used for revision comparison."""
+    tl = (text or '').lower()
+    stmt = _ingredient_statement(text)
+    sf = []
+    for p in _SF_CLAIM_PATTERNS:
+        for m in re.finditer(p, tl):
+            sf.append(m.group(0).strip())
+    comp = []
+    for p in _COMPARATIVE_PATTERNS:
+        for m in re.finditer(p, tl):
+            comp.append(m.group(0).strip())
+    vn = vision_nutrition or {}
+    return {
+        'ingredients_raw': stmt,
+        'ingredients': [_norm_ing(x) for x in _split_ingredients(stmt) if _norm_ing(x)],
+        'has_less_than_2pct': bool(re.search(r'less\s+than\s+\d+\s*%', stmt.lower())),
+        'front_callout': vn.get('front_callout', {}) or {},
+        'nfp': vn.get('nfp', {}) or {},
+        'nfp_extra_columns': _detect_extra_nfp_columns(tl),
+        'serving_size_g': (panel or {}).get('serving_size_g'),
+        'structure_function_claims': sorted(set(sf)),
+        'comparative_claims': sorted(set(comp)),
+    }
+
+
+def _detect_extra_nfp_columns(tl: str) -> list:
+    """Names of secondary NFP columns beyond the plain per-serving column
+    ("As Prepared", "Protein Plus", "Dry Mix" dual columns)."""
+    cols = []
+    for pat, name in [
+        (r'as\s+prepared', 'As Prepared'),
+        (r'when\s+prepared', 'When Prepared'),
+        (r'protein\s+plus', 'Protein Plus'),
+        (r'as\s+packaged', 'As Packaged'),
+        (r'dry\s+mix', 'Dry Mix'),
+    ]:
+        if re.search(pat, tl):
+            cols.append(name)
+    return cols
+
+
+# ── Prior-version sourcing (stored job history) ───────────────────────────────
+
+def _result_gtin_sku(res: dict):
+    """The single decoded GTIN and matched SKU that identify a stored result."""
+    g = (res.get('checks', {}).get('gtin', {}) or {}).get('found_gtins') or []
+    uniq = {str(x).strip() for x in g if str(x).strip()}
+    gtin = uniq.pop() if len(uniq) == 1 else None
+    sku = (res.get('matched_spec') or {}).get('sku')
+    return gtin, (str(sku).strip().lower() if sku else None)
+
+
+def _find_prior_snapshot(gtin=None, sku=None, exclude_job_id=None) -> dict:
+    """Most recent prior label snapshot for this SKU/GTIN from stored job history
+    (the on-disk job store loaded at startup). None if this is the first proof."""
+    gtin = str(gtin).strip() if gtin else None
+    sku = str(sku).strip().lower() if sku else None
+    if not gtin and not sku:
+        return None
+    with _jobs_lock:
+        jobs = list(_jobs.values())
+    for job in sorted(jobs, key=lambda j: j.get('created', ''), reverse=True):
+        if exclude_job_id and job.get('id') == exclude_job_id:
+            continue
+        for res in job.get('results', []):
+            snap = res.get('snapshot')
+            if not snap:
+                continue
+            r_gtin, r_sku = _result_gtin_sku(res)
+            if (gtin and r_gtin == gtin) or (sku and r_sku == sku):
+                return snap
+    return None
+
+
+def _fetch_prior_snapshot(gtin=None, sku=None) -> dict:
+    """Prior label snapshot for revision comparison. Prefers ReadyDoc (the QA
+    team's canonical artwork history); falls back to the local job store. Never
+    raises — a missing prior version just means the comparison is skipped."""
+    try:
+        import readydoc
+        snap = readydoc.fetch_prior_snapshot(gtin, sku)
+        if snap:
+            return snap
+    except Exception as _e:
+        print(f'[readydoc] prior-snapshot fetch skipped: {_e}')
+    return _find_prior_snapshot(gtin, sku)
+
+
+def _recount_result(res: dict) -> None:
+    """Recompute a result's severity and issue counts from its checks — used after
+    a cross-file pass appends issues post-hoc."""
+    all_issues = [i for c in (res.get('checks') or {}).values()
+                  if isinstance(c, dict) for i in c.get('issues', [])]
+    crit = [i for i in all_issues if i.get('severity') == 'critical']
+    warns = [i for i in all_issues if i.get('severity') == 'warning']
+    infos = [i for i in all_issues if i.get('severity') == 'info']
+    res['critical_count'] = len(crit)
+    res['warning_count'] = len(warns)
+    res['info_count'] = len(infos)
+    res['severity'] = ('critical' if crit else 'warning' if warns
+                       else 'info' if infos else 'clean')
+
+
+def _flag_duplicate_ingredients(results: list) -> None:
+    """Check 7.4 — two distinct SKUs in the same batch with identical (or nearly
+    identical) ingredient statements. Usually a copy-paste in whatever generated
+    the panel. Appends a warning to each involved file's 'ingredients' check."""
+    entries = []
+    for res in results or []:
+        snap = res.get('snapshot') or {}
+        ings = snap.get('ingredients') or []
+        if len(ings) >= 3:
+            entries.append((res, ings))
+    for i in range(len(entries)):
+        for j in range(i + 1, len(entries)):
+            res_a, a = entries[i]
+            res_b, b = entries[j]
+            if res_a.get('filename') == res_b.get('filename'):
+                continue
+            sa, sb = set(a), set(b)
+            overlap = len(sa & sb) / max(1, len(sa | sb))
+            # Identical sets, or same items in a different order → flag.
+            if overlap >= 0.92:
+                same_order = a == b
+                detail = ('identical' if same_order else
+                          'identical apart from ingredient order')
+                for res, other in ((res_a, res_b), (res_b, res_a)):
+                    chk = res.setdefault('checks', {}).setdefault(
+                        'ingredients', {'issues': [], 'notes': []})
+                    chk.setdefault('issues', []).append({'severity': 'warning', 'message': (
+                        f'Ingredient statement is {detail} to {other.get("filename")}. Two '
+                        'distinct SKUs with the same ingredient list is usually a copy-paste in '
+                        'whatever generated the panel — confirm each flavor\'s statement is correct.')})
+                    _recount_result(res)
+
+
+# ── Check: Ingredient statement drift between revisions ───────────────────────
+
+def _check_ingredient_drift(current: dict, prior: dict) -> dict:
+    """Compare the current ingredient statement against the prior proofed version.
+    Order changes and dropped descriptors are reported as questions, not verdicts —
+    either the formula changed or one of the two statements is wrong."""
+    issues, notes = [], []
+    cur = (current or {}).get('ingredients') or []
+    old = (prior or {}).get('ingredients') or []
+    if not old:
+        notes.append('No prior proofed version on file for this SKU — ingredient drift '
+                     'comparison skipped (duplicate-across-flavors is still checked).')
+        return {'issues': issues, 'notes': notes, 'compared': False}
+    if not cur:
+        notes.append('Could not read an ingredient statement to compare against the prior version.')
+        return {'issues': issues, 'notes': notes, 'compared': False}
+
+    # 1. Headline order changes — an ingredient among the first three that moves.
+    for i, ing in enumerate(old[:3]):
+        if ing in cur:
+            j = cur.index(ing)
+            if abs(j - i) >= 2:
+                issues.append({'severity': 'warning', 'message': (
+                    f'Ingredient "{ing}" moved from #{i + 1} to #{j + 1} versus the prior '
+                    'version. Ingredients are listed by weight — either the formula changed '
+                    'or one of the two statements is wrong. Verify.')})
+
+    # 2. Dropped descriptors — the same ingredient with one or more qualifying
+    #    words removed anywhere in the name ("Organic Brown Rice Flour" → "Brown
+    #    Rice Flour", "Non-Fat Dried Milk Powder" → "Non-Fat Milk Powder"). Match a
+    #    current ingredient whose words are a proper subset of the prior's.
+    cur_set = set(cur)
+    cur_wordsets = [(c, set(c.split())) for c in cur]
+    for oing in old:
+        if oing in cur_set:
+            continue
+        ow = set(oing.split())
+        best = None
+        for c, cw in cur_wordsets:
+            if cw and cw < ow and (best is None or len(cw) > len(best[1])):
+                best = (c, cw)
+        if best:
+            dropped_words = ow - best[1]
+            dropped = ' '.join(w for w in oing.split() if w in dropped_words)
+            is_claim = 'organic' in dropped_words
+            sev = 'critical' if is_claim else 'warning'
+            issues.append({'severity': sev, 'message': (
+                f'Descriptor "{dropped}" dropped: "{oing}" → "{best[0]}". '
+                + ('A dropped "Organic" is either a lost claim or an unsupported one still '
+                   'printing elsewhere on-pack — resolve before print.'
+                   if is_claim else
+                   'Either the ingredient changed or a qualifier was lost. Verify.'))})
+
+    # 3. Format change — introduction/removal of "contains less than 2% of".
+    if bool(current.get('has_less_than_2pct')) != bool(prior.get('has_less_than_2pct')):
+        added = current.get('has_less_than_2pct')
+        notes.append(
+            f'The "contains less than 2%" construction was {"added" if added else "removed"} '
+            'versus the prior version — confirm the reformatting is intentional.')
+
+    if not issues and not notes:
+        notes.append('Ingredient statement matches the prior proofed version.')
+    return {'issues': issues, 'notes': notes, 'compared': True}
+
+
+# ── Check: Claims that lose substantiation ────────────────────────────────────
+
+def _check_claims(current: dict, prior: dict = None) -> dict:
+    """Structure/function claims, comparative nutrition language, and front callouts
+    that quoted an NFP column dropped in the revision."""
+    issues, notes = [], []
+    cur = current or {}
+
+    # 1. A front callout that quoted a now-removed second NFP column → CRITICAL.
+    #    The prior panel had an extra column (e.g. "Protein Plus"); the revision is
+    #    single-column and the front protein no longer matches the panel.
+    if prior:
+        fc = (cur.get('front_callout') or {}).get('protein_g')
+        nfp = (cur.get('nfp') or {}).get('protein_g')
+        prior_cols = prior.get('nfp_extra_columns') or []
+        cur_cols = cur.get('nfp_extra_columns') or []
+        dropped_cols = [c for c in prior_cols if c not in cur_cols]
+        if fc is not None and nfp is not None and fc != nfp and dropped_cols:
+            issues.append({'severity': 'critical', 'message': (
+                f'Front callout "{fc}G Protein" no longer matches the NFP ({nfp}g). The prior '
+                f'version had a second column ({", ".join(dropped_cols)}) that the revision '
+                'dropped — the callout appears to quote that removed column and is now '
+                'unsubstantiated. Requantify the callout against the single-column panel.')})
+
+    # 2. Structure/function claims — list for labeling review (no judgment).
+    sf = cur.get('structure_function_claims') or []
+    if sf:
+        notes.append('Structure/function claims for your labeling review (substantiation not '
+                     'checked by this tool): ' + '; '.join(f'"{c}"' for c in sf) + '.')
+
+    # 3. Comparative nutrition language — nutrient content claims with requirements.
+    comp = cur.get('comparative_claims') or []
+    for c in comp:
+        issues.append({'severity': 'warning', 'message': (
+            f'Comparative nutrition language detected: "{c}". A comparison ("more/extra/higher") '
+            'is a nutrient content claim with its own FDA requirements (reference food, '
+            'quantified difference). An unquantified prep suggestion is fine; a comparison is not.')})
+
+    if not issues and not notes:
+        notes.append('No structure/function, comparative, or dropped-column claim concerns detected.')
+    return {'issues': issues, 'notes': notes}
 
 
 # ── Check 3: Eyemark color ────────────────────────────────────────────────────

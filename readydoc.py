@@ -29,10 +29,14 @@ _TIMEOUT = 15
 # Map this engine's check keys onto names a human reads in the QA queue.
 _CHECK_LABEL = {
     'gtin': 'GTIN / barcode',
+    'netwt': 'Nutrition panel vs net weight',
     'nfp': 'Nutrition panel vs front',
     'eyemark': 'Eyemark',
     'spelling': 'Spelling & brand names',
     'fda': 'FDA compliance',
+    'prep': 'Prep block type',
+    'ingredients': 'Ingredient statement changes',
+    'claims': 'Claims review',
     'specs': 'Print specs & dimensions',
     'wind': 'Wind direction',
 }
@@ -57,6 +61,39 @@ def _post(path: str, payload: dict) -> dict:
     )
     with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:
         return json.loads(resp.read().decode('utf-8') or '{}')
+
+
+def _get(path: str, params: dict) -> dict:
+    base = os.environ['READYDOC_URL'].rstrip('/')
+    token = os.environ['READYDOC_TOKEN']
+    q = dict(params or {})
+    q['token'] = token
+    url = f'{base}{path}?' + urllib.parse.urlencode({k: v for k, v in q.items() if v})
+    req = urllib.request.Request(url, headers={'User-Agent': 'artwork-proofing'}, method='GET')
+    with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:
+        return json.loads(resp.read().decode('utf-8') or '{}')
+
+
+def fetch_prior_snapshot(gtin=None, sku=None) -> dict:
+    """Return the most recent stored label snapshot for this product from
+    ReadyDoc's artwork history, or None. Never raises — a ReadyDoc outage or a
+    first-ever proof simply yields no prior version to compare against.
+
+    Endpoint assumption: GET /api/artwork/snapshot?gtin=&sku= returning
+    {"snapshot": {...}} (or the snapshot object directly). Adjust here if the
+    ReadyDoc read route differs.
+    """
+    if not enabled() or (not gtin and not sku):
+        return None
+    try:
+        data = _get('/api/artwork/snapshot', {'gtin': gtin, 'sku': sku})
+    except Exception as exc:
+        print(f'[readydoc] snapshot fetch: {exc}')
+        return None
+    if isinstance(data, dict):
+        snap = data.get('snapshot', data)
+        return snap if isinstance(snap, dict) and snap.get('ingredients') is not None else None
+    return None
 
 
 def _checks_from_result(result: dict) -> list:
@@ -118,6 +155,9 @@ def publish_job(job_id: str, results: list) -> None:
             'sku': sku,
             'summary': f"Proofed {result.get('filename', '')} — severity {result.get('severity', 'unknown')}",
             'checks': _checks_from_result(result),
+            # The label-content snapshot so a later revision can be compared against
+            # this version (Checks 7 & 8). Additive — ignored by older ReadyDoc.
+            'snapshot': result.get('snapshot'),
         }
         try:
             _post('/api/artwork/ingest', payload)
