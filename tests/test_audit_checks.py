@@ -71,6 +71,22 @@ def _run():
     check('anchored text parse wins over vision structured servings',
           merged['servings_per_container'] == 6.0 and merged['serving_size_g'] == 63.0)
 
+    # NFP-crop: bbox parse + validation, and graceful degrade with no bbox.
+    import json as _json
+    check('valid nfp_bbox parsed',
+          pe._parse_vision_json(_json.dumps({'nfp_bbox': [0.1, 0.2, 0.5, 0.9]}))['nfp_bbox'] == [0.1, 0.2, 0.5, 0.9])
+    check('out-of-range nfp_bbox rejected',
+          pe._parse_vision_json(_json.dumps({'nfp_bbox': [0.1, 0.2, 1.5, 0.9]}))['nfp_bbox'] is None)
+    check('degenerate nfp_bbox rejected',
+          pe._parse_vision_json(_json.dumps({'nfp_bbox': [0.5, 0.5, 0.5, 0.9]}))['nfp_bbox'] is None)
+    check('_read_nfp_panel degrades to {} with no bbox', pe._read_nfp_panel('/nope.png', None) == {})
+
+    # Net carbs uses the crop's structured components over full-page text.
+    r = pe._check_net_carbs('Total Net Carbs 16g\nTotal Carbohydrate 10g Sugar Alcohol 0g Erythritol',
+                            serving_g=63,
+                            nfp_vals={'total_carbohydrate_g': 42.0, 'dietary_fiber_g': 5.0, 'sugar_alcohol_g': 21.0})
+    check('net carbs reconciles from crop values (42-5-21=16)', r == [])
+
     # Net-carb gate — suspect inputs downgrade CRITICAL to SUSPECT.
     r = pe._check_net_carbs('Total Net Carbs 16g\nTotal Carbohydrate 10g Dietary Fiber 1g '
                             'Sugar Alcohol 0g\nIngredients: Erythritol, Whey', serving_g=40)
