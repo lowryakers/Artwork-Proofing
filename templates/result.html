@@ -80,10 +80,11 @@
     </div>
   </div>
   <div class="col-6 col-sm-3">
-    <div class="card border-0 shadow-sm text-center h-100 {{ 'bg-danger text-white' if s.total_critical_issues else 'bg-success text-white' }}">
+    {# Never show green "0 Critical" while any file errored — a crashed file is not a clean one. #}
+    <div class="card border-0 shadow-sm text-center h-100 {{ 'bg-danger text-white' if s.total_critical_issues else ('bg-light' if s.get('errored_count') else 'bg-success text-white') }}">
       <div class="card-body py-3">
-        <div class="fs-2 fw-bold">{{ s.total_critical_issues }}</div>
-        <div class="small">Critical Issues</div>
+        <div class="fs-2 fw-bold {{ 'text-dark' if (not s.total_critical_issues and s.get('errored_count')) }}">{{ s.total_critical_issues }}</div>
+        <div class="small {{ 'text-dark' if (not s.total_critical_issues and s.get('errored_count')) }}">Critical Issues{% if s.get('errored_count') %} <span class="text-danger fw-semibold">· {{ s.errored_count }} errored</span>{% endif %}</div>
       </div>
     </div>
   </div>
@@ -115,8 +116,23 @@
 </div>
 {% endif %}
 
-<!-- Verification completeness — "not checked" must never read as "checked and fine" -->
+<!-- Errored files — a crashed file produced no checks and is not a clean file -->
 {% set vsum = job.get('summary') or {} %}
+{% if vsum.get('errored_count') %}
+<div class="alert alert-danger border mb-3" role="alert">
+  <div class="d-flex align-items-center gap-2">
+    <i class="bi bi-exclamation-octagon-fill fs-5"></i>
+    <span><strong>{{ vsum.errored_count }} file(s) errored — no checks ran on them.</strong> {{ vsum.run_line }}</span>
+  </div>
+  {% if vsum.get('errored_files') %}
+  <ul class="mb-0 mt-2 small">
+    {% for ef in vsum.errored_files %}<li><code>{{ ef.file }}</code> — {{ ef.error }}</li>{% endfor %}
+  </ul>
+  {% endif %}
+</div>
+{% endif %}
+
+<!-- Verification completeness — "not checked" must never read as "checked and fine" -->
 {% if vsum.get('not_fully_verified_count') %}
 <div class="alert alert-warning border d-flex align-items-center gap-2 mb-3" role="alert">
   <i class="bi bi-patch-exclamation-fill fs-5"></i>
