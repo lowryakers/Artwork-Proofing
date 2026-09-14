@@ -545,12 +545,17 @@ def _claude_vision_ocr(img_path: str) -> dict:
             'present and its fill color. This is NOT the barcode and NOT a color swatch — it is a '
             'single small filled block at the trim edge. If you cannot clearly see one, set '
             'present=false and color=null.\n'
-            'panel = the serving-size line and container size, read precisely from the '
-            'Nutrition Facts panel and the front net-weight declaration. serving_size_g is the '
-            'grams in parentheses on the "Serving size" line; servings_per_container is the '
-            '"servings per container" count (strip the word "about"); net_weight_g is the metric '
-            'net weight on the front; unit_count is only from an explicit "Makes N" yield. Convert '
-            'all weights to grams (1 oz = 28.35g, 1 lb = 453.6g) and report grams only.\n'
+            'panel = the serving-size line and container size, read precisely from the CURRENT '
+            'Nutrition Facts panel (ignore any faint/old panel underneath) and the front '
+            'net-weight declaration. serving_size_g = the grams in parentheses on the "Serving '
+            'size" line (e.g. 98 from "3/4 Cup (98g)"). servings_per_container = the number on '
+            'the line that literally reads "servings per container" — take ONLY the number '
+            'immediately before that phrase; keep decimals and drop "about" (so "About 4.5 '
+            'servings per container" → 4.5). This is NOT the "Makes N" unit count, NOT the prep '
+            'block yield, and NOT any other number on the pack — if you cannot see the literal '
+            '"servings per container" line, return null. net_weight_g = the metric net weight on '
+            'the front; unit_count = only from an explicit front "Makes N" yield. Convert all '
+            'weights to grams (1 oz = 28.35g, 1 lb = 453.6g) and report grams only.\n'
             'Use null for any value not visible. Numbers only (no units) for nutrition.'
         )})
 
@@ -1014,7 +1019,8 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
     # Front-callout traceability (net carbs, Check D) and superseded-NFP (Fix 7a)
     # attach to the front-vs-NFP check card when present.
     if 'nfp' in checks and isinstance(checks['nfp'], dict):
-        extra = _check_net_carbs(label_text) + _check_superseded_nfp(_panel, matched_spec)
+        extra = (_check_net_carbs(label_text, _panel.get('serving_size_g'))
+                 + _check_superseded_nfp(_panel, matched_spec))
         if extra:
             checks['nfp'].setdefault('issues', []).extend(extra)
 
@@ -1552,12 +1558,23 @@ def _parse_panel_from_text(text: str) -> dict:
 
 
 def _merge_panel(text_panel: dict, vision_panel: dict) -> dict:
-    """Combine OCR-parsed and vision-parsed panels — vision is authoritative on
-    outlined/reverse art, so it wins where present; OCR fills the gaps."""
+    """Combine OCR-parsed and vision-parsed panels.
+
+    Vision is authoritative for layout-y fields (net weight, unit count) it reads
+    off the front. But its STRUCTURED serving-size / servings-per-container fields
+    proved unreliable — it returns the "Makes N" unit count, the prep yield, or a
+    superseded panel's figure instead of the line that literally reads "servings
+    per container". For those anchored fields the deterministic text parse of the
+    same text (anchored to the literal phrase) is more trustworthy, so it wins;
+    vision only fills a gap the text parse left empty."""
+    ANCHORED = {'serving_size_g', 'serving_size_cups', 'servings_per_container'}
     out = dict(text_panel or {})
     for k, v in (vision_panel or {}).items():
-        if v is not None:
-            out[k] = v
+        if v is None:
+            continue
+        if k in ANCHORED and out.get(k) is not None:
+            continue  # keep the anchored text-parse value
+        out[k] = v
     # Normalize the key the check expects for declared net weight.
     if 'net_weight_g' in out and 'declared_net_weight_g' not in out:
         out['declared_net_weight_g'] = out['net_weight_g']
@@ -1670,6 +1687,21 @@ def _check_net_weight(panel: dict, fill_weight_g=None, fname: str = '') -> dict:
                             f'carried over from a prior revision (should be ~{round(fill / ss, 1):g}).')
                 issues.append({'severity': 'critical', 'message': msg})
                 statuses.append('CRITICAL')
+
+    # ── Cross-check (Fix C) — for a unit-declared serving ("4 Cupcakes"), the
+    # units per serving × servings-per-container should equal the front "Makes N"
+    # yield. A disagreement means one of those reads is wrong, so a clean-multiple
+    # reconciliation must not stand as PASS — downgrade to SUSPECT.
+    _ups = None
+    _um = re.match(r'\s*(\d+)\s+[a-z]', desc.lower())
+    if _um:
+        _ups = int(_um.group(1))
+    if _ups and spc and unit_count and abs(_ups * spc - unit_count) > 0.5:
+        issues.append({'severity': 'suspect', 'message': (
+            f'SUSPECT READ — {_ups} per serving × {spc:g} servings = {_ups * spc:g}, but the '
+            f'front declares "Makes {unit_count:g}". One of the serving-size, servings-per-'
+            'container, or unit-count reads is wrong — do not treat the reconciliation as clean.')})
+        statuses.append('SUSPECT')
 
     # ── Unverified — no fill weight, so Checks A & C cannot run ───────────────
     if not verified:
@@ -1964,11 +1996,16 @@ def _build_label_snapshot(text: str, panel: dict, vision_nutrition: dict) -> dic
     }
 
 
-def _check_net_carbs(text: str) -> list:
+def _check_net_carbs(text: str, serving_g=None) -> list:
     """Check D (derived value) — recompute Total Net Carbs from the CURRENT NFP
     (total carbohydrate − dietary fiber − sugar alcohols) and compare to the front
     'Net Carbs' claim. A derived callout must trace to the panel it ships with, not
-    to the previous artwork. Degrades to a REVIEW note if a component can't be read."""
+    to the previous artwork. Degrades to a REVIEW note if a component can't be read.
+
+    A derived CRITICAL inherits the confidence of its least reliable input — so if
+    a component read looks wrong (sugar alcohols 0 while erythritol leads the
+    ingredients, or total carbohydrate implausible against the serving weight), it
+    is downgraded to SUSPECT READ rather than asserting a label error."""
     issues = []
     tl = (text or '').lower()
     fm = re.search(r'(\d+(?:\.\d+)?)\s*g?\s*(?:total\s+)?net\s+carbs?', tl) \
@@ -1994,12 +2031,29 @@ def _check_net_carbs(text: str) -> list:
             'from THIS panel and confirm the front figure.')})
         return issues
     recomputed = round(total_carb - fiber - sugar_alc, 1)
-    if abs(recomputed - front_nc) > 0.5:
-        issues.append({'severity': 'critical', 'message': (
-            f'Net Carbs mismatch: front shows {front_nc:g}g but the current NFP recomputes to '
-            f'{recomputed:g}g (total carb {total_carb:g} − fiber {fiber:g} − sugar alcohol '
-            f'{sugar_alc:g}). Recompute the derived front claim from this panel — it appears to '
-            'quote a prior revision.')})
+    if abs(recomputed - front_nc) <= 0.5:
+        return issues  # reconciles — nothing to report
+
+    # A component read looks unreliable → the recompute can't be trusted enough to
+    # assert a label error. Downgrade to SUSPECT and name the doubtful field.
+    _suspect = []
+    if sugar_alc == 0 and re.search(r'erythritol|sugar\s+alcohol', tl):
+        _suspect.append('sugar alcohols read as 0 while the panel/ingredients mention erythritol')
+    if serving_g and total_carb > serving_g:
+        _suspect.append(f'total carbohydrate ({total_carb:g}g) exceeds the serving weight ({serving_g:g}g)')
+    if _suspect:
+        issues.append({'severity': 'suspect', 'message': (
+            f'SUSPECT READ — front "Net Carbs" ({front_nc:g}g) does not match a recompute of '
+            f'{recomputed:g}g, but the recompute is unreliable: {"; ".join(_suspect)}. '
+            'Re-read the total carbohydrate, dietary fiber, and sugar alcohol lines before '
+            'treating the front claim as wrong.')})
+        return issues
+
+    issues.append({'severity': 'critical', 'message': (
+        f'Net Carbs mismatch: front shows {front_nc:g}g but the current NFP recomputes to '
+        f'{recomputed:g}g (total carb {total_carb:g} − fiber {fiber:g} − sugar alcohol '
+        f'{sugar_alc:g}). Recompute the derived front claim from this panel — it appears to '
+        'quote a prior revision.')})
     return issues
 
 
@@ -2142,33 +2196,64 @@ def _flag_cross_sku_collisions(results: list) -> None:
                     break
 
 
+# A pack can carry several independent numbered lists (e.g. PANCAKE INSTRUCTIONS
+# and WAFFLE INSTRUCTIONS), each correctly numbered 1..N. A header, or a step
+# number that restarts at 1, begins a NEW list — not a repeat of the previous one.
+_INSTR_HEADER = re.compile(
+    r'\b([A-Z][A-Za-z]*\s+)?(?:instructions?|directions?|to\s+prepare|preparation|'
+    r'how\s+to\s+(?:make|prepare|use)|for\s+(?:pancakes?|waffles?|crepes?))\b', re.I)
+
+
 def _check_instruction_steps(text: str) -> list:
     """Fix 7b — structural check on numbered instruction lists: repeated step
-    numbers, out-of-sequence numbering, identical consecutive steps. Catches
-    layout damage like the duplicated steps 2 and 3 on the buttermilk back panel."""
+    numbers, out-of-sequence numbering, identical consecutive steps. Evaluates each
+    list independently (split on section headers and on any restart to step 1), so
+    two legitimately separate lists — pancake + waffle — are not read as one
+    duplicated [1,2,3,1,2,3]."""
     issues = []
     lines = [ln.strip() for ln in (text or '').splitlines() if ln.strip()]
-    steps, prev = [], None
+
+    # Segment into independent lists: a header line, or a step numbered 1 after a
+    # higher step, starts a new list.
+    lists, cur, prev_n = [], [], None
     for ln in lines:
+        if _INSTR_HEADER.search(ln) and not re.match(r'^\d{1,2}[.)]', ln):
+            if cur:
+                lists.append(cur); cur = []
+            prev_n = None
+            continue
         m = re.match(r'^(\d{1,2})[.)]\s+(.+)', ln)
         if m:
-            steps.append((int(m.group(1)), m.group(2).strip().lower()))
-        if prev is not None and ln.lower() == prev and len(ln) > 12:
-            issues.append({'severity': 'warning', 'message': (
-                f'Duplicated consecutive line in the instructions: "{ln[:60]}". Often layout '
-                'damage from removing a block — verify the step list.')})
-        prev = ln.lower()
-    if steps:
+            n = int(m.group(1))
+            if n == 1 and prev_n is not None and prev_n >= 1:
+                lists.append(cur); cur = []      # restart → new list
+            cur.append((n, m.group(2).strip().lower()))
+            prev_n = n
+        else:
+            prev_n = None
+    if cur:
+        lists.append(cur)
+
+    for steps in lists:
         nums = [n for n, _ in steps]
+        if not nums:
+            continue
         repeated = sorted({n for n in nums if nums.count(n) > 1})
         if repeated:
             issues.append({'severity': 'warning', 'message': (
-                f'Repeated instruction step number(s): {", ".join(map(str, repeated))}. '
-                'A step number appearing twice is layout damage — renumber the sequence.')})
+                f'Repeated instruction step number(s) within one list: {", ".join(map(str, repeated))}. '
+                'A step number appearing twice in the same list is layout damage — renumber it.')})
         seq = [n for n in nums if 1 <= n <= 20]
         if seq and seq != sorted(seq):
             issues.append({'severity': 'warning', 'message': (
-                f'Instruction steps out of sequence: read {seq}. Verify the numbering.')})
+                f'Instruction steps out of sequence within one list: read {seq}. Verify the numbering.')})
+        # Identical consecutive steps within a single list.
+        for (a_n, a_t), (b_n, b_t) in zip(steps, steps[1:]):
+            if a_t == b_t and len(a_t) > 12:
+                issues.append({'severity': 'warning', 'message': (
+                    f'Duplicated consecutive step text in the instructions: "{a_t[:60]}". '
+                    'Often layout damage from removing a block — verify the step list.')})
+                break
     return issues
 
 
