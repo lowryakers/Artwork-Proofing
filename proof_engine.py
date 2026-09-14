@@ -1014,19 +1014,35 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
     if matched_spec:
         checks['gtin']['spec_gtin'] = str(matched_spec.get('gtin', '')).strip()
 
-    all_issues = [i for c in checks.values() for i in c.get('issues', [])]
-    crit  = [i for i in all_issues if i['severity'] == 'critical']
-    warns = [i for i in all_issues if i['severity'] == 'warning']
-    infos = [i for i in all_issues if i['severity'] == 'info']
+    all_issues = [i for c in checks.values() if isinstance(c, dict) for i in c.get('issues', [])]
+    crit    = [i for i in all_issues if i.get('severity') == 'critical']
+    warns   = [i for i in all_issues if i.get('severity') == 'warning']
+    suspect = [i for i in all_issues if i.get('severity') == 'suspect']
+    review  = [i for i in all_issues if i.get('severity') == 'review']
+    infos   = [i for i in all_issues if i.get('severity') == 'info']
 
+    # Severity precedence. SUSPECT READ ranks below WARNING and can never be
+    # critical — it means "the tool's read is doubtful," not "the label is wrong."
     if crit:
         severity = 'critical'
     elif warns:
         severity = 'warning'
+    elif suspect:
+        severity = 'suspect'
+    elif review:
+        severity = 'review'
     elif infos:
         severity = 'info'
     else:
         severity = 'clean'
+
+    # Verification completeness is ORTHOGONAL to severity: a check that could not
+    # be fully evaluated (net weight with no fill weight, prep type UNKNOWN) marks
+    # the file not-fully-verified so "not checked" can never read as "checked and
+    # fine." Tracked separately from severity, counted in the run summary.
+    unverified_checks = [k for k, c in checks.items()
+                         if isinstance(c, dict)
+                         and str(c.get('status', '')).upper() in ('UNVERIFIED', 'UNKNOWN')]
 
     return {
         'filename': fname,
@@ -1038,7 +1054,11 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
         'severity': severity,
         'critical_count': len(crit),
         'warning_count': len(warns),
+        'suspect_count': len(suspect),
+        'review_count': len(review),
         'info_count': len(infos),
+        'fully_verified': not unverified_checks,
+        'unverified_checks': unverified_checks,
         'error': None,
         'matched_spec': matched_spec,
         'snapshot': _snapshot,
@@ -1360,7 +1380,9 @@ def _check_nfp(ocr_text: str, front_text: str = '', vision_nutrition: dict = Non
             _nc = nfp_calories[0] if len(nfp_calories) == 1 else None
             if _fc is not None and _nc is not None and _fc != _nc:
                 issues.append({
-                    'severity': 'warning',
+                    # A front call-out contradicting its own NFP is an FDA labeling
+                    # violation — not a warning that sits next to a color note.
+                    'severity': 'critical',
                     'message': (
                         f'Calorie mismatch: front call-out shows {_fc} cal but NFP shows {_nc} cal. '
                         'Front panel and NFP must declare identical calorie counts (FDA labeling requirement).'
@@ -1383,7 +1405,8 @@ def _check_nfp(ocr_text: str, front_text: str = '', vision_nutrition: dict = Non
             _np = nfp_proteins[0] if len(nfp_proteins) == 1 else None
             if _fp is not None and _np is not None and _fp != _np:
                 issues.append({
-                    'severity': 'warning',
+                    # Front call-out contradicting its own NFP = FDA labeling violation.
+                    'severity': 'critical',
                     'message': (
                         f'Protein mismatch: front call-out shows {_fp}g but NFP shows {_np}g. '
                         'Front call-out must match the NFP protein grams.'
@@ -1443,9 +1466,32 @@ _CUP_G     = 130.0         # ProDough dry blends ≈ 130 g per cup
 _CUP_TOL   = 0.20          # 20% band on the cup→gram density sanity check
 
 
+_VULGAR = {'¼': '1/4', '½': '1/2', '¾': '3/4', '⅓': '1/3', '⅔': '2/3',
+           '⅛': '1/8', '⅜': '3/8', '⅝': '5/8', '⅞': '7/8', '⅕': '1/5',
+           '⅖': '2/5', '⅗': '3/5', '⅘': '4/5', '⅙': '1/6', '⅚': '5/6'}
+
+
+def _normalize_fractions(s: str) -> str:
+    """Replace typographic vulgar-fraction glyphs (¾ ½ ⅓ …) with ASCII (3/4 …),
+    inserting a space before a glyph that abuts a digit ("1½" → "1 1/2") so mixed
+    numbers parse. Without this, '¾ Cup (98g)' silently lost its fraction and a
+    correct 130.7 g/cup density read as a phantom error."""
+    if not s:
+        return s
+    out = []
+    for ch in s:
+        if ch in _VULGAR:
+            if out and out[-1].isdigit():
+                out.append(' ')
+            out.append(_VULGAR[ch])
+        else:
+            out.append(ch)
+    return ''.join(out)
+
+
 def _frac_to_float(s):
-    """Parse '3/4', '1 1/2', or '0.75' → float; None if unparseable."""
-    s = (s or '').strip()
+    """Parse '3/4', '1 1/2', '¾', '0.75' → float; None if unparseable."""
+    s = _normalize_fractions((s or '').strip())
     m = re.match(r'^(\d+)\s+(\d+)\s*/\s*(\d+)$', s)      # mixed number "1 1/2"
     if m:
         return int(m.group(1)) + int(m.group(2)) / int(m.group(3))
@@ -1461,7 +1507,7 @@ def _frac_to_float(s):
 def _parse_panel_from_text(text: str) -> dict:
     """Best-effort read of the serving/net-weight fields from OCR text — a
     fallback for when Claude Vision did not supply the structured panel block."""
-    tl = (text or '').lower()
+    tl = _normalize_fractions((text or '').lower())
     out = {}
 
     # Serving size grams — grams in parentheses on/near the "serving size" line.
@@ -1537,95 +1583,104 @@ def _check_net_weight(panel: dict, fill_weight_g=None, fname: str = '') -> dict:
     cups = panel.get('serving_size_cups')
     desc = (panel.get('serving_size_desc') or '').strip()
 
-    implied = round(ss * spc, 1) if (ss and spc) else None
+    implied = round(ss * spc) if (ss and spc) else None   # integer grams for exact compare
 
     def _within(a, b):
         d = _pct_off(a, b)
         return d is not None and d <= _NETWT_TOL
 
-    # ── Core reconciliation ──────────────────────────────────────────────────
-    # Collect every comparison we can actually make, then decide severity.
-    fail_reasons = []          # human-readable mismatch lines
-    diagnosis = None           # single best root-cause line
-
-    imp_vs_dec  = _within(implied, dnw)  if (implied is not None and dnw) else None
-    imp_vs_fill = _within(implied, fill) if (implied is not None and fill) else None
-    dec_vs_fill = _within(dnw, fill)     if (dnw and fill) else None
-
-    if imp_vs_dec is False:
-        fail_reasons.append(
-            f'NFP implies {implied:g}g ({ss:g}g × {spc:g}) but net weight declares {dnw:g}g.')
-    if imp_vs_fill is False:
-        fail_reasons.append(
-            f'NFP implies {implied:g}g but the real fill weight is {fill:g}g.')
-    if dec_vs_fill is False:
-        fail_reasons.append(
-            f'Declared net weight {dnw:g}g does not match the real fill weight {fill:g}g.')
-
-    # ── Diagnose which input is wrong (brief's decision table) ───────────────
-    if fill:
-        r_imp = (implied / fill) if implied else None
-        r_dec = (dnw / fill) if dnw else None
-        if r_imp is not None and 0.40 <= r_imp <= 0.60:
-            factor = round(fill / implied, 1) if implied else 2
-            corrected = round(fill / spc, 1) if spc else None
-            diagnosis = (
-                f'Serving weight looks understated ~{factor:g}×. '
-                + (f'It should be about {corrected:g}g (fill {fill:g}g ÷ {spc:g} servings). '
-                   if corrected else '')
-                + 'EVERY per-serving nutrition value on this panel is understated by the same factor.')
-        elif r_imp is not None and 1.35 <= r_imp <= 1.70:
-            corrected = round(fill / ss, 1) if ss else None
-            diagnosis = (
-                f'Implied total is ~{r_imp:.2g}× the real fill — servings-per-container '
-                'likely carried over from a prior revision after the serving size changed. '
-                + (f'It should be about {corrected:g} servings (fill {fill:g}g ÷ {ss:g}g).'
-                   if corrected else ''))
-        elif r_dec is not None and 1.75 <= r_dec <= 2.25:
-            diagnosis = (
-                f'Net weight declaration is ~{r_dec:.2g}× the real fill — the panel describes a '
-                'container about twice the size actually filled (often a copy-paste from another '
-                f'SKU or a prior revision). Net weight should be about {fill:g}g.')
-        elif r_imp is not None and 1.75 <= r_imp <= 2.25:
-            corrected = round(fill / ss, 1) if ss else None
-            diagnosis = (
-                f'Implied total is ~{r_imp:.2g}× the real fill — serving size or servings count '
-                'describes about twice the real fill. '
-                + (f'Servings should be about {corrected:g} (fill {fill:g}g ÷ {ss:g}g).'
-                   if corrected else ''))
-
-    # ── Emit the verdict ─────────────────────────────────────────────────────
     verified = fill is not None
-    if fail_reasons:
-        status = 'FAIL'
-        msg = 'Nutrition panel does not reconcile to net weight. ' + ' '.join(fail_reasons)
-        if diagnosis:
-            msg += ' ' + diagnosis
-        if not verified:
-            msg += (' (Checked against the declared net weight only — no fill weight supplied, '
-                    'so a panel that is self-consistent but wrong cannot be caught here.)')
-        issues.append({'severity': 'critical', 'message': msg})
-    elif implied is None:
-        status = 'UNVERIFIED'
-        _missing = [n for n, v in (('serving size (g)', ss),
-                                   ('servings per container', spc)) if not v]
+    statuses = []   # sub-verdicts; overall status = the most severe
+
+    # ── Check B — back-calculation detector (no fill weight required) ─────────
+    # Net weight is a MEASUREMENT of package contents, not a calculation. A
+    # correctly measured net weight almost never equals serving × servings
+    # exactly, because both are rounded — so exact equality is the signature of a
+    # value derived from the panel rather than weighed.
+    if dnw and ss and spc and abs(dnw - round(ss * spc)) < 0.5:
+        issues.append({'severity': 'critical', 'message': (
+            f'Net weight appears DERIVED from the panel, not measured: declared {dnw:g}g equals '
+            f'serving × servings exactly ({ss:g} × {spc:g} = {round(ss * spc):g}). Net weight is a '
+            'measurement of contents — this exact match is the fingerprint of a back-calculated '
+            '(and typically wrong) figure. Verify against actual fill weight.')})
+        statuses.append('CRITICAL')
+
+    # ── Check A — declared net weight vs ACTUAL fill (EXACT, no tolerance) ────
+    # A measurement does not get a tolerance. Overstatement is materially worse.
+    declared_matches_fill = None
+    if verified and dnw is not None:
+        diff = dnw - fill
+        declared_matches_fill = abs(diff) < 0.5
+        if not declared_matches_fill:
+            pct = abs(diff) / fill * 100
+            if diff > 0:
+                issues.append({'severity': 'critical', 'message': (
+                    f'Net weight OVERSTATED — declared {dnw:g}g but bags fill at {fill:g}g '
+                    f'({pct:.1f}% over). Overstating net contents is materially worse than '
+                    'understating — it is a short-measure / misbranding exposure. Correct the '
+                    'declared net weight to the actual fill.')})
+            else:
+                issues.append({'severity': 'critical', 'message': (
+                    f'Net weight understated — declared {dnw:g}g but bags fill at {fill:g}g '
+                    f'({pct:.1f}% under). Declared net weight must equal the actual fill.')})
+            statuses.append('CRITICAL')
+
+    # ── Check C — panel reconciles to fill (±5%, absorbs the rounding artifact)
+    if verified and implied is not None and not _within(implied, fill):
+        if declared_matches_fill:
+            # The measured net weight is right; serving × servings does not
+            # reconcile — the serving-size or servings read is the suspect, not
+            # the label. Never assert a CRITICAL on a likely misread.
+            issues.append({'severity': 'suspect', 'message': (
+                f'SUSPECT READ — net weight ({dnw:g}g) matches the fill, but serving × servings '
+                f'({ss:g} × {spc:g} = {implied:g}g) does not reconcile to it. The serving-size or '
+                '"servings per container" value was probably misread — re-check those fields.')})
+            statuses.append('SUSPECT')
+        else:
+            ratio = implied / fill
+            clean_factor = (any(abs(ratio - f) <= 0.12 for f in (2, 3, 4))
+                            or any(abs(ratio - 1.0 / f) <= 0.05 for f in (2, 3, 4)))
+            if clean_factor and dnw is None:
+                issues.append({'severity': 'suspect', 'message': (
+                    f'SUSPECT READ — serving × servings ({implied:g}g) is ~{ratio:.2g}× the real '
+                    f'fill ({fill:g}g), a clean multiple that usually means a misread of the '
+                    'serving-size or servings-per-container field rather than a true label error.')})
+                statuses.append('SUSPECT')
+            else:
+                msg = (f'Panel does not reconcile to fill — serving × servings '
+                       f'({ss:g} × {spc:g} = {implied:g}g) vs actual fill {fill:g}g.')
+                if 0.40 <= ratio <= 0.60:
+                    msg += (f' Serving weight looks understated ~{round(fill / implied, 1):g}× — '
+                            'EVERY per-serving value on the panel is understated by that factor.')
+                elif 1.35 <= ratio <= 1.70:
+                    msg += (f' Implied is ~{ratio:.2g}× fill — servings-per-container likely '
+                            f'carried over from a prior revision (should be ~{round(fill / ss, 1):g}).')
+                issues.append({'severity': 'critical', 'message': msg})
+                statuses.append('CRITICAL')
+
+    # ── Unverified — no fill weight, so Checks A & C cannot run ───────────────
+    if not verified:
+        statuses.append('UNVERIFIED')
+        if implied is not None and dnw is not None:
+            notes.append(
+                f'NOT VERIFIED — no fill weight supplied for this SKU. The panel is self-'
+                f'consistent (implied {implied:g}g vs declared {dnw:g}g), which is exactly the '
+                'condition this check cannot evaluate without a real fill weight. Add FILL '
+                'WEIGHT (g) to the master list.')
+        else:
+            _missing = [n for n, v in (('serving size (g)', ss),
+                                       ('servings per container', spc),
+                                       ('fill weight', fill)) if not v]
+            notes.append('NOT VERIFIED — could not obtain ' + ', '.join(_missing)
+                         + '. Verify net weight against actual fill manually.')
+
+    # Overall status = most severe sub-verdict.
+    _rank = {'CRITICAL': 4, 'SUSPECT': 3, 'UNVERIFIED': 2, 'PASS': 1}
+    status = max(statuses, key=lambda s: _rank.get(s, 0)) if statuses else 'PASS'
+    if status == 'PASS' and verified:
         notes.append(
-            'Net-weight reconciliation could not run — could not read '
-            + ' and '.join(_missing) + ' from the panel. Verify these manually.')
-    elif not verified:
-        status = 'UNVERIFIED'
-        notes.append(
-            f'NFP reconciles to the declared net weight ({implied:g}g ≈ {dnw:g}g) but no fill '
-            'weight was supplied for this SKU, so the self-consistent-but-wrong case is '
-            'unverified. Add a FILL WEIGHT (g) value to the master list to fully verify.'
-            if dnw else
-            f'NFP implies {implied:g}g total, but neither a net weight nor a fill weight was '
-            'available to reconcile against. Add a FILL WEIGHT (g) value to the master list.')
-    else:
-        status = 'PASS'
-        notes.append(
-            f'Reconciles: {ss:g}g × {spc:g} = {implied:g}g ≈ net {dnw:g}g ≈ fill {fill:g}g '
-            '(within 5%).' if dnw else
+            f'Reconciles: net {dnw:g}g = fill {fill:g}g; {ss:g}g × {spc:g} = {implied:g}g '
+            f'(within 5% of fill).' if dnw else
             f'Reconciles: {ss:g}g × {spc:g} = {implied:g}g ≈ fill {fill:g}g (within 5%).')
 
     # ── Sub-check: grams of dry mix per declared unit ────────────────────────
@@ -1641,15 +1696,29 @@ def _check_net_weight(panel: dict, fill_weight_g=None, fname: str = '') -> dict:
     implied_density = None
     if ss and cups:
         implied_density = round(ss / cups, 1)
-        if _pct_off(implied_density, _CUP_G) and _pct_off(implied_density, _CUP_G) > _CUP_TOL:
-            issues.append({
-                'severity': 'warning',
-                'message': (
+        _off = _pct_off(implied_density, _CUP_G)
+        if _off and _off > _CUP_TOL:
+            # A density that is a clean ~1.5×/2× off the norm almost always means
+            # the cup FRACTION was misread (e.g. 3/4 read as 1/2), not that the
+            # label is wrong. Report SUSPECT READ, not a WARNING asserting an error.
+            _dr = implied_density / _CUP_G
+            if any(abs(_dr - f) <= 0.15 for f in (0.5, 0.667, 1.5, 2.0)):
+                issues.append({'severity': 'suspect', 'message': (
+                    f'SUSPECT READ — serving {desc or f"{cups:g} cup(s)"} = {ss:g}g implies '
+                    f'{implied_density:g} g/cup vs the ~{_CUP_G:g} g/cup ProDough norm (~{_dr:.2g}× off). '
+                    'A clean multiple like this usually means the cup fraction was misread '
+                    '(e.g. 3/4 read as 1/2). Re-check the serving-size cup value before treating '
+                    'it as a label error.')})
+                statuses.append('SUSPECT')
+            else:
+                issues.append({'severity': 'warning', 'message': (
                     f'Serving declared as {desc or f"{cups:g} cup(s)"} = {ss:g}g implies '
                     f'{implied_density:g}g per cup, but ProDough dry blends run ~{_CUP_G:g}g/cup. '
                     'The grams can be right while the printed cup figure is wrong — and the cup '
-                    'figure is what goes into the back-panel prep instructions.'),
-            })
+                    'figure is what goes into the back-panel prep instructions.')})
+            # Re-evaluate overall status if the density check raised the severity.
+            _rank2 = {'CRITICAL': 4, 'SUSPECT': 3, 'UNVERIFIED': 2, 'PASS': 1}
+            status = max([status] + statuses, key=lambda s: _rank2.get(s, 0))
 
     return {
         'status': status,
@@ -1663,7 +1732,6 @@ def _check_net_weight(panel: dict, fill_weight_g=None, fname: str = '') -> dict:
         'g_per_unit': g_per_unit,
         'serving_size_cups': cups,
         'implied_density': implied_density,
-        'diagnosis': diagnosis,
         'issues': issues,
         'notes': notes,
     }
@@ -1679,36 +1747,43 @@ def _check_net_weight(panel: dict, fill_weight_g=None, fname: str = '') -> dict:
 #   Heuristic: a "Makes N ..." yield, or a mix quantity that does not match the
 #   serving size, means batch; otherwise per-serving.
 
-_PREP_HEADERS = (r'directions?|to\s+prepare|preparation|mixing\s+instructions?|'
-                 r'how\s+to\s+(?:make|prepare|use)|instructions?|recipe')
+# Header patterns, ordered so the block starts at the section that carries the
+# recipe/yield. "What you('ll) need" is the actual header on every ProDough back
+# panel and MUST be here — the yield statement ("Makes 12 cupcakes") sits under it,
+# above "Instructions". We take the EARLIEST header match, not the first pattern
+# that hits, so we don't start the capture at "Instructions" and miss the yield.
+_PREP_HEADERS = (r'what\s+you(?:\'ll)?\s+need|directions?|to\s+prepare|preparation|'
+                 r'mixing\s+instructions?|how\s+to\s+(?:make|prepare|use)|'
+                 r'ingredients\s+you\s+need|instructions?|recipe')
 
 
 def _check_prep_block(text: str, panel: dict = None) -> dict:
     issues, notes = [], []
     panel = panel or {}
-    tl = (text or '').lower()
+    tl = _normalize_fractions((text or '').lower())
 
-    # Locate a prep/directions block: prefer an explicit header, else the first
-    # run of instruction verbs.
+    # Locate the prep block at the EARLIEST header match (so the yield line, which
+    # sits under "What You Need" above "Instructions", is inside the captured text).
     block = ''
-    m = re.search(r'(?:' + _PREP_HEADERS + r')\b[:\s\-]*(.{0,400})', tl, re.DOTALL)
-    if m and m.group(1).strip():
-        block = m.group(1)
+    starts = [m.start() for m in re.finditer(r'(?:' + _PREP_HEADERS + r')\b', tl)]
+    if starts:
+        block = tl[min(starts): min(starts) + 500]
     else:
-        m2 = re.search(r'((?:\bmix\b|combine|whisk|blend|stir|add\s+\d).{0,300})', tl, re.DOTALL)
+        m2 = re.search(r'((?:\bmix\b|combine|whisk|blend|stir|add\s+\d).{0,400})', tl, re.DOTALL)
         block = m2.group(1) if m2 else ''
     if not block.strip():
         notes.append('No prep / directions block detected to classify.')
-        return {'classification': None, 'yield': None, 'issues': issues, 'notes': notes}
+        return {'classification': 'UNKNOWN', 'yield': None, 'issues': issues, 'notes': notes}
 
-    # Signal 1 — an explicit yield statement ("Makes 12 cupcakes").
+    # Signal 1 — an explicit yield statement ("Makes 12 cupcakes", "Makes 24 Crepes").
     yield_m = re.search(r'\bmakes\s+(?:about\s+)?(\d+)\s+([a-z]+)', block)
 
-    # Signal 2 — mix quantity that does not correspond to a single serving. Compare
-    # the prep's cup measure of dry mix to the serving size (cups), when both read.
+    # Signal 2 — mix quantity that does not correspond to a single serving. Allow
+    # one or two words between "cup(s)" and "mix" — real copy reads "1 1/2 cups
+    # cupcake mix" / "1 cup crepe mix", not "1 cup mix".
     mix_cups = None
-    mm = re.search(r'(\d+\s+\d+\s*/\s*\d+|\d+\s*/\s*\d+|\d+(?:\.\d+)?)\s*cups?\s+(?:of\s+)?'
-                   r'(?:mix|powder|blend|dry\s+mix)', block)
+    mm = re.search(r'(\d+\s+\d+\s*/\s*\d+|\d+\s*/\s*\d+|\d+(?:\.\d+)?)\s*cups?\s+'
+                   r'(?:of\s+)?(?:[a-z]+\s+){0,2}(?:mix|powder|blend)\b', block)
     if mm:
         mix_cups = _frac_to_float(mm.group(1))
     serving_cups = panel.get('serving_size_cups')
@@ -1717,20 +1792,42 @@ def _check_prep_block(text: str, panel: dict = None) -> dict:
         and abs(mix_cups - serving_cups) / serving_cups > 0.25
     )
 
-    if yield_m or quantity_mismatch:
+    # Signal 3 — a serving declared in UNITS ("2 Crepes", "4 Cupcakes") has no cup
+    # measure, yet the prep block is measured in cups. The two are incommensurable,
+    # which is itself the tell that the prep is a batch recipe, not per-serving.
+    unit_declared = bool(re.search(r'\b\d+\s+(?:crepes?|cupcakes?|cookies?|muffins?|pancakes?|bars?)\b',
+                                   (panel.get('serving_size_desc') or '').lower()))
+    unit_vs_cup_batch = unit_declared and mix_cups is not None and not serving_cups
+
+    if yield_m or quantity_mismatch or unit_vs_cup_batch:
         classification = 'batch'
-        why = (f'it states a fixed yield ("{yield_m.group(0)}")' if yield_m
-               else f'its mix quantity ({mix_cups:g} cup) makes several servings, not one '
-                    f'({serving_cups:g} cup)')
+        if yield_m:
+            why = f'it states a fixed yield ("{yield_m.group(0)}")'
+        elif quantity_mismatch:
+            why = (f'its mix quantity ({mix_cups:g} cup) makes several servings, not one '
+                   f'({serving_cups:g} cup)')
+        else:
+            why = (f'the serving is declared in units ("{panel.get("serving_size_desc")}") while '
+                   f'the prep is measured in cups ({mix_cups:g}) — a batch recipe')
         notes.append(
             f'Prep block is a BATCH recipe — {why}. Batch quantities are independent of the '
             'serving declaration, so a serving-size-only change does NOT require prep-copy edits.')
-    else:
+    elif (re.search(r'\b(?:1|one)\s+(?:scoop|stick|packet|sachet)\b', block)
+          or (mix_cups is not None and serving_cups)):
+        # A single-dose prep ("mix 1 scoop into water") or a cup measure that
+        # matches one serving → per-serving; it scales with the serving size.
         classification = 'per-serving'
         notes.append(
             'Prep block is PER-SERVING — quantities scale with the NFP serving size, so a '
             'serving-size change DOES require updating these quantities (and the back-panel '
             'prep copy).')
+    else:
+        # Neither signal available — never default to a value that looks like a verdict.
+        classification = 'UNKNOWN'
+        notes.append(
+            'Prep block type UNKNOWN — could not read a yield statement or a comparable mix '
+            'quantity. Classify manually before assuming a serving-size change does or does not '
+            'require prep-copy edits.')
 
     return {
         'classification': classification,
@@ -1883,16 +1980,24 @@ def _fetch_prior_snapshot(gtin=None, sku=None) -> dict:
 def _recount_result(res: dict) -> None:
     """Recompute a result's severity and issue counts from its checks — used after
     a cross-file pass appends issues post-hoc."""
-    all_issues = [i for c in (res.get('checks') or {}).values()
-                  if isinstance(c, dict) for i in c.get('issues', [])]
-    crit = [i for i in all_issues if i.get('severity') == 'critical']
-    warns = [i for i in all_issues if i.get('severity') == 'warning']
-    infos = [i for i in all_issues if i.get('severity') == 'info']
+    checks = res.get('checks') or {}
+    all_issues = [i for c in checks.values() if isinstance(c, dict) for i in c.get('issues', [])]
+    crit    = [i for i in all_issues if i.get('severity') == 'critical']
+    warns   = [i for i in all_issues if i.get('severity') == 'warning']
+    suspect = [i for i in all_issues if i.get('severity') == 'suspect']
+    review  = [i for i in all_issues if i.get('severity') == 'review']
+    infos   = [i for i in all_issues if i.get('severity') == 'info']
     res['critical_count'] = len(crit)
     res['warning_count'] = len(warns)
+    res['suspect_count'] = len(suspect)
+    res['review_count'] = len(review)
     res['info_count'] = len(infos)
-    res['severity'] = ('critical' if crit else 'warning' if warns
-                       else 'info' if infos else 'clean')
+    res['severity'] = ('critical' if crit else 'warning' if warns else 'suspect' if suspect
+                       else 'review' if review else 'info' if infos else 'clean')
+    res['unverified_checks'] = [k for k, c in checks.items()
+                                if isinstance(c, dict)
+                                and str(c.get('status', '')).upper() in ('UNVERIFIED', 'UNKNOWN')]
+    res['fully_verified'] = not res['unverified_checks']
 
 
 def _flag_duplicate_ingredients(results: list) -> None:
@@ -3530,13 +3635,26 @@ def _check_print_specs(pdf_path: str, brand_config: dict = None,
 
 def _build_summary(results: list) -> dict:
     total = len(results)
-    counts = {'clean': 0, 'info': 0, 'warning': 0, 'critical': 0, 'error': 0}
+    counts = {'clean': 0, 'info': 0, 'review': 0, 'suspect': 0, 'warning': 0, 'critical': 0, 'error': 0}
     for r in results:
         sev = r.get('severity', 'error')
         counts[sev] = counts.get(sev, 0) + 1
 
     total_crits = sum(r.get('critical_count', 0) for r in results)
     total_warns = sum(r.get('warning_count', 0) for r in results)
+
+    # Verification completeness — "not checked" must never read as "checked and
+    # fine." A reviewer sees, in one line, how many SKUs were fully verified.
+    not_verified = [r for r in results if not r.get('fully_verified', True) and not r.get('error')]
+    fully_verified_count = total - len(not_verified) - counts.get('error', 0)
+    if not_verified:
+        _names = ', '.join(sorted({', '.join(r.get('unverified_checks', [])) for r in not_verified}))
+        verification_line = (
+            f'{fully_verified_count} of {total} SKUs fully verified; '
+            f'{len(not_verified)} could NOT be fully checked '
+            f'(incomplete: {_names or "see files"}). Resolve before relying on this run.')
+    else:
+        verification_line = f'All {total} SKUs fully verified.'
 
     fda_crits = []
     for r in results:
@@ -3550,4 +3668,7 @@ def _build_summary(results: list) -> dict:
         'total_critical_issues': total_crits,
         'total_warning_issues': total_warns,
         'fda_critical_issues': fda_crits,
+        'fully_verified_count': fully_verified_count,
+        'not_fully_verified_count': len(not_verified),
+        'verification_line': verification_line,
     }
