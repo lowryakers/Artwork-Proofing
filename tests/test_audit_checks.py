@@ -87,6 +87,47 @@ def _run():
           pe._parse_vision_json(_json.dumps({'nfp_bbox': [0.5, 0.5, 0.5, 0.9]}))['nfp_bbox'] is None)
     check('_read_nfp_panel degrades to {} with no bbox', pe._read_nfp_panel('/nope.png', None) == {})
 
+    # NFP-crop mirror handling: a mirror-printed panel (film) reads empty straight,
+    # so the crop is flipped and re-read. Guarded — needs Pillow.
+    try:
+        import types as _types
+        from PIL import Image as _PImg
+        _prev_pil, _prev_img, _prev_anth, _prev_avail = (
+            pe.PIL_AVAILABLE, getattr(pe, 'Image', None),
+            getattr(pe, '_anthropic', None), pe.ANTHROPIC_AVAILABLE)
+        pe.PIL_AVAILABLE = True
+        pe.Image = _PImg
+        pe.ANTHROPIC_AVAILABLE = True
+        os.environ.setdefault('ANTHROPIC_API_KEY', 'test')
+        _tmp = os.path.join(os.path.dirname(__file__), '_mirror_tmp.png')
+        _PImg.new('RGB', (1600, 2400), 'white').save(_tmp)
+        _seq = ['{"serving_size_g":null,"servings_per_container":null,"calories":null}',
+                '{"serving_size_g":98,"servings_per_container":4.5,"calories":300,"protein_g":19,"total_carbohydrate_g":24}']
+        _n = {'i': 0}
+
+        class _B:
+            def __init__(s, t):
+                s.text = t
+
+        class _Resp:
+            def __init__(s, t):
+                s.content = [_B(t)]
+
+        class _Msgs:
+            def create(s, **k):
+                t = _seq[min(_n['i'], len(_seq) - 1)]
+                _n['i'] += 1
+                return _Resp(t)
+        pe._anthropic = _types.SimpleNamespace(Anthropic=lambda api_key=None: _types.SimpleNamespace(messages=_Msgs()))
+        _res = pe._read_nfp_panel(_tmp, [0.27, 0.74, 0.52, 0.95])
+        check('mirror-printed crop recovered via flip retry',
+              _res.get('servings_per_container') == 4.5 and _res.get('serving_size_g') == 98.0)
+        os.remove(_tmp)
+        pe.PIL_AVAILABLE, pe.ANTHROPIC_AVAILABLE = _prev_pil, _prev_avail
+        pe.Image, pe._anthropic = _prev_img, _prev_anth
+    except ImportError:
+        print('[skip] mirror flip-retry test (Pillow not installed)')
+
     # Net carbs uses the crop's structured components over full-page text.
     r = pe._check_net_carbs('Total Net Carbs 16g\nTotal Carbohydrate 10g Sugar Alcohol 0g Erythritol',
                             serving_g=63,

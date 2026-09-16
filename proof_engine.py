@@ -698,12 +698,37 @@ def _parse_vision_json(txt: str) -> dict:
         return dict(_empty, raw_text=txt)
 
 
+_NFP_CROP_PROMPT = (
+    'This image is a crop of ONE Nutrition Facts (or Supplement Facts) panel and nothing '
+    'else. It may be MIRROR-REVERSED or rotated (these are film/pouch back panels printed '
+    'through clear film); read it correctly oriented. Return ONLY this JSON object:\n'
+    '{"serving_size_g": <grams in the Serving size line, e.g. 98 from "3/4 Cup (98g)", or '
+    'null>, "serving_size_desc": "<unit portion, e.g. \\"3/4 Cup\\", \\"4 Cupcakes\\", or '
+    'null>", "serving_size_cups": <cup quantity as a decimal if given in cups, else null>, '
+    '"servings_per_container": <the number on the line that literally reads "servings per '
+    'container"; keep decimals, drop "about"; null if absent>, "calories": <number or '
+    'null>, "protein_g": <number or null>, "total_carbohydrate_g": <number or null>, '
+    '"dietary_fiber_g": <number or null>, "sugar_alcohol_g": <grams of sugar alcohols / '
+    'erythritol, or null>, "added_sugar_g": <number or null>}\n'
+    'Take servings-per-container ONLY from the literal "servings per container" line — '
+    'never a "Makes N" count. Read every row you can actually see, including Total '
+    'Carbohydrate, Dietary Fiber, and Sugar Alcohols. Numbers only, no units.\n'
+    'CRITICAL: return null for any value you cannot clearly read FROM THIS IMAGE. Do NOT '
+    'guess a typical or common value for the product type — a guessed "typical panel" '
+    'number is a failure, not a fallback. If the crop is blurry, cut off, or unreadable, '
+    'null is the correct answer for the fields you cannot see.')
+
+
 def _read_nfp_panel(img_path: str, bbox) -> dict:
     """Durable NFP read: crop the Nutrition/Supplement Facts panel to its own image
     (using the bbox from the first vision pass) and read that rectangle in isolation.
     Isolated + upscaled, the small NFP digits are legible instead of lost in a
-    full-package pass. Returns a dict of panel/NFP fields, or {} on any failure —
-    the caller degrades to the full-page reads. Never raises."""
+    full-package pass.
+
+    ProDough back panels are printed on clear film and read MIRRORED, so a straight
+    crop is unreadable — try the crop normal, then horizontally flipped, then rotated
+    180°, and keep the orientation that reads the most fields. Returns {} on any
+    failure — the caller degrades to the full-page reads. Never raises."""
     if not (ANTHROPIC_AVAILABLE and PIL_AVAILABLE and bbox):
         return {}
     try:
@@ -711,8 +736,8 @@ def _read_nfp_panel(img_path: str, bbox) -> dict:
         im = Image.open(img_path).convert('RGB')
         W, H = im.size
         x0, y0, x1, y1 = bbox
-        # Pad generously so a slightly-off box still contains the whole panel.
-        pw, ph = (x1 - x0) * 0.10, (y1 - y0) * 0.10
+        # Pad generously so a slightly-off or tight box still contains the panel.
+        pw, ph = (x1 - x0) * 0.15, (y1 - y0) * 0.15
         px0, py0 = max(0, int((x0 - pw) * W)), max(0, int((y0 - ph) * H))
         px1, py1 = min(W, int((x1 + pw) * W)), min(H, int((y1 + ph) * H))
         if px1 - px0 < 8 or py1 - py0 < 8:
@@ -720,65 +745,66 @@ def _read_nfp_panel(img_path: str, bbox) -> dict:
         crop = im.crop((px0, py0, px1, py1))
         # Upscale small crops so digits are large; then cap to the API's ~1.1MP.
         _long = max(crop.width, crop.height)
-        if _long < 1400:
-            s = min(3.0, 1400.0 / _long)
+        if _long < 1600:
+            s = min(3.0, 1600.0 / _long)
             crop = crop.resize((int(crop.width * s), int(crop.height * s)))
         _cap = 1_140_000
         if crop.width * crop.height > _cap:
             s = (_cap / float(crop.width * crop.height)) ** 0.5
             crop = crop.resize((max(1, int(crop.width * s)), max(1, int(crop.height * s))))
-        _b = io.BytesIO()
-        crop.save(_b, format='JPEG', quality=95)
-        b64 = base64.standard_b64encode(_b.getvalue()).decode('utf-8')
 
-        prompt = (
-            'This image is a crop of ONE Nutrition Facts (or Supplement Facts) panel and nothing '
-            'else. Read it carefully and return ONLY this JSON object:\n'
-            '{"serving_size_g": <grams in the Serving size line, e.g. 98 from "3/4 Cup (98g)", or '
-            'null>, "serving_size_desc": "<unit portion, e.g. \\"3/4 Cup\\", \\"4 Cupcakes\\", or '
-            'null>", "serving_size_cups": <cup quantity as a decimal if given in cups, else null>, '
-            '"servings_per_container": <the number on the line that literally reads "servings per '
-            'container"; keep decimals, drop "about"; null if absent>, "calories": <number or '
-            'null>, "protein_g": <number or null>, "total_carbohydrate_g": <number or null>, '
-            '"dietary_fiber_g": <number or null>, "sugar_alcohol_g": <grams of sugar alcohols / '
-            'erythritol, or null>, "added_sugar_g": <number or null>}\n'
-            'Take servings-per-container ONLY from the literal "servings per container" line — '
-            'never a "Makes N" count. Read every row you can actually see, including Total '
-            'Carbohydrate, Dietary Fiber, and Sugar Alcohols. Numbers only, no units.\n'
-            'CRITICAL: return null for any value you cannot clearly read FROM THIS IMAGE. Do NOT '
-            'guess a typical or common value for the product type — a guessed "typical panel" '
-            'number is a failure, not a fallback. If the crop is blurry, cut off, or unreadable, '
-            'null is the correct answer for the fields you cannot see.')
         _client = _anthropic.Anthropic(api_key=os.environ['ANTHROPIC_API_KEY'])
-        _msg = _client.messages.create(
-            model='claude-sonnet-4-6', max_tokens=400,
-            messages=[{'role': 'user', 'content': [
-                {'type': 'image', 'source': {'type': 'base64', 'media_type': 'image/jpeg', 'data': b64}},
-                {'type': 'text', 'text': prompt}]}])
-        _txt = ''
-        for _blk in (_msg.content or []):
-            if getattr(_blk, 'text', None):
-                _txt = _blk.text
-                break
-        _start = _txt.find('{')
-        if _start < 0:
-            return {}
-        data, _ = json.JSONDecoder().raw_decode(_txt[_start:])
-        out = {}
-        for k in ('serving_size_g', 'serving_size_cups', 'servings_per_container', 'calories',
-                  'protein_g', 'total_carbohydrate_g', 'dietary_fiber_g', 'sugar_alcohol_g',
-                  'added_sugar_g'):
-            v = data.get(k)
-            if isinstance(v, (int, float)):
-                out[k] = float(v)
-            elif isinstance(v, str):
-                m = re.search(r'-?\d+(?:\.\d+)?', v)
-                if m:
-                    out[k] = float(m.group(0))
-        d = data.get('serving_size_desc')
-        if isinstance(d, str) and d.strip() and d.strip().lower() not in ('null', 'none'):
-            out['serving_size_desc'] = d.strip()
-        return out
+
+        def _read_crop(pim):
+            _b = io.BytesIO()
+            pim.save(_b, format='JPEG', quality=95)
+            b64 = base64.standard_b64encode(_b.getvalue()).decode('utf-8')
+            _msg = _client.messages.create(
+                model='claude-sonnet-4-6', max_tokens=400,
+                messages=[{'role': 'user', 'content': [
+                    {'type': 'image', 'source': {'type': 'base64', 'media_type': 'image/jpeg', 'data': b64}},
+                    {'type': 'text', 'text': _NFP_CROP_PROMPT}]}])
+            _txt = ''
+            for _blk in (_msg.content or []):
+                if getattr(_blk, 'text', None):
+                    _txt = _blk.text
+                    break
+            _start = _txt.find('{')
+            if _start < 0:
+                return {}
+            data, _ = json.JSONDecoder().raw_decode(_txt[_start:])
+            out = {}
+            for k in ('serving_size_g', 'serving_size_cups', 'servings_per_container', 'calories',
+                      'protein_g', 'total_carbohydrate_g', 'dietary_fiber_g', 'sugar_alcohol_g',
+                      'added_sugar_g'):
+                v = data.get(k)
+                if isinstance(v, (int, float)):
+                    out[k] = float(v)
+                elif isinstance(v, str):
+                    m = re.search(r'-?\d+(?:\.\d+)?', v)
+                    if m:
+                        out[k] = float(m.group(0))
+            d = data.get('serving_size_desc')
+            if isinstance(d, str) and d.strip() and d.strip().lower() not in ('null', 'none'):
+                out['serving_size_desc'] = d.strip()
+            return out
+
+        def _score(d):
+            # How much of the panel this read recovered (fields that drive checks).
+            return sum(1 for k in ('serving_size_g', 'servings_per_container', 'calories',
+                                   'protein_g', 'total_carbohydrate_g') if d.get(k) is not None)
+
+        # Straight read first; only try flipped/rotated orientations if it is sparse,
+        # to keep the call count down. Mirror (left-right) is the common film case.
+        best = _read_crop(crop)
+        if _score(best) < 3:
+            for _t in (Image.FLIP_LEFT_RIGHT, Image.ROTATE_180):
+                alt = _read_crop(crop.transpose(_t))
+                if _score(alt) > _score(best):
+                    best = alt
+                if _score(best) >= 3:
+                    break
+        return best
     except Exception as _e:
         print(f'[vision] nfp-crop read failed: {_e}')
         return {}
@@ -4110,7 +4136,11 @@ def _build_summary(results: list) -> dict:
     not_verified = [r for r in results if not r.get('fully_verified', True) and not r.get('error')]
     fully_verified_count = total - len(not_verified) - counts.get('error', 0)
     if not_verified:
-        _names = ', '.join(sorted({', '.join(r.get('unverified_checks', [])) for r in not_verified}))
+        # Distinct check names, friendly-labeled — not the per-file joined strings
+        # (which produced "netwt, netwt, prep, prep").
+        _friendly = {'netwt': 'net weight', 'prep': 'prep block', 'nfp': 'front vs NFP'}
+        _keys = sorted({c for r in not_verified for c in r.get('unverified_checks', [])})
+        _names = ', '.join(_friendly.get(k, k) for k in _keys)
         verification_line = (
             f'{fully_verified_count} of {total} SKUs fully verified; '
             f'{len(not_verified)} could NOT be fully checked '
