@@ -74,6 +74,30 @@ def _run():
     r = pe._check_net_weight(empty, fill_weight_g=380)
     check('unreadable panel + fill → UNVERIFIED (no crash, never PASS)', r['status'] == 'UNVERIFIED')
 
+    # A fill-weight PASS must NOT rest on a Tesseract-only serving read (the
+    # arithmetic-twin false-PASS hole). Reconciles, but OCR-only → SUSPECT.
+    r_ocr = pe._check_net_weight({'serving_size_g': 63, 'servings_per_container': 6,
+                                  'declared_net_weight_g': 380}, fill_weight_g=380,
+                                 serving_vision_backed=False)
+    check('reconciling fill-weight PASS on OCR-only serving → SUSPECT', r_ocr['status'] == 'SUSPECT')
+    r_vis = pe._check_net_weight({'serving_size_g': 63, 'servings_per_container': 6,
+                                  'declared_net_weight_g': 380}, fill_weight_g=380,
+                                 serving_vision_backed=True)
+    check('reconciling fill-weight PASS on vision-backed serving → PASS', r_vis['status'] == 'PASS')
+
+    # The vision gate FORCES vision when a fill weight is on file (net-weight
+    # verdict in play) — even if Tesseract read everything else.
+    _orig = pe._ocr_needs_vision
+    pe._ocr_needs_vision = lambda *a, **k: False   # pretend Tesseract read the nutrition
+    try:
+        _complete = 'nutrition facts calories 130 protein 25 contains: milk'
+        check('gate: no fill + complete OCR → vision skipped',
+              pe._should_run_vision(_complete, '', 'PD_cupcake.pdf', None) is False)
+        check('gate: fill on file forces vision',
+              pe._should_run_vision(_complete, '', 'PD_cupcake.pdf', 380.0) is True)
+    finally:
+        pe._ocr_needs_vision = _orig
+
     # Single-serving stick pack: net weight == serving × 1 is correct by
     # definition, NOT a back-calculation — must not fire Check B.
     stick = _r(35, 1, 35, None)
