@@ -122,6 +122,11 @@ def _run():
         _res = pe._read_nfp_panel(_tmp, [0.27, 0.74, 0.52, 0.95])
         check('mirror-printed crop recovered via flip retry',
               _res.get('servings_per_container') == 4.5 and _res.get('serving_size_g') == 98.0)
+        # bbox=None (vision couldn't locate) → whole-image fallback read still works.
+        _n['i'] = 0
+        _res2 = pe._read_nfp_panel(_tmp, None)
+        check('bbox=None falls back to whole-image read',
+              _res2.get('serving_size_g') == 98.0)
         os.remove(_tmp)
         pe.PIL_AVAILABLE, pe.ANTHROPIC_AVAILABLE = _prev_pil, _prev_avail
         pe.Image, pe._anthropic = _prev_img, _prev_anth

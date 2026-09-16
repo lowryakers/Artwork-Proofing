@@ -729,20 +729,26 @@ def _read_nfp_panel(img_path: str, bbox) -> dict:
     crop is unreadable — try the crop normal, then horizontally flipped, then rotated
     180°, and keep the orientation that reads the most fields. Returns {} on any
     failure — the caller degrades to the full-page reads. Never raises."""
-    if not (ANTHROPIC_AVAILABLE and PIL_AVAILABLE and bbox):
+    if not (ANTHROPIC_AVAILABLE and PIL_AVAILABLE):
         return {}
     try:
         import base64, io
         im = Image.open(img_path).convert('RGB')
         W, H = im.size
-        x0, y0, x1, y1 = bbox
-        # Pad generously so a slightly-off or tight box still contains the panel.
-        pw, ph = (x1 - x0) * 0.15, (y1 - y0) * 0.15
-        px0, py0 = max(0, int((x0 - pw) * W)), max(0, int((y0 - ph) * H))
-        px1, py1 = min(W, int((x1 + pw) * W)), min(H, int((y1 + ph) * H))
-        if px1 - px0 < 8 or py1 - py0 < 8:
-            return {}
-        crop = im.crop((px0, py0, px1, py1))
+        if bbox:
+            x0, y0, x1, y1 = bbox
+            # Pad generously so a slightly-off or tight box still contains the panel.
+            pw, ph = (x1 - x0) * 0.15, (y1 - y0) * 0.15
+            px0, py0 = max(0, int((x0 - pw) * W)), max(0, int((y0 - ph) * H))
+            px1, py1 = min(W, int((x1 + pw) * W)), min(H, int((y1 + ph) * H))
+            if px1 - px0 < 8 or py1 - py0 < 8:
+                return {}
+            crop = im.crop((px0, py0, px1, py1))
+        else:
+            # No bbox — vision couldn't locate the panel. Fall back to the whole
+            # image with the focused prompt + orientation flips; better than leaving
+            # the panel unread, and still degrades to {} if nothing legible comes back.
+            crop = im
         # Upscale small crops so digits are large; then cap to the API's ~1.1MP.
         _long = max(crop.width, crop.height)
         if _long < 1600:
@@ -1010,6 +1016,16 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
         except Exception:
             pass
 
+    # Barcode + spec match up front: the net-weight reconciliation is the flagship
+    # check and must NOT ride on a flaky Tesseract-only serving read. When a fill
+    # weight is on file (a net-weight verdict is in play), Claude Vision is forced
+    # on below so the panel comes from the reliable isolated crop, not OCR guesswork.
+    barcode_gtins = _scan_barcodes(img_path)
+    matched_spec = _match_spec_row(barcode_gtins, fname, spec_rows or [])
+    _fill_weight = (matched_spec.get('fill_weight_g') if matched_spec else None)
+    if _fill_weight is None:
+        _fill_weight = brand_config.get('fill_weight_g')
+
     ocr_claude = ''
     vision_nutrition = None
     vision_allergens = None
@@ -1039,10 +1055,13 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
     # Using _is_film_rollstock (not a narrower regex) keeps the eyemark trigger in
     # lockstep with the check that actually consumes it, so legitimate film files
     # (flowwrap, sleeve, OCR-identified) always get the vision eyemark read.
+    #   • a fill weight is on file (net-weight reconciliation will run and needs a
+    #     RELIABLE serving/servings read — never trust Tesseract alone for a verdict)
     _needs_nutrition_vision = _ocr_needs_vision(_pre_claude_text, front_text=_front_ocr)
     _is_film_for_vision = _is_film_rollstock(fname, _pre_claude_text)
     _has_contains_decl = bool(re.search(r'\bcontains?\s*:', _pre_claude_text.lower()))
-    _run_vision = _needs_nutrition_vision or _is_film_for_vision or not _has_contains_decl
+    _run_vision = (_needs_nutrition_vision or _is_film_for_vision or not _has_contains_decl
+                   or _fill_weight is not None)
     if not ANTHROPIC_AVAILABLE:
         _vision_diag = 'vision: skipped — ANTHROPIC_API_KEY not set / anthropic not installed'
     elif not _run_vision:
@@ -1095,13 +1114,8 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
     # vision pass) fall back to the full OCR, which carries the label itself.
     label_text = ocr_claude if len(ocr_claude.strip()) > 40 else combined_text
 
-    # Scan barcode stripes directly from rendered image (primary GTIN source)
-    barcode_gtins = _scan_barcodes(img_path)
-
+    # barcode_gtins and matched_spec were computed up front (before the vision gate).
     brand_mode = brand_config.get('brand_mode', 'prodough')
-
-    # ── Match spec row from sheet ────────────────────────────────────────────
-    matched_spec = _match_spec_row(barcode_gtins, fname, spec_rows or [])
 
     # Wind direction: form override > spec sheet > nothing
     effective_wind = brand_config.get('wind_direction', '').strip()
@@ -1146,9 +1160,7 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
                 _nfp_vals[_ck] = nfp_read[_ck]
         vision_nutrition['nfp'] = _nfp_vals
 
-    _fill_weight = (matched_spec.get('fill_weight_g') if matched_spec else None)
-    if _fill_weight is None:
-        _fill_weight = brand_config.get('fill_weight_g')
+    # _fill_weight was computed up front (before the vision gate).
 
     # Revision comparison (Checks 7 & 8): snapshot this label's content and pull
     # the prior proofed version for this SKU from stored history (ReadyDoc → local).
