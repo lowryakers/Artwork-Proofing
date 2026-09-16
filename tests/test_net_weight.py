@@ -74,6 +74,15 @@ def _run():
     r = pe._check_net_weight(empty, fill_weight_g=380)
     check('unreadable panel + fill → UNVERIFIED (no crash, never PASS)', r['status'] == 'UNVERIFIED')
 
+    # Single-serving stick pack: net weight == serving × 1 is correct by
+    # definition, NOT a back-calculation — must not fire Check B.
+    stick = _r(35, 1, 35, None)
+    check('single-serving stick not flagged as back-calc',
+          not _has(stick, 'derived'))
+    check('single-serving stick w/ matching fill → PASS',
+          pe._check_net_weight({'serving_size_g': 35, 'servings_per_container': 1,
+                                'declared_net_weight_g': 35}, fill_weight_g=35)['status'] == 'PASS')
+
     # Partial panel (serving read, servings missing) + fill → not PASS.
     r = pe._check_net_weight(
         {'serving_size_g': 63, 'servings_per_container': None, 'declared_net_weight_g': 380,

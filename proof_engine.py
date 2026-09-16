@@ -1804,10 +1804,13 @@ def _check_net_weight(panel: dict, fill_weight_g=None, fname: str = '') -> dict:
 
     # ── Check B — back-calculation detector (no fill weight required) ─────────
     # Net weight is a MEASUREMENT of package contents, not a calculation. A
-    # correctly measured net weight almost never equals serving × servings
-    # exactly, because both are rounded — so exact equality is the signature of a
-    # value derived from the panel rather than weighed.
-    if dnw and ss and spc and abs(dnw - round(ss * spc)) < 0.5:
+    # correctly measured multi-serving net weight almost never equals serving ×
+    # servings exactly, because both are rounded — so exact equality is the
+    # signature of a value derived from the panel rather than weighed.
+    # EXCEPTION: a single-serving pack (a stick/sachet, servings = 1) has net
+    # weight == serving size BY DEFINITION — the whole pack is one serving — so
+    # that equality is correct, not a back-calculation. Only flag when spc > 1.
+    if dnw and ss and spc and spc > 1 and abs(dnw - round(ss * spc)) < 0.5:
         issues.append({'severity': 'critical', 'message': (
             f'Net weight appears DERIVED from the panel, not measured: declared {_g(dnw)}g equals '
             f'serving × servings exactly ({_g(ss)} × {_g(spc)} = {_g(round(ss * spc))}). Net weight is a '
@@ -2245,6 +2248,14 @@ def _check_net_carbs(text: str, serving_g=None, nfp_vals: dict = None) -> list:
     if sugar_alc == 0 and has_sa_ingredient:
         _suspect.append('sugar alcohols read as 0 while the ingredients list a sugar alcohol '
                         '(e.g. erythritol)')
+    # Plausibility (robust to a mirrored, unreadable ingredient list): if the front
+    # net carbs sit below total carbohydrate minus fiber, sugar alcohols MUST be
+    # present to reach that figure — reading them as ~0 is a missed line, not a
+    # label error. This is the common failure: the sugar-alcohol row didn't crop.
+    if sugar_alc <= 0.5 and front_nc < (total_carb - fiber) - 0.5:
+        _suspect.append('sugar alcohols read as 0, but the front value is below total '
+                        'carbohydrate minus fiber — a sugar-alcohol line was almost certainly '
+                        'missed')
     if serving_g and total_carb > serving_g:
         _suspect.append(f'total carbohydrate ({total_carb:g}g) exceeds the serving weight '
                         f'({serving_g:g}g)')
