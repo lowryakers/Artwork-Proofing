@@ -134,6 +134,14 @@ def _run():
                             nfp_vals={'total_carbohydrate_g': 42.0, 'dietary_fiber_g': 5.0, 'sugar_alcohol_g': 21.0})
     check('net carbs reconciles from crop values (42-5-21=16)', r == [])
 
+    # A missed sugar-alcohol line (read 0) where the front sits below total−fiber
+    # must be SUSPECT, not a CRITICAL — robust even when the ingredient text is
+    # mirrored/unreadable (pumpkin: crop total 45, fiber 3, sugar alc 0, front 12).
+    r_sa = pe._check_net_carbs('Total Net Carbs 12g',
+                               nfp_vals={'total_carbohydrate_g': 45, 'dietary_fiber_g': 3, 'sugar_alcohol_g': 0})
+    check('missed sugar-alcohol line → SUSPECT not CRITICAL',
+          any(i['severity'] == 'suspect' for i in r_sa) and not any(i['severity'] == 'critical' for i in r_sa))
+
     # Net-carb gate — suspect inputs downgrade CRITICAL to SUSPECT.
     r = pe._check_net_carbs('Total Net Carbs 16g\nTotal Carbohydrate 10g Dietary Fiber 1g '
                             'Sugar Alcohol 0g\nIngredients: Erythritol, Whey', serving_g=40)
