@@ -32,14 +32,20 @@ def _run():
     check('Check E names Buttermilk as the collision source',
           any('buttermilk' in i['message'].lower() and i['severity'] == 'critical' for i in coll))
 
-    # Check D — Net carbs recomputed from the CURRENT panel.
-    bad = ('Total Net Carbs 5g\nNutrition Facts Total Carbohydrate 20g '
-           'Dietary Fiber 6g Sugar Alcohol 8g')   # 20-6-8 = 6 ≠ 5
-    r = pe._check_net_carbs(bad)
-    check('Check D flags net-carb mismatch (front 5 vs recomputed 6)',
+    # Check D — Net carbs recomputed from the CURRENT panel. A CRITICAL requires
+    # the reliable crop-sourced components (20-6-8=6 ≠ front 5).
+    r = pe._check_net_carbs('Total Net Carbs 5g',
+                            nfp_vals={'total_carbohydrate_g': 20, 'dietary_fiber_g': 6, 'sugar_alcohol_g': 8})
+    check('Check D flags net-carb mismatch from crop values (front 5 vs recomputed 6)',
           any(i['severity'] == 'critical' and 'net carbs' in i['message'].lower() for i in r))
-    good = ('Total Net Carbs 6g\nTotal Carbohydrate 20g Dietary Fiber 6g Sugar Alcohol 8g')
-    check('Check D passes when front matches recompute', not pe._check_net_carbs(good))
+    check('Check D passes when front matches recompute',
+          not pe._check_net_carbs('Total Net Carbs 6g',
+                                  nfp_vals={'total_carbohydrate_g': 20, 'dietary_fiber_g': 6, 'sugar_alcohol_g': 8}))
+    # A mismatch from the UNRELIABLE full-page text (no crop values) must NOT be a
+    # CRITICAL — it downgrades to SUSPECT.
+    r2 = pe._check_net_carbs('Total Net Carbs 5g\nTotal Carbohydrate 20g Dietary Fiber 6g Sugar Alcohol 8g')
+    check('Check D text-only mismatch → SUSPECT not CRITICAL',
+          any(i['severity'] == 'suspect' for i in r2) and not any(i['severity'] == 'critical' for i in r2))
 
     # 7a — superseded NFP: artwork 7 servings vs approved 4.5.
     r = pe._check_superseded_nfp({'servings_per_container': 7},

@@ -893,17 +893,22 @@ def _generate_report(job: dict, brand_name: str = 'ProDough') -> io.BytesIO:
                for r in job['results'] if r.get('checks', {}).get('netwt')]
     if nw_rows:
         wsn = wb.create_sheet('Net Weight', 1)
-        n_fail = sum(1 for _, nw in nw_rows if nw.get('status') == 'FAIL')
+        n_crit = sum(1 for _, nw in nw_rows if nw.get('status') == 'CRITICAL')
+        n_susp = sum(1 for _, nw in nw_rows if nw.get('status') == 'SUSPECT')
         n_unv  = sum(1 for _, nw in nw_rows if nw.get('status') == 'UNVERIFIED')
         wsn.merge_cells('A1:H1')
         wsn['A1'] = 'NUTRITION PANEL vs NET WEIGHT (must reconcile before print)'
         wsn['A1'].font = Font(bold=True, size=12)
-        if n_fail:
-            banner = f'{n_fail} SKU(s) DO NOT reconcile — see rows below.'
-        elif n_unv:
-            banner = f'All computable panels reconcile; {n_unv} SKU(s) checked against declared net weight only (no fill weight supplied).'
-        else:
-            banner = 'All panels reconcile to actual fill weight.'
+        # UNVERIFIED here means the panel did not READ — not that fill weight was
+        # missing. Word it to match the actual condition.
+        _parts = []
+        if n_crit:
+            _parts.append(f'{n_crit} SKU(s) DO NOT reconcile')
+        if n_susp:
+            _parts.append(f'{n_susp} suspect read(s) to re-check')
+        if n_unv:
+            _parts.append(f'{n_unv} could not be reconciled — the nutrition panel did not read')
+        banner = ('; '.join(_parts) + '.') if _parts else 'All panels reconcile to actual fill weight.'
         wsn.merge_cells('A2:H2')
         wsn['A2'] = banner
         hdrs = ['File', 'Serving (g)', 'Servings/Container', 'Implied Total (g)',

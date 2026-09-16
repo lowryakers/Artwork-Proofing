@@ -521,10 +521,14 @@ def _claude_vision_ocr(img_path: str) -> dict:
             '"about 4.5" as 4.5, or null>, "net_weight_g": <grams from the front Net Wt line, e.g. '
             '454 from "Net Wt 1lb (16oz) 454g", or null>, "unit_count": <number from a front '
             '"Makes N ..." yield, e.g. 24 from "Makes 24 Cupcakes", or null>},\n'
-            '  "nfp_bbox": [<x0>, <y0>, <x1>, <y1>]  // bounding box of the Nutrition Facts '
+            '  "nfp_bbox": [<x0>, <y0>, <x1>, <y1>],  // bounding box of the Nutrition Facts '
             '(or Supplement Facts) panel in the FIRST image, as fractions of width/height in '
             '[0,1] (top-left origin): x0,y0 = top-left corner, x1,y1 = bottom-right. null if no '
             'panel is visible.\n'
+            '  "dshea_disclaimer": <true or false>  // true if the pack prints the FDA/DSHEA '
+            'disclaimer "These statements have not been evaluated by the Food and Drug '
+            'Administration. This product is not intended to diagnose, treat, cure, or prevent any '
+            'disease." (or close wording); false otherwise.\n'
             '}\n\n'
             'front_callout = the big circular badge numbers on the FRONT of the pack '
             '(e.g. "130 Calories Per Serving", "25G Protein Per Serving", "0G Added Sugar"). '
@@ -559,7 +563,9 @@ def _claude_vision_ocr(img_path: str) -> dict:
             'block yield, and NOT any other number on the pack — if you cannot see the literal '
             '"servings per container" line, return null. net_weight_g = the metric net weight on '
             'the front; unit_count = only from an explicit front "Makes N" yield. Convert all '
-            'weights to grams (1 oz = 28.35g, 1 lb = 453.6g) and report grams only.\n'
+            'weights to grams (1 oz = 28.35g, 1 lb = 453.6g) and report grams only. Return null '
+            'for any panel value you cannot actually read — never guess a typical value for the '
+            'product type; a guessed number is worse than null.\n'
             'nfp_bbox = locate the Nutrition Facts / Supplement Facts panel in the FIRST image '
             '(the whole-package view) and give its bounding box as fractions of the image width '
             'and height in [0,1], top-left origin: [x0, y0, x1, y1]. Be generous rather than '
@@ -684,6 +690,7 @@ def _parse_vision_json(txt: str) -> dict:
             'eyemark': _clean_eyemark(_data.get('eyemark', {})),
             'panel': _clean_panel(_data.get('panel', {})),
             'nfp_bbox': _clean_bbox(_data.get('nfp_bbox')),
+            'dshea_disclaimer': bool(_data.get('dshea_disclaimer')),
             '_parsed': True,
         }
     except Exception:
@@ -736,7 +743,12 @@ def _read_nfp_panel(img_path: str, bbox) -> dict:
             '"dietary_fiber_g": <number or null>, "sugar_alcohol_g": <grams of sugar alcohols / '
             'erythritol, or null>, "added_sugar_g": <number or null>}\n'
             'Take servings-per-container ONLY from the literal "servings per container" line — '
-            'never a "Makes N" count. Numbers only, no units; null for anything not present.')
+            'never a "Makes N" count. Read every row you can actually see, including Total '
+            'Carbohydrate, Dietary Fiber, and Sugar Alcohols. Numbers only, no units.\n'
+            'CRITICAL: return null for any value you cannot clearly read FROM THIS IMAGE. Do NOT '
+            'guess a typical or common value for the product type — a guessed "typical panel" '
+            'number is a failure, not a fallback. If the crop is blurry, cut off, or unreadable, '
+            'null is the correct answer for the fields you cannot see.')
         _client = _anthropic.Anthropic(api_key=os.environ['ANTHROPIC_API_KEY'])
         _msg = _client.messages.create(
             model='claude-sonnet-4-6', max_tokens=400,
@@ -978,6 +990,7 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
     vision_eyemark = None
     vision_panel = None
     vision_nfp_bbox = None
+    vision_dshea = False
     nfp_read = {}
     _vision_diag = ''
     # Gate Claude Vision on whether the nutrition content actually came through —
@@ -1019,6 +1032,7 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
         vision_eyemark = _vision.get('eyemark', {})
         vision_panel = _vision.get('panel', {})
         vision_nfp_bbox = _vision.get('nfp_bbox')
+        vision_dshea = bool(_vision.get('dshea_disclaimer'))
         # Durable read: re-read the Nutrition Facts panel from an isolated crop so
         # its small digits are legible instead of squashed in the full-page pass.
         nfp_read = _read_nfp_panel(img_path, vision_nfp_bbox)
@@ -1099,6 +1113,11 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
             _nfp_vals['protein_g'] = int(nfp_read['protein_g'])
         if nfp_read.get('added_sugar_g') is not None:
             _nfp_vals['added_sugar_g'] = int(nfp_read['added_sugar_g'])
+        # Carry the crop's carb components too, so the net-carb recompute reads the
+        # same reliable source as the serving size (not a stale full-page read).
+        for _ck in ('total_carbohydrate_g', 'dietary_fiber_g', 'sugar_alcohol_g'):
+            if nfp_read.get(_ck) is not None:
+                _nfp_vals[_ck] = nfp_read[_ck]
         vision_nutrition['nfp'] = _nfp_vals
 
     _fill_weight = (matched_spec.get('fill_weight_g') if matched_spec else None)
@@ -1108,6 +1127,9 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
     # Revision comparison (Checks 7 & 8): snapshot this label's content and pull
     # the prior proofed version for this SKU from stored history (ReadyDoc → local).
     _snapshot = _build_label_snapshot(label_text, _panel, vision_nutrition)
+    # DSHEA disclaimer detection is robust to vision omitting it from raw_text: the
+    # first pass reports it as a structured boolean, OR-ed with the text regex.
+    _snapshot['dshea_disclaimer'] = bool(_snapshot.get('dshea_disclaimer')) or vision_dshea
     _gtin_lookup = barcode_gtins[0] if (barcode_gtins and len(set(barcode_gtins)) == 1) else None
     _sku_lookup = matched_spec.get('sku') if matched_spec else None
     _prior_snapshot = _fetch_prior_snapshot(_gtin_lookup, _sku_lookup)
@@ -1993,7 +2015,12 @@ def _check_prep_block(text: str, panel: dict = None) -> dict:
     # which is itself the tell that the prep is a batch recipe, not per-serving.
     unit_declared = bool(re.search(r'\b\d+\s+(?:crepes?|cupcakes?|cookies?|muffins?|pancakes?|bars?)\b',
                                    (panel.get('serving_size_desc') or '').lower()))
-    unit_vs_cup_batch = unit_declared and mix_cups is not None and not serving_cups
+    # A unit-declared serving whose prep is measured in cups is a batch recipe —
+    # the units are incommensurable. Fire this even when the exact mix quantity
+    # didn't OCR (just the word "cup" in the block is enough), so two identical
+    # crepe layouts classify the same way instead of one landing on UNKNOWN.
+    prep_uses_cups = bool(re.search(r'\bcups?\b', block))
+    unit_vs_cup_batch = unit_declared and prep_uses_cups and not serving_cups
 
     if yield_m or quantity_mismatch or unit_vs_cup_batch:
         classification = 'batch'
@@ -2003,8 +2030,9 @@ def _check_prep_block(text: str, panel: dict = None) -> dict:
             why = (f'its mix quantity ({mix_cups:g} cup) makes several servings, not one '
                    f'({serving_cups:g} cup)')
         else:
+            _mc = f' ({mix_cups:g} cup)' if mix_cups is not None else ''
             why = (f'the serving is declared in units ("{panel.get("serving_size_desc")}") while '
-                   f'the prep is measured in cups ({mix_cups:g}) — a batch recipe')
+                   f'the prep is measured in cups{_mc} — a batch recipe')
         notes.append(
             f'Prep block is a BATCH recipe — {why}. Batch quantities are independent of the '
             'serving declaration, so a serving-size-only change does NOT require prep-copy edits.')
@@ -2152,19 +2180,26 @@ def _check_net_carbs(text: str, serving_g=None, nfp_vals: dict = None) -> list:
             if m:
                 return float(m.group(1))
         return None
-    # Prefer the isolated NFP-crop read's structured components when present — they
-    # are far more reliable than regex over the full-page text.
+    # Use ONLY the isolated NFP-crop read's structured components for a CRITICAL —
+    # regex over the full-page text is exactly the unreliable read the crop replaced,
+    # and a derived CRITICAL can carry no more confidence than its inputs. Track
+    # where each component came from so a text-fallback recompute can never assert
+    # a label error.
     nfp_vals = nfp_vals or {}
+    tc_from_crop = nfp_vals.get('total_carbohydrate_g') is not None
     total_carb = nfp_vals.get('total_carbohydrate_g')
     if total_carb is None:
         total_carb = _grab(r'total\s+carb\w*\s*(\d+(?:\.\d+)?)\s*g')
     fiber = nfp_vals.get('dietary_fiber_g')
     if fiber is None:
         fiber = _grab(r'(?:dietary\s+)?fib(?:er|re)\s*(\d+(?:\.\d+)?)\s*g') or 0.0
+    sa_from_crop = nfp_vals.get('sugar_alcohol_g') is not None
     sugar_alc = nfp_vals.get('sugar_alcohol_g')
     if sugar_alc is None:
         sugar_alc = _grab(r'sugar\s+alcohols?\s*(\d+(?:\.\d+)?)\s*g',
                           r'erythritol\s*(\d+(?:\.\d+)?)\s*g') or 0.0
+    has_sa_ingredient = bool(re.search(r'erythritol|sugar\s+alcohol|maltitol|xylitol|sorbitol', tl))
+
     if total_carb is None:
         issues.append({'severity': 'review', 'message': (
             f'Front "Net Carbs" claim ({front_nc:g}g) could not be verified — the NFP total '
@@ -2175,19 +2210,24 @@ def _check_net_carbs(text: str, serving_g=None, nfp_vals: dict = None) -> list:
     if abs(recomputed - front_nc) <= 0.5:
         return issues  # reconciles — nothing to report
 
-    # A component read looks unreliable → the recompute can't be trusted enough to
-    # assert a label error. Downgrade to SUSPECT and name the doubtful field.
+    # Mismatch — but a CRITICAL is only warranted when the inputs are the reliable
+    # crop read AND individually plausible. Otherwise it is a SUSPECT READ.
     _suspect = []
-    if sugar_alc == 0 and re.search(r'erythritol|sugar\s+alcohol', tl):
-        _suspect.append('sugar alcohols read as 0 while the panel/ingredients mention erythritol')
+    if not tc_from_crop:
+        _suspect.append('the total carbohydrate came from the full-page read, not the isolated '
+                        'panel crop')
+    if sugar_alc == 0 and has_sa_ingredient:
+        _suspect.append('sugar alcohols read as 0 while the ingredients list a sugar alcohol '
+                        '(e.g. erythritol)')
     if serving_g and total_carb > serving_g:
-        _suspect.append(f'total carbohydrate ({total_carb:g}g) exceeds the serving weight ({serving_g:g}g)')
+        _suspect.append(f'total carbohydrate ({total_carb:g}g) exceeds the serving weight '
+                        f'({serving_g:g}g)')
     if _suspect:
         issues.append({'severity': 'suspect', 'message': (
             f'SUSPECT READ — front "Net Carbs" ({front_nc:g}g) does not match a recompute of '
             f'{recomputed:g}g, but the recompute is unreliable: {"; ".join(_suspect)}. '
-            'Re-read the total carbohydrate, dietary fiber, and sugar alcohol lines before '
-            'treating the front claim as wrong.')})
+            'Re-read the total carbohydrate, dietary fiber, and sugar alcohol lines from the '
+            'panel before treating the front claim as wrong.')})
         return issues
 
     issues.append({'severity': 'critical', 'message': (
