@@ -422,6 +422,19 @@ def _match_spec_row(gtin_list: list, fname: str, spec_rows: list) -> dict:
     return {}
 
 
+def _should_run_vision(pre_claude_text: str, front_ocr: str, fname: str, fill_weight) -> bool:
+    """Decide whether to escalate to Claude Vision. Run it when ANY compliance read
+    is incomplete from Tesseract, OR when a fill weight is on file — a net-weight
+    verdict is then in play and its serving/servings MUST come from a reliable
+    vision read, never Tesseract alone. Pure function so the gate is unit-testable."""
+    return bool(
+        _ocr_needs_vision(pre_claude_text, front_text=front_ocr)          # nutrition missing
+        or _is_film_rollstock(fname, pre_claude_text)                     # eyemark read
+        or not re.search(r'\bcontains?\s*:', pre_claude_text.lower())     # FALCPA line missing
+        or fill_weight is not None                                        # net-weight verdict in play
+    )
+
+
 def _claude_vision_ocr(img_path: str) -> dict:
     """Use Claude Sonnet vision to read press-ready PDFs where text is outlined or
     reverse/mirror-printed (Tesseract returns garbage or backwards words).
@@ -1057,11 +1070,7 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
     # (flowwrap, sleeve, OCR-identified) always get the vision eyemark read.
     #   • a fill weight is on file (net-weight reconciliation will run and needs a
     #     RELIABLE serving/servings read — never trust Tesseract alone for a verdict)
-    _needs_nutrition_vision = _ocr_needs_vision(_pre_claude_text, front_text=_front_ocr)
-    _is_film_for_vision = _is_film_rollstock(fname, _pre_claude_text)
-    _has_contains_decl = bool(re.search(r'\bcontains?\s*:', _pre_claude_text.lower()))
-    _run_vision = (_needs_nutrition_vision or _is_film_for_vision or not _has_contains_decl
-                   or _fill_weight is not None)
+    _run_vision = _should_run_vision(_pre_claude_text, _front_ocr, fname, _fill_weight)
     if not ANTHROPIC_AVAILABLE:
         _vision_diag = 'vision: skipped — ANTHROPIC_API_KEY not set / anthropic not installed'
     elif not _run_vision:
@@ -1160,6 +1169,17 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
                 _nfp_vals[_ck] = nfp_read[_ck]
         vision_nutrition['nfp'] = _nfp_vals
 
+    # Was the serving/servings that a net-weight verdict rests on actually read by
+    # VISION (the isolated crop, the vision panel, or vision's transcription that
+    # label_text uses) — or only by Tesseract? A fill-weight PASS must never rest on
+    # a Tesseract-only serving read (that is the arithmetic-twin false-PASS hole).
+    _label_is_vision = len(ocr_claude.strip()) > 40
+    _netwt_vision_backed = (
+        _label_is_vision
+        or any(nfp_read.get(k) is not None for k in ('serving_size_g', 'servings_per_container'))
+        or any((vision_panel or {}).get(k) is not None
+               for k in ('serving_size_g', 'servings_per_container')))
+
     # _fill_weight was computed up front (before the vision gate).
 
     # Revision comparison (Checks 7 & 8): snapshot this label's content and pull
@@ -1177,7 +1197,7 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
         brand_name = brand_config.get('brand_name', '')
         checks = {
             'gtin':     _check_gtin(combined_text, fname, gtin_rows, barcode_gtins),
-            'netwt':    _check_net_weight(_panel, fill_weight_g=_fill_weight, fname=fname),
+            'netwt':    _check_net_weight(_panel, fill_weight_g=_fill_weight, fname=fname, serving_vision_backed=_netwt_vision_backed),
             'eyemark':  _check_eyemark(img, is_film, fname, required_eyemark, vision_eyemark=vision_eyemark),
             'spelling': _check_spelling_generic(label_text, brand_name),
             'fda':      _check_fda_light(label_text, fname),
@@ -1193,7 +1213,7 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
         proof_type = brand_config.get('proof_type', 'press')
         checks = {
             'gtin':     _check_gtin(combined_text, fname, gtin_rows, barcode_gtins),
-            'netwt':    _check_net_weight(_panel, fill_weight_g=_fill_weight, fname=fname),
+            'netwt':    _check_net_weight(_panel, fill_weight_g=_fill_weight, fname=fname, serving_vision_backed=_netwt_vision_backed),
             'nfp':      _check_nfp(label_text, front_text=ocr_left + '\n' + ocr_inv_left + '\n' + ocr_inv_right, vision_nutrition=vision_nutrition),
             'eyemark':  _check_eyemark(img, is_film, fname, required_eyemark, vision_eyemark=vision_eyemark),
             'spelling': _check_spelling(label_text, fname),
@@ -1780,7 +1800,8 @@ def _pct_off(a, b):
     return abs(a - b) / float(b)
 
 
-def _check_net_weight(panel: dict, fill_weight_g=None, fname: str = '') -> dict:
+def _check_net_weight(panel: dict, fill_weight_g=None, fname: str = '',
+                      serving_vision_backed: bool = True) -> dict:
     """Reconcile the nutrition panel against net weight and real fill weight.
 
     panel: serving_size_g, serving_size_desc, servings_per_container,
@@ -1921,6 +1942,17 @@ def _check_net_weight(panel: dict, fill_weight_g=None, fname: str = '') -> dict:
     _rank = {'CRITICAL': 4, 'SUSPECT': 3, 'UNVERIFIED': 2, 'PASS': 1}
     if statuses:
         status = max(statuses, key=lambda s: _rank.get(s, 0))
+    elif implied is not None and verified and not serving_vision_backed:
+        # It reconciles, but the serving/servings came from Tesseract only (vision
+        # couldn't read the panel). A fill-weight verdict must not rest on an
+        # OCR-only serving read — that is the arithmetic-twin false-PASS hole
+        # (32×12 and 63×6 both reconcile). Do not award PASS.
+        status = 'SUSPECT'
+        issues.append({'severity': 'suspect', 'message': (
+            f'SUSPECT READ — the panel reconciles ({ss:g}g × {spc:g} = {implied:g}g ≈ fill '
+            f'{fill:g}g) but the serving size / servings-per-container were read by OCR only; '
+            'Claude Vision could not read this panel, so the values are not verified. Two wrong '
+            'figures can reconcile to the fill by coincidence — re-check the serving line.')})
     elif implied is not None:
         status = 'PASS'
         if verified:
