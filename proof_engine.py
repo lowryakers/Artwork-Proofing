@@ -520,7 +520,11 @@ def _claude_vision_ocr(img_path: str) -> dict:
             'e.g. 0.75 for 3/4 cup, else null>, "servings_per_container": <number, e.g. 7; parse '
             '"about 4.5" as 4.5, or null>, "net_weight_g": <grams from the front Net Wt line, e.g. '
             '454 from "Net Wt 1lb (16oz) 454g", or null>, "unit_count": <number from a front '
-            '"Makes N ..." yield, e.g. 24 from "Makes 24 Cupcakes", or null>}\n'
+            '"Makes N ..." yield, e.g. 24 from "Makes 24 Cupcakes", or null>},\n'
+            '  "nfp_bbox": [<x0>, <y0>, <x1>, <y1>]  // bounding box of the Nutrition Facts '
+            '(or Supplement Facts) panel in the FIRST image, as fractions of width/height in '
+            '[0,1] (top-left origin): x0,y0 = top-left corner, x1,y1 = bottom-right. null if no '
+            'panel is visible.\n'
             '}\n\n'
             'front_callout = the big circular badge numbers on the FRONT of the pack '
             '(e.g. "130 Calories Per Serving", "25G Protein Per Serving", "0G Added Sugar"). '
@@ -556,6 +560,11 @@ def _claude_vision_ocr(img_path: str) -> dict:
             '"servings per container" line, return null. net_weight_g = the metric net weight on '
             'the front; unit_count = only from an explicit front "Makes N" yield. Convert all '
             'weights to grams (1 oz = 28.35g, 1 lb = 453.6g) and report grams only.\n'
+            'nfp_bbox = locate the Nutrition Facts / Supplement Facts panel in the FIRST image '
+            '(the whole-package view) and give its bounding box as fractions of the image width '
+            'and height in [0,1], top-left origin: [x0, y0, x1, y1]. Be generous rather than '
+            'tight. This box is used to crop and re-read the panel, so getting its location right '
+            'matters more than reading its small digits here. null if no panel is visible.\n'
             'Use null for any value not visible. Numbers only (no units) for nutrition.'
         )})
 
@@ -653,6 +662,20 @@ def _parse_vision_json(txt: str) -> dict:
                 out['serving_size_desc'] = desc.strip()
             return out
 
+        def _clean_bbox(b):
+            # Normalized [x0,y0,x1,y1] in [0,1] with x0<x1, y0<y1. Reject anything else.
+            if not isinstance(b, (list, tuple)) or len(b) != 4:
+                return None
+            try:
+                x0, y0, x1, y1 = (float(v) for v in b)
+            except (TypeError, ValueError):
+                return None
+            if not all(0.0 <= v <= 1.0 for v in (x0, y0, x1, y1)):
+                return None
+            if x1 - x0 < 0.02 or y1 - y0 < 0.02:
+                return None
+            return [x0, y0, x1, y1]
+
         return {
             'raw_text': str(_data.get('raw_text', '')) or txt,
             'front_callout': _clean(_data.get('front_callout', {})),
@@ -660,11 +683,93 @@ def _parse_vision_json(txt: str) -> dict:
             'allergens': _clean_allergens(_data.get('allergens', {})),
             'eyemark': _clean_eyemark(_data.get('eyemark', {})),
             'panel': _clean_panel(_data.get('panel', {})),
+            'nfp_bbox': _clean_bbox(_data.get('nfp_bbox')),
             '_parsed': True,
         }
     except Exception:
         # Fall back to treating the whole response as raw text
         return dict(_empty, raw_text=txt)
+
+
+def _read_nfp_panel(img_path: str, bbox) -> dict:
+    """Durable NFP read: crop the Nutrition/Supplement Facts panel to its own image
+    (using the bbox from the first vision pass) and read that rectangle in isolation.
+    Isolated + upscaled, the small NFP digits are legible instead of lost in a
+    full-package pass. Returns a dict of panel/NFP fields, or {} on any failure —
+    the caller degrades to the full-page reads. Never raises."""
+    if not (ANTHROPIC_AVAILABLE and PIL_AVAILABLE and bbox):
+        return {}
+    try:
+        import base64, io
+        im = Image.open(img_path).convert('RGB')
+        W, H = im.size
+        x0, y0, x1, y1 = bbox
+        # Pad generously so a slightly-off box still contains the whole panel.
+        pw, ph = (x1 - x0) * 0.10, (y1 - y0) * 0.10
+        px0, py0 = max(0, int((x0 - pw) * W)), max(0, int((y0 - ph) * H))
+        px1, py1 = min(W, int((x1 + pw) * W)), min(H, int((y1 + ph) * H))
+        if px1 - px0 < 8 or py1 - py0 < 8:
+            return {}
+        crop = im.crop((px0, py0, px1, py1))
+        # Upscale small crops so digits are large; then cap to the API's ~1.1MP.
+        _long = max(crop.width, crop.height)
+        if _long < 1400:
+            s = min(3.0, 1400.0 / _long)
+            crop = crop.resize((int(crop.width * s), int(crop.height * s)))
+        _cap = 1_140_000
+        if crop.width * crop.height > _cap:
+            s = (_cap / float(crop.width * crop.height)) ** 0.5
+            crop = crop.resize((max(1, int(crop.width * s)), max(1, int(crop.height * s))))
+        _b = io.BytesIO()
+        crop.save(_b, format='JPEG', quality=95)
+        b64 = base64.standard_b64encode(_b.getvalue()).decode('utf-8')
+
+        prompt = (
+            'This image is a crop of ONE Nutrition Facts (or Supplement Facts) panel and nothing '
+            'else. Read it carefully and return ONLY this JSON object:\n'
+            '{"serving_size_g": <grams in the Serving size line, e.g. 98 from "3/4 Cup (98g)", or '
+            'null>, "serving_size_desc": "<unit portion, e.g. \\"3/4 Cup\\", \\"4 Cupcakes\\", or '
+            'null>", "serving_size_cups": <cup quantity as a decimal if given in cups, else null>, '
+            '"servings_per_container": <the number on the line that literally reads "servings per '
+            'container"; keep decimals, drop "about"; null if absent>, "calories": <number or '
+            'null>, "protein_g": <number or null>, "total_carbohydrate_g": <number or null>, '
+            '"dietary_fiber_g": <number or null>, "sugar_alcohol_g": <grams of sugar alcohols / '
+            'erythritol, or null>, "added_sugar_g": <number or null>}\n'
+            'Take servings-per-container ONLY from the literal "servings per container" line — '
+            'never a "Makes N" count. Numbers only, no units; null for anything not present.')
+        _client = _anthropic.Anthropic(api_key=os.environ['ANTHROPIC_API_KEY'])
+        _msg = _client.messages.create(
+            model='claude-sonnet-4-6', max_tokens=400,
+            messages=[{'role': 'user', 'content': [
+                {'type': 'image', 'source': {'type': 'base64', 'media_type': 'image/jpeg', 'data': b64}},
+                {'type': 'text', 'text': prompt}]}])
+        _txt = ''
+        for _blk in (_msg.content or []):
+            if getattr(_blk, 'text', None):
+                _txt = _blk.text
+                break
+        _start = _txt.find('{')
+        if _start < 0:
+            return {}
+        data, _ = json.JSONDecoder().raw_decode(_txt[_start:])
+        out = {}
+        for k in ('serving_size_g', 'serving_size_cups', 'servings_per_container', 'calories',
+                  'protein_g', 'total_carbohydrate_g', 'dietary_fiber_g', 'sugar_alcohol_g',
+                  'added_sugar_g'):
+            v = data.get(k)
+            if isinstance(v, (int, float)):
+                out[k] = float(v)
+            elif isinstance(v, str):
+                m = re.search(r'-?\d+(?:\.\d+)?', v)
+                if m:
+                    out[k] = float(m.group(0))
+        d = data.get('serving_size_desc')
+        if isinstance(d, str) and d.strip() and d.strip().lower() not in ('null', 'none'):
+            out['serving_size_desc'] = d.strip()
+        return out
+    except Exception as _e:
+        print(f'[vision] nfp-crop read failed: {_e}')
+        return {}
 
 
 # ── Single-file proofing ──────────────────────────────────────────────────────
@@ -872,6 +977,8 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
     vision_allergens = None
     vision_eyemark = None
     vision_panel = None
+    vision_nfp_bbox = None
+    nfp_read = {}
     _vision_diag = ''
     # Gate Claude Vision on whether the nutrition content actually came through —
     # not raw word count. Outlined-text PDFs yield garbage; reverse/mirror-printed
@@ -911,13 +1018,19 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
         vision_allergens = _vision.get('allergens', {})
         vision_eyemark = _vision.get('eyemark', {})
         vision_panel = _vision.get('panel', {})
-        _vision_diag = 'vision: {} | front={} nfp={} allergens={} eyemark={} panel={}'.format(
+        vision_nfp_bbox = _vision.get('nfp_bbox')
+        # Durable read: re-read the Nutrition Facts panel from an isolated crop so
+        # its small digits are legible instead of squashed in the full-page pass.
+        nfp_read = _read_nfp_panel(img_path, vision_nfp_bbox)
+        _vision_diag = 'vision: {} | front={} nfp={} allergens={} eyemark={} panel={} bbox={} nfp_crop={}'.format(
             _vision.get('status', '?'),
             _vision.get('front_callout', {}),
             _vision.get('nfp', {}),
             _vision.get('allergens', {}),
             _vision.get('eyemark', {}),
             _vision.get('panel', {}),
+            vision_nfp_bbox,
+            nfp_read,
         )
 
     combined_text = (
@@ -969,6 +1082,25 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
     # authoritative vision panel, plus the external fill weight from the master list
     # (spec sheet > brand_config). Fill weight absent → the check runs UNVERIFIED.
     _panel = _merge_panel(_parse_panel_from_text(label_text), vision_panel)
+    # The isolated NFP-crop read is the most reliable source for the panel fields —
+    # it wins over both the anchored text parse and the full-page vision structured
+    # read. Only overwrite with values it actually returned.
+    for _k in ('serving_size_g', 'serving_size_cups', 'servings_per_container', 'serving_size_desc'):
+        if nfp_read.get(_k) is not None:
+            _panel[_k] = nfp_read[_k]
+    # Feed the crop's NFP calories/protein into the front-vs-NFP comparison, and
+    # keep its carb components for the net-carb recompute.
+    if nfp_read:
+        vision_nutrition = dict(vision_nutrition or {})
+        _nfp_vals = dict(vision_nutrition.get('nfp') or {})
+        if nfp_read.get('calories') is not None:
+            _nfp_vals['calories'] = int(nfp_read['calories'])
+        if nfp_read.get('protein_g') is not None:
+            _nfp_vals['protein_g'] = int(nfp_read['protein_g'])
+        if nfp_read.get('added_sugar_g') is not None:
+            _nfp_vals['added_sugar_g'] = int(nfp_read['added_sugar_g'])
+        vision_nutrition['nfp'] = _nfp_vals
+
     _fill_weight = (matched_spec.get('fill_weight_g') if matched_spec else None)
     if _fill_weight is None:
         _fill_weight = brand_config.get('fill_weight_g')
@@ -1019,7 +1151,7 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
     # Front-callout traceability (net carbs, Check D) and superseded-NFP (Fix 7a)
     # attach to the front-vs-NFP check card when present.
     if 'nfp' in checks and isinstance(checks['nfp'], dict):
-        extra = (_check_net_carbs(label_text, _panel.get('serving_size_g'))
+        extra = (_check_net_carbs(label_text, _panel.get('serving_size_g'), nfp_read)
                  + _check_superseded_nfp(_panel, matched_spec))
         if extra:
             checks['nfp'].setdefault('issues', []).extend(extra)
@@ -1996,7 +2128,7 @@ def _build_label_snapshot(text: str, panel: dict, vision_nutrition: dict) -> dic
     }
 
 
-def _check_net_carbs(text: str, serving_g=None) -> list:
+def _check_net_carbs(text: str, serving_g=None, nfp_vals: dict = None) -> list:
     """Check D (derived value) — recompute Total Net Carbs from the CURRENT NFP
     (total carbohydrate − dietary fiber − sugar alcohols) and compare to the front
     'Net Carbs' claim. A derived callout must trace to the panel it ships with, not
@@ -2020,10 +2152,19 @@ def _check_net_carbs(text: str, serving_g=None) -> list:
             if m:
                 return float(m.group(1))
         return None
-    total_carb = _grab(r'total\s+carb\w*\s*(\d+(?:\.\d+)?)\s*g')
-    fiber = _grab(r'(?:dietary\s+)?fib(?:er|re)\s*(\d+(?:\.\d+)?)\s*g') or 0.0
-    sugar_alc = _grab(r'sugar\s+alcohols?\s*(\d+(?:\.\d+)?)\s*g',
-                      r'erythritol\s*(\d+(?:\.\d+)?)\s*g') or 0.0
+    # Prefer the isolated NFP-crop read's structured components when present — they
+    # are far more reliable than regex over the full-page text.
+    nfp_vals = nfp_vals or {}
+    total_carb = nfp_vals.get('total_carbohydrate_g')
+    if total_carb is None:
+        total_carb = _grab(r'total\s+carb\w*\s*(\d+(?:\.\d+)?)\s*g')
+    fiber = nfp_vals.get('dietary_fiber_g')
+    if fiber is None:
+        fiber = _grab(r'(?:dietary\s+)?fib(?:er|re)\s*(\d+(?:\.\d+)?)\s*g') or 0.0
+    sugar_alc = nfp_vals.get('sugar_alcohol_g')
+    if sugar_alc is None:
+        sugar_alc = _grab(r'sugar\s+alcohols?\s*(\d+(?:\.\d+)?)\s*g',
+                          r'erythritol\s*(\d+(?:\.\d+)?)\s*g') or 0.0
     if total_carb is None:
         issues.append({'severity': 'review', 'message': (
             f'Front "Net Carbs" claim ({front_nc:g}g) could not be verified — the NFP total '
