@@ -1,0 +1,68 @@
+{
+  "die_layout_png": "fixtures/dies/prodough_bottle_shrink_sleeve_litho_flexo_108LF_5.625inCL_2026-09-03.png",
+  "die_pdf": "fixtures/dies/prodough_bottle_shrink_sleeve_SC_Shrink_Template_7_21_26_108LF.pdf",
+  "die_product_id": "108mmLF x 5.625inCL PLUS",
+  "die_sha256": null,
+  "fixture_shas": {
+    "die_layout_png": null,
+    "die_pdf": null
+  },
+  "format": "bottle_sleeve",
+  "mm": {
+    "clear_strip": 5.0,
+    "clear_vertical_total": 4.0,
+    "cut_length": 142.875,
+    "cut_length_in": 5.625,
+    "layflat": 108.0,
+    "print_h": 138.875,
+    "print_w": 218.0,
+    "side_left_slit": 51.0,
+    "side_right_slit": 64.0,
+    "slit_w": 223.0
+  },
+  "panel_map": [
+    {
+      "name": "LEFT_WRAP",
+      "x0": 0.0,
+      "x1": 0.234
+    },
+    {
+      "name": "FRONT",
+      "x0": 0.234,
+      "x1": 0.729
+    },
+    {
+      "name": "RIGHT_WRAP",
+      "x0": 0.729,
+      "x1": 1.0
+    }
+  ],
+  "provenance": {
+    "contact": "Bill Pendleton",
+    "email": "bpendleton@lithoflexo.com",
+    "layout_date": "2026-09-03",
+    "locked_date": "2026-09-17",
+    "note": "Dimensions confirmed for ArtProofing die lock. Not a vendor PO / quote task.",
+    "phone": "801-994-1129",
+    "supersedes": "Impact Sleeves 107\u00d7125 / art 216\u00d7121 / 2.5 mm underlap (WRONG \u2014 void).",
+    "vendor": "Litho Flexo Grafics (A Resource Label Group Co.)"
+  },
+  "spec": {
+    "accepted_trims_mm": [
+      [
+        218.0,
+        138.875
+      ],
+      [
+        223.0,
+        142.875
+      ]
+    ],
+    "die_line_required": true,
+    "trim_height_mm": 138.875,
+    "trim_width_mm": 218.0
+  },
+  "substrate": "shrink_film",
+  "template_id": "prodough_bottle_shrink_sleeve",
+  "template_version": 1
+}

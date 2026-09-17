@@ -158,6 +158,11 @@ def publish_job(job_id: str, results: list) -> None:
             # The label-content snapshot so a later revision can be compared against
             # this version (Checks 7 & 8). Additive — ignored by older ReadyDoc.
             'snapshot': result.get('snapshot'),
+            # Which locked die this flavor was proofed against (template id +
+            # version + fixture sha + mm constants). Additive — ignored by older
+            # ReadyDoc; present only for bottle-sleeve (and future templated) jobs.
+            'format': result.get('format'),
+            'die_template': result.get('die_template'),
         }
         try:
             _post('/api/artwork/ingest', payload)

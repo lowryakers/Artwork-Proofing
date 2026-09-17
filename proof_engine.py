@@ -45,6 +45,12 @@ try:
 except ImportError:
     ANTHROPIC_AVAILABLE = False
 
+try:
+    import die_templates as _die_templates
+    DIE_TEMPLATES_AVAILABLE = True
+except ImportError:
+    DIE_TEMPLATES_AVAILABLE = False
+
 _UPLOAD_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'uploads')
 
 # ── In-memory job store ───────────────────────────────────────────────────────
@@ -302,6 +308,33 @@ _POUCH_KEYWORDS = {'pouch', 'bag', 'zip', 'mylar', 'doypack', 'doypak',
                    'standup', 'stand_up', 'stand-up', 'canister', 'jar',
                    'bottle', 'tub', 'container'}
 
+# Bottle shrink-sleeve is its own format: reverse-printed clear FILM (so it gets
+# the film-style vision/mirror reads) but wrapping a BOTTLE — so it must never be
+# confused with a stick, and its trim comes from the locked die template.
+_BOTTLE_SLEEVE_PHRASES = ('shrink sleeve', 'shrink-sleeve', 'shrinksleeve',
+                          'shrink_sleeve', 'bottle sleeve', 'bottle-sleeve')
+_BTL_TOKEN = re.compile(r'(?:^|[-_])btl(?:$|[-_])', re.IGNORECASE)
+
+
+def _is_bottle_sleeve(fname: str, ocr_text: str = '', packaging_type: str = '') -> bool:
+    """True when the file is a ProDough bottle shrink sleeve.
+
+    Triggers on the -BTL- SKU token (every live bottle draft is WHY/PLT/BEF-BTL-*),
+    an explicit shrink/bottle-sleeve phrase, or a packaging_type that says so.
+    Filename/packaging_type win; OCR text is only a fallback hint.
+    """
+    name = (fname or '').lower()
+    pt = (packaging_type or '').lower()
+    if _BTL_TOKEN.search(name) or _BTL_TOKEN.search(pt):
+        return True
+    for phrase in _BOTTLE_SLEEVE_PHRASES:
+        if phrase in name or phrase in pt:
+            return True
+    if 'shrink' in pt and 'sleeve' in pt:
+        return True
+    text = (ocr_text or '').lower()
+    return any(phrase in text for phrase in _BOTTLE_SLEEVE_PHRASES)
+
 
 def _is_film_rollstock(fname: str, ocr_text: str = '') -> bool:
     """Return True only when the design is clearly identified as film/rollstock.
@@ -310,6 +343,12 @@ def _is_film_rollstock(fname: str, ocr_text: str = '') -> bool:
     """
     name = fname.lower()
     text = ocr_text.lower()
+
+    # Bottle shrink sleeves are reverse-printed clear film — treat as film so the
+    # vision/mirror reads apply, and so the "bottle" keyword below never routes
+    # them to the pouch (no-eyemark) branch.
+    if _is_bottle_sleeve(fname, ocr_text):
+        return True
 
     # Explicit pouch/bag indicators → not film
     for kw in _POUCH_KEYWORDS:
@@ -343,9 +382,16 @@ _SPEC_GENERIC = {
 
 
 def _spec_format(row: dict) -> str:
-    """'film', 'pouch' or '' — which physical format a spec row describes."""
-    blob = ' '.join(str(row.get(k, '') or '') for k in ('packaging_type', 'flavor')).lower()
-    # Pouch words are tested first: a row labelled "Stick pack" contains "pack",
+    """'bottle_sleeve', 'film', 'pouch' or '' — which physical format a spec row
+    describes."""
+    blob = ' '.join(str(row.get(k, '') or '')
+                    for k in ('packaging_type', 'flavor', 'sku')).lower()
+    # Bottle shrink sleeve is checked first — it is film wrapping a bottle, so it
+    # would otherwise be caught by both the 'bottle' (pouch) and 'sleeve' (film)
+    # keywords and mis-classified.
+    if _is_bottle_sleeve('', packaging_type=blob) or ('shrink' in blob and 'sleeve' in blob):
+        return 'bottle_sleeve'
+    # Pouch words are tested next: a row labelled "Stick pack" contains "pack",
     # which is harmless, but "Pouch" must never be read as film.
     if any(kw in blob for kw in _POUCH_KEYWORDS):
         return 'pouch'
@@ -393,6 +439,14 @@ def _match_spec_row(gtin_list: list, fname: str, spec_rows: list) -> dict:
         if all(kw in fname_lower for kw in keywords):
             candidates.append(row)
 
+    # Bottle shrink sleeves must never be checked against stick/film trim. A
+    # -BTL- file carries the "sleeve" keyword, which could otherwise pull it onto
+    # a stick row (both are _spec_format=='film'). Drop stick/film rows outright
+    # for a bottle-sleeve file — a wrong trim check is worse than none.
+    file_is_bottle_sleeve = _is_bottle_sleeve(fname)
+    if file_is_bottle_sleeve:
+        candidates = [r for r in candidates if _spec_format(r) != 'film']
+
     if not candidates:
         return {}
     if len(candidates) == 1:
@@ -400,12 +454,17 @@ def _match_spec_row(gtin_list: list, fname: str, spec_rows: list) -> dict:
 
     # 3. Several flavour matches — separate them by format.
     want = ''
-    if any(kw in fname_lower for kw in _POUCH_KEYWORDS):
+    if file_is_bottle_sleeve:
+        want = 'bottle_sleeve'
+    elif any(kw in fname_lower for kw in _POUCH_KEYWORDS):
         want = 'pouch'
     elif any(kw in fname_lower for kw in _FILM_KEYWORDS):
         want = 'film'
     if want:
-        same = [r for r in candidates if _spec_format(r) == want]
+        # A bottle-sleeve file accepts a row tagged bottle_sleeve OR the generic
+        # bottle (pouch) format — same physical product, different sheet wording.
+        ok = {'bottle_sleeve', 'pouch'} if want == 'bottle_sleeve' else {want}
+        same = [r for r in candidates if _spec_format(r) in ok]
         if len(same) == 1:
             return same[0]
         if same:
@@ -420,6 +479,78 @@ def _match_spec_row(gtin_list: list, fname: str, spec_rows: list) -> dict:
     if len({_shape(r) for r in candidates}) == 1:
         return candidates[0]
     return {}
+
+
+def _select_die_template(fname: str, ocr_text: str = '', matched_spec: dict = None,
+                         brand_config: dict = None):
+    """Return the locked die template for a job, or None.
+
+    A bottle shrink-sleeve job (by -BTL- token / sleeve keyword, a matched spec
+    row of that format, or an explicit format=Bottle from the UI picker) loads
+    the one registered die so its trim, panel map and mm constants are reused for
+    every flavor without re-measuring. Flavor swaps never recalibrate."""
+    if not DIE_TEMPLATES_AVAILABLE:
+        return None
+    matched_spec = matched_spec or {}
+    brand_config = brand_config or {}
+    fmt = str(brand_config.get('format') or brand_config.get('packaging_type') or '').lower()
+    is_sleeve = (
+        _is_bottle_sleeve(fname, ocr_text, matched_spec.get('packaging_type', ''))
+        or _spec_format(matched_spec) == 'bottle_sleeve'
+        or fmt in ('bottle', 'bottle_sleeve', 'sleeve', 'shrink sleeve', 'shrink_sleeve')
+    )
+    if is_sleeve:
+        return _die_templates.get('prodough_bottle_shrink_sleeve')
+    return None
+
+
+def _tesseract_text(pil_img, psm: int = 6) -> str:
+    """Run Tesseract on a PIL image via a temp PNG. '' on any failure.
+
+    Matches the engine's other Tesseract calls (--oem 3, -l eng); only the input
+    plumbing differs (an in-memory crop rather than a saved page)."""
+    import tempfile
+    tmp = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as fh:
+            tmp = fh.name
+        pil_img.save(tmp)
+        out = subprocess.run(
+            ['tesseract', tmp, 'stdout', '--oem', '3', '--psm', str(psm), '-l', 'eng'],
+            capture_output=True, text=True, timeout=90,
+        )
+        return out.stdout or ''
+    except Exception:
+        return ''
+    finally:
+        if tmp and os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+
+def _read_front_panel(img_path: str, fraction) -> str:
+    """OCR just the FRONT panel of a flat sleeve layout.
+
+    A shrink-sleeve flat is 3 panels wide (wrap | FRONT layflat | wrap), so the
+    stick-style left-half split reads the seam, not the front. Cropping the
+    template's FRONT fraction puts the front call-outs where the front-vs-NFP
+    check expects them. Best-effort: any failure returns '' and the caller keeps
+    the existing whole-panel bundle."""
+    if not (PIL_AVAILABLE and fraction):
+        return ''
+    try:
+        im = Image.open(img_path).convert('RGB')
+        w, h = im.size
+        x0 = max(0, int(round(fraction[0] * w)))
+        x1 = min(w, int(round(fraction[1] * w)))
+        if x1 - x0 < 20:
+            return ''
+        crop = im.crop((x0, 0, x1, h))
+        return _tesseract_text(crop, psm=6)
+    except Exception:
+        return ''
 
 
 def _should_run_vision(pre_claude_text: str, front_ocr: str, fname: str, fill_weight) -> bool:
@@ -1192,6 +1323,21 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
     _sku_lookup = matched_spec.get('sku') if matched_spec else None
     _prior_snapshot = _fetch_prior_snapshot(_gtin_lookup, _sku_lookup)
 
+    # Locked die template (bottle shrink sleeve, …): registered once and reused
+    # for every flavor on that die, so a proof never re-measures. Selected by the
+    # -BTL- token, sleeve keywords, a matching spec row, or a format=Bottle picker.
+    _die_template = _select_die_template(fname, combined_text, matched_spec, brand_config)
+
+    # Panel-aware front read: a sleeve flat is wrap|FRONT|wrap, so the stick-style
+    # left-half is the seam, not the front. With a die locked, OCR its FRONT panel
+    # and fold it into the front-vs-NFP text — additive, so it never loses signal.
+    _front_panel_text = ''
+    if _die_template and DIE_TEMPLATES_AVAILABLE:
+        _front_panel_text = _read_front_panel(
+            img_path, _die_templates.front_panel_fraction(_die_template))
+    _nfp_front_text = '\n'.join(t for t in
+                                (_front_panel_text, ocr_left, ocr_inv_left, ocr_inv_right) if t)
+
     if brand_mode == 'generic':
         is_film = brand_config.get('packaging_type', 'other') == 'stick'
         brand_name = brand_config.get('brand_name', '')
@@ -1204,7 +1350,7 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
             'prep':     _check_prep_block(label_text, _panel),
             'ingredients': _check_ingredient_drift(_snapshot, _prior_snapshot),
             'claims':   _check_claims(_snapshot, _prior_snapshot),
-            'specs':    _check_print_specs(pdf_path, brand_config, matched_spec),
+            'specs':    _check_print_specs(pdf_path, brand_config, matched_spec, template=_die_template),
         }
         if is_film:
             checks['wind'] = _check_wind_direction(combined_text, effective_wind)
@@ -1214,7 +1360,7 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
         checks = {
             'gtin':     _check_gtin(combined_text, fname, gtin_rows, barcode_gtins),
             'netwt':    _check_net_weight(_panel, fill_weight_g=_fill_weight, fname=fname, serving_vision_backed=_netwt_vision_backed),
-            'nfp':      _check_nfp(label_text, front_text=ocr_left + '\n' + ocr_inv_left + '\n' + ocr_inv_right, vision_nutrition=vision_nutrition),
+            'nfp':      _check_nfp(label_text, front_text=_nfp_front_text, vision_nutrition=vision_nutrition),
             'eyemark':  _check_eyemark(img, is_film, fname, required_eyemark, vision_eyemark=vision_eyemark),
             'spelling': _check_spelling(label_text, fname),
             'fda':      _check_fda(label_text, fname, vision_allergens=vision_allergens),
@@ -1224,7 +1370,7 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
         }
         # Print Specs and Wind Direction are press-proof checks — skip for art proofs
         if proof_type != 'art':
-            checks['specs'] = _check_print_specs(pdf_path, brand_config, matched_spec)
+            checks['specs'] = _check_print_specs(pdf_path, brand_config, matched_spec, template=_die_template)
             if effective_wind:
                 checks['wind'] = _check_wind_direction(combined_text, effective_wind)
 
@@ -1270,10 +1416,27 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
                          if isinstance(c, dict)
                          and str(c.get('status', '')).upper() in ('UNVERIFIED', 'UNKNOWN')]
 
+    # Locked-die metadata: recorded on the result so the job record and the
+    # ReadyDoc ingest summary both carry which die a flavor was proofed against.
+    _die_meta = None
+    if _die_template:
+        _die_meta = {
+            'template_id': _die_template.get('template_id'),
+            'template_version': _die_template.get('template_version'),
+            'format': _die_template.get('format'),
+            'die_product_id': _die_template.get('die_product_id'),
+            'die_sha256': (_die_templates.die_sha256(_die_template)
+                           if DIE_TEMPLATES_AVAILABLE else None),
+            'mm_constants': (_die_templates.mm_constants(_die_template)
+                             if DIE_TEMPLATES_AVAILABLE else None),
+        }
+
     return {
         'filename': fname,
         'img_path': img_path,
         'img_web': img_path,
+        'format': (_die_template.get('format') if _die_template else None),
+        'die_template': _die_meta,
         'ocr_preview': ('[' + _vision_diag + ']\n\n' + combined_text)[:3000] if _vision_diag else combined_text[:3000],
         'ocr_text': combined_text,
         'checks': checks,
@@ -3893,17 +4056,20 @@ def _get_ocg_names(doc) -> list:
 
 
 def _check_print_specs(pdf_path: str, brand_config: dict = None,
-                       matched_spec: dict = None) -> dict:
+                       matched_spec: dict = None, template: dict = None) -> dict:
     """
     Read actual PDF vector data using PyMuPDF.
     Checks dimensions, bleed, spot/Pantone colors, die lines, and RGB content.
     No OCR — all results are exact.
     If matched_spec is provided (from the Master SKU Spec Sheet), its values
     override brand_config for dimension/material/spot color validation.
+    If a locked die template is provided, its trim / die-line rule are the
+    authoritative expectation (reused for every flavor on that die).
     """
     issues, notes = [], []
     brand_config = brand_config or {}
     matched_spec = matched_spec or {}
+    template = template or {}
     proof_type = brand_config.get('proof_type', 'press')
     pts_to_mm = 25.4 / 72
 
@@ -3957,20 +4123,36 @@ def _check_print_specs(pdf_path: str, brand_config: dict = None,
                 notes.append('No TrimBox found (art proof — no finishing panel expected). '
                              'Add a TrimBox before submitting press-ready files.')
 
-        # Compare against expected spec dimensions (spec sheet overrides brand_config)
-        spec_w = matched_spec.get('trim_width_mm') or brand_config.get('spec_width_mm')
-        spec_h = matched_spec.get('trim_height_mm') or brand_config.get('spec_height_mm')
+        # Compare against expected dimensions. A locked die template wins over the
+        # spec sheet, which wins over brand_config.
+        tmpl_spec = template.get('spec', {})
+        spec_w = tmpl_spec.get('trim_width_mm') or matched_spec.get('trim_width_mm') or brand_config.get('spec_width_mm')
+        spec_h = tmpl_spec.get('trim_height_mm') or matched_spec.get('trim_height_mm') or brand_config.get('spec_height_mm')
         dim_ref = (tb_w, tb_h) if tb_w else (mb_w, mb_h)
         dim_label = 'trim' if tb_w else 'page'
-        if spec_w and spec_h and dim_ref[0]:
+
+        # A die may accept several valid layouts (e.g. useable print area OR the
+        # full slit × cut length for a shrink sleeve). Match against any of them.
+        accepted = [list(p) for p in (tmpl_spec.get('accepted_trims_mm') or [])]
+        if spec_w and spec_h and [spec_w, spec_h] not in accepted:
+            accepted.insert(0, [spec_w, spec_h])
+
+        if dim_ref[0] and accepted:
             tol = 2.0  # mm
-            fits = (
-                (abs(dim_ref[0] - spec_w) <= tol and abs(dim_ref[1] - spec_h) <= tol) or
-                (abs(dim_ref[0] - spec_h) <= tol and abs(dim_ref[1] - spec_w) <= tol)
-            )
-            if fits:
-                notes.append(f'Dimensions match spec: {spec_w} × {spec_h} mm ✓')
-            else:
+
+            def _fits(pair):
+                a, b = pair
+                return ((abs(dim_ref[0] - a) <= tol and abs(dim_ref[1] - b) <= tol) or
+                        (abs(dim_ref[0] - b) <= tol and abs(dim_ref[1] - a) <= tol))
+
+            hit = next((p for p in accepted if _fits(p)), None)
+            if hit:
+                if template:
+                    notes.append(f'Dimensions match locked die {template.get("template_id")}: '
+                                 f'{hit[0]} × {hit[1]} mm ✓')
+                else:
+                    notes.append(f'Dimensions match spec: {hit[0]} × {hit[1]} mm ✓')
+            elif spec_w and spec_h:
                 # ≥1.9× scale difference indicates a multi-panel flat/die-cut layout where
                 # the TrimBox captures all panels unfolded (front+back+gusset) while the spec
                 # stores the finished single-panel size. Flag as a note, not a critical error.
@@ -4044,18 +4226,21 @@ def _check_print_specs(pdf_path: str, brand_config: dict = None,
         die_layers = [l for l in ocg_names
                       if any(kw in l.lower().replace('_', ' ') for kw in _DIELINE_KEYWORDS)]
 
+        die_required = bool(tmpl_spec.get('die_line_required') or matched_spec.get('die_line_required'))
         if die_spots:
             notes.append(f'Die line spot color detected: {", ".join(die_spots)} ✓')
         elif die_layers:
             notes.append(f'Die line layer detected: {", ".join(die_layers)} ✓')
         else:
-            die_sev = 'critical' if matched_spec.get('die_line_required') else 'warning'
+            die_sev = 'critical' if die_required else 'warning'
+            _die_src = ('the locked die template' if tmpl_spec.get('die_line_required')
+                        else 'the master spec sheet')
             issues.append({'severity': die_sev,
                            'message': 'No die line spot color or layer detected. '
                                       'Expected a spot color named "Dieline", "CutContour", "Die", '
                                       'or similar. Verify die lines are present and correctly labeled '
                                       'in the file before sending to print.'
-                                      + (' Die line is required per the master spec sheet.' if die_sev == 'critical' else '')})
+                                      + (f' Die line is required per {_die_src}.' if die_sev == 'critical' else '')})
 
         # ── RGB content ───────────────────────────────────────────────────────
         has_rgb = False
@@ -4128,6 +4313,20 @@ def _check_print_specs(pdf_path: str, brand_config: dict = None,
                 notes.append('Material type: not detected in PDF text. '
                              'If this is a press proof, verify the material spec in the finishing section '
                              'of the proof form manually.')
+
+        # ── Locked die template note ──────────────────────────────────────────
+        if template:
+            _mm = template.get('mm', {})
+            _sha = None
+            if DIE_TEMPLATES_AVAILABLE:
+                _sha = _die_templates.die_sha256(template)
+            _sha_txt = _sha[:12] if _sha else 'pending (fixture not committed)'
+            _panels = '|'.join(p['name'] for p in template.get('panel_map', []))
+            notes.append(
+                f'Locked die: {template.get("template_id")} v{template.get("template_version")} '
+                f'({template.get("die_product_id", "")}) — layflat {_mm.get("layflat")} mm, '
+                f'print {_mm.get("print_w")} × {_mm.get("print_h")} mm, slit {_mm.get("slit_w")} mm. '
+                f'Panels: {_panels}. Fixture sha {_sha_txt}.')
 
         # ── Spec sheet match note ─────────────────────────────────────────────
         if matched_spec:
