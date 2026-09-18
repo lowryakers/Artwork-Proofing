@@ -41,9 +41,16 @@ _CHECK_LABEL = {
     'wind': 'Wind direction',
 }
 
-# The engine grades issues critical / warning / info; ReadyDoc stores
-# pass / fail / warn. Info is a note, not a finding, so it does not travel.
-_SEVERITY = {'critical': 'fail', 'warning': 'warn'}
+# The engine grades issues critical / warning / suspect / review / info;
+# ReadyDoc stores only pass / fail / warn (server clamps anything else to warn
+# anyway). Info is a note, not a finding, so it does not travel. suspect and
+# review are real findings — "the tool's read is doubtful" or "needs a human
+# look" — and must never be silently dropped into a false pass.
+_SEVERITY = {'critical': 'fail', 'warning': 'warn', 'suspect': 'warn', 'review': 'warn'}
+
+# Check-block statuses that mean "not evaluated" — must file as warn, never
+# pass, even when the block carries no graded issues.
+_UNVERIFIED_STATUSES = {'UNVERIFIED', 'UNKNOWN', 'SUSPECT'}
 
 
 def enabled() -> bool:
@@ -97,27 +104,55 @@ def fetch_prior_snapshot(gtin=None, sku=None) -> dict:
 
 
 def _checks_from_result(result: dict) -> list:
-    """Flatten one file's check output into ReadyDoc's flat check list."""
+    """Flatten one file's check output into ReadyDoc's flat check list.
+
+    Never files a false pass: an issue whose severity we don't recognize warns
+    rather than vanishing, and a check block left UNVERIFIED/UNKNOWN/SUSPECT
+    (no graded issues, so nothing below would otherwise fire) files as warn —
+    "not evaluated" must never read as "evaluated and fine."
+    """
     out = []
     for key, block in (result.get('checks') or {}).items():
         if not isinstance(block, dict):
             continue
         label = _CHECK_LABEL.get(key, key)
         issues = block.get('issues') or []
-        graded = [i for i in issues if _SEVERITY.get(i.get('severity'))]
-        if not graded:
-            # No findings worth escalating is itself worth recording: a version
-            # showing "eyemark: pass" is the evidence that it was looked at.
-            if block.get('skipped'):
-                continue
-            out.append({'name': label, 'result': 'pass'})
+        graded = []
+        for issue in issues:
+            sev = issue.get('severity')
+            mapped = _SEVERITY.get(sev)
+            if mapped is None and sev not in (None, 'info'):
+                # A severity this map doesn't know about yet is not "nothing" —
+                # warn rather than let an unrecognized finding disappear.
+                mapped = 'warn'
+            if mapped:
+                graded.append((issue, mapped))
+
+        if graded:
+            for issue, mapped in graded:
+                out.append({
+                    'name': f"{label} — {str(issue.get('message', ''))[:80]}",
+                    'result': mapped,
+                    'detail': str(issue.get('message', ''))[:1000],
+                })
             continue
-        for issue in graded:
-            out.append({
-                'name': f"{label} — {str(issue.get('message', ''))[:80]}",
-                'result': _SEVERITY[issue['severity']],
-                'detail': str(issue.get('message', ''))[:1000],
-            })
+
+        if block.get('skipped'):
+            continue
+
+        status = str(block.get('status', '')).upper()
+        if status in _UNVERIFIED_STATUSES:
+            # Lead with the limitation, not reassurance. Prefer the engine's own
+            # "not verified" note when it left one; else a generic fallback.
+            note = next((n for n in (block.get('notes') or [])
+                        if 'not verified' in str(n).lower()), None)
+            detail = str(note or f'{label} could not be fully evaluated — not verified.')[:1000]
+            out.append({'name': label, 'result': 'warn', 'detail': detail})
+            continue
+
+        # No findings worth escalating is itself worth recording: a version
+        # showing "eyemark: pass" is the evidence that it was looked at.
+        out.append({'name': label, 'result': 'pass'})
     return out
 
 
