@@ -18,6 +18,7 @@ Env:
   READYDOC_TOKEN  same value as PRODUCT_MASTER_TOKEN on the ReadyDoc service
 """
 import json
+import mimetypes
 import os
 import threading
 import urllib.error
@@ -41,9 +42,16 @@ _CHECK_LABEL = {
     'wind': 'Wind direction',
 }
 
-# The engine grades issues critical / warning / info; ReadyDoc stores
-# pass / fail / warn. Info is a note, not a finding, so it does not travel.
-_SEVERITY = {'critical': 'fail', 'warning': 'warn'}
+# The engine grades issues critical / warning / suspect / review / info;
+# ReadyDoc stores only pass / fail / warn (server clamps anything else to warn
+# anyway). Info is a note, not a finding, so it does not travel. suspect and
+# review are real findings — "the tool's read is doubtful" or "needs a human
+# look" — and must never be silently dropped into a false pass.
+_SEVERITY = {'critical': 'fail', 'warning': 'warn', 'suspect': 'warn', 'review': 'warn'}
+
+# Check-block statuses that mean "not evaluated" — must file as warn, never
+# pass, even when the block carries no graded issues.
+_UNVERIFIED_STATUSES = {'UNVERIFIED', 'UNKNOWN', 'SUSPECT'}
 
 
 def enabled() -> bool:
@@ -74,6 +82,70 @@ def _get(path: str, params: dict) -> dict:
         return json.loads(resp.read().decode('utf-8') or '{}')
 
 
+def _post_multipart(path: str, fields: dict, file_path: str, file_field: str = 'files') -> dict:
+    """POST a single file as multipart/form-data (stdlib only — no new deps).
+
+    Mirrors _post's auth (READYDOC_TOKEN query param). `fields` are sent as
+    plain form fields alongside the file (ReadyDoc's ingest/files route reads
+    `kind` this way); `file_field` matches the multer field name on that route.
+    """
+    base = os.environ['READYDOC_URL'].rstrip('/')
+    token = os.environ['READYDOC_TOKEN']
+    boundary = 'readydoc-boundary-' + os.urandom(16).hex()
+
+    with open(file_path, 'rb') as fh:
+        file_bytes = fh.read()
+    filename = os.path.basename(file_path)
+    content_type = mimetypes.guess_type(filename)[0] or 'application/octet-stream'
+
+    body = bytearray()
+    for key, value in (fields or {}).items():
+        body += f'--{boundary}\r\n'.encode()
+        body += f'Content-Disposition: form-data; name="{key}"\r\n\r\n'.encode()
+        body += f'{value}\r\n'.encode()
+    body += f'--{boundary}\r\n'.encode()
+    body += (f'Content-Disposition: form-data; name="{file_field}"; '
+            f'filename="{filename}"\r\n').encode()
+    body += f'Content-Type: {content_type}\r\n\r\n'.encode()
+    body += file_bytes
+    body += f'\r\n--{boundary}--\r\n'.encode()
+
+    req = urllib.request.Request(
+        f'{base}{path}?token={urllib.parse.quote(token)}',
+        data=bytes(body),
+        headers={
+            'Content-Type': f'multipart/form-data; boundary={boundary}',
+            'User-Agent': 'artwork-proofing',
+        },
+        method='POST',
+    )
+    with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:
+        return json.loads(resp.read().decode('utf-8') or '{}')
+
+
+def _attach_file(version_id: str, kind: str, file_path) -> None:
+    """Attach one file (preview PNG or print PDF) to a just-ingested version.
+
+    Best-effort: a missing path, a 503 (ReadyDoc's R2 storage not configured),
+    or any other failure is logged and swallowed — the JSON ingest already
+    succeeded, and a thumbnail is a nice-to-have, never a reason to fail the
+    proof run.
+    """
+    if not file_path or not os.path.exists(file_path):
+        return
+    try:
+        _post_multipart(f'/api/artwork/ingest/{version_id}/files', {'kind': kind}, file_path)
+    except urllib.error.HTTPError as exc:
+        body = ''
+        try:
+            body = exc.read().decode('utf-8')[:200]
+        except Exception:
+            pass
+        print(f'[readydoc] file attach ({kind}): HTTP {exc.code} {body}')
+    except Exception as exc:
+        print(f'[readydoc] file attach ({kind}): {exc}')
+
+
 def fetch_prior_snapshot(gtin=None, sku=None) -> dict:
     """Return the most recent stored label snapshot for this product from
     ReadyDoc's artwork history, or None. Never raises — a ReadyDoc outage or a
@@ -97,27 +169,55 @@ def fetch_prior_snapshot(gtin=None, sku=None) -> dict:
 
 
 def _checks_from_result(result: dict) -> list:
-    """Flatten one file's check output into ReadyDoc's flat check list."""
+    """Flatten one file's check output into ReadyDoc's flat check list.
+
+    Never files a false pass: an issue whose severity we don't recognize warns
+    rather than vanishing, and a check block left UNVERIFIED/UNKNOWN/SUSPECT
+    (no graded issues, so nothing below would otherwise fire) files as warn —
+    "not evaluated" must never read as "evaluated and fine."
+    """
     out = []
     for key, block in (result.get('checks') or {}).items():
         if not isinstance(block, dict):
             continue
         label = _CHECK_LABEL.get(key, key)
         issues = block.get('issues') or []
-        graded = [i for i in issues if _SEVERITY.get(i.get('severity'))]
-        if not graded:
-            # No findings worth escalating is itself worth recording: a version
-            # showing "eyemark: pass" is the evidence that it was looked at.
-            if block.get('skipped'):
-                continue
-            out.append({'name': label, 'result': 'pass'})
+        graded = []
+        for issue in issues:
+            sev = issue.get('severity')
+            mapped = _SEVERITY.get(sev)
+            if mapped is None and sev not in (None, 'info'):
+                # A severity this map doesn't know about yet is not "nothing" —
+                # warn rather than let an unrecognized finding disappear.
+                mapped = 'warn'
+            if mapped:
+                graded.append((issue, mapped))
+
+        if graded:
+            for issue, mapped in graded:
+                out.append({
+                    'name': f"{label} — {str(issue.get('message', ''))[:80]}",
+                    'result': mapped,
+                    'detail': str(issue.get('message', ''))[:1000],
+                })
             continue
-        for issue in graded:
-            out.append({
-                'name': f"{label} — {str(issue.get('message', ''))[:80]}",
-                'result': _SEVERITY[issue['severity']],
-                'detail': str(issue.get('message', ''))[:1000],
-            })
+
+        if block.get('skipped'):
+            continue
+
+        status = str(block.get('status', '')).upper()
+        if status in _UNVERIFIED_STATUSES:
+            # Lead with the limitation, not reassurance. Prefer the engine's own
+            # "not verified" note when it left one; else a generic fallback.
+            note = next((n for n in (block.get('notes') or [])
+                        if 'not verified' in str(n).lower()), None)
+            detail = str(note or f'{label} could not be fully evaluated — not verified.')[:1000]
+            out.append({'name': label, 'result': 'warn', 'detail': detail})
+            continue
+
+        # No findings worth escalating is itself worth recording: a version
+        # showing "eyemark: pass" is the evidence that it was looked at.
+        out.append({'name': label, 'result': 'pass'})
     return out
 
 
@@ -165,7 +265,7 @@ def publish_job(job_id: str, results: list) -> None:
             'die_template': result.get('die_template'),
         }
         try:
-            _post('/api/artwork/ingest', payload)
+            resp = _post('/api/artwork/ingest', payload)
         except urllib.error.HTTPError as exc:
             body = ''
             try:
@@ -173,8 +273,21 @@ def publish_job(job_id: str, results: list) -> None:
             except Exception:
                 pass
             print(f'[readydoc] {result.get("filename")}: HTTP {exc.code} {body}')
+            continue
         except Exception as exc:
             print(f'[readydoc] {result.get("filename")}: {exc}')
+            continue
+
+        # Attach the rendered preview (and the source print PDF, when available)
+        # to the version just ingested, so the Artwork board shows the actual
+        # pack instead of a generic icon. Best-effort — see _attach_file.
+        version_id = (resp or {}).get('version_id')
+        if not version_id:
+            print(f'[readydoc] {result.get("filename")}: ingest ok, no version_id '
+                 f'in response — skipping file attach')
+            continue
+        _attach_file(version_id, 'preview', result.get('img_path'))
+        _attach_file(version_id, 'print_pdf', result.get('pdf_path'))
 
 
 def publish_job_async(job_id: str, results: list) -> None:
