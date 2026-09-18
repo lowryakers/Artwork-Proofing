@@ -18,6 +18,7 @@ Env:
   READYDOC_TOKEN  same value as PRODUCT_MASTER_TOKEN on the ReadyDoc service
 """
 import json
+import mimetypes
 import os
 import threading
 import urllib.error
@@ -79,6 +80,70 @@ def _get(path: str, params: dict) -> dict:
     req = urllib.request.Request(url, headers={'User-Agent': 'artwork-proofing'}, method='GET')
     with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:
         return json.loads(resp.read().decode('utf-8') or '{}')
+
+
+def _post_multipart(path: str, fields: dict, file_path: str, file_field: str = 'files') -> dict:
+    """POST a single file as multipart/form-data (stdlib only — no new deps).
+
+    Mirrors _post's auth (READYDOC_TOKEN query param). `fields` are sent as
+    plain form fields alongside the file (ReadyDoc's ingest/files route reads
+    `kind` this way); `file_field` matches the multer field name on that route.
+    """
+    base = os.environ['READYDOC_URL'].rstrip('/')
+    token = os.environ['READYDOC_TOKEN']
+    boundary = 'readydoc-boundary-' + os.urandom(16).hex()
+
+    with open(file_path, 'rb') as fh:
+        file_bytes = fh.read()
+    filename = os.path.basename(file_path)
+    content_type = mimetypes.guess_type(filename)[0] or 'application/octet-stream'
+
+    body = bytearray()
+    for key, value in (fields or {}).items():
+        body += f'--{boundary}\r\n'.encode()
+        body += f'Content-Disposition: form-data; name="{key}"\r\n\r\n'.encode()
+        body += f'{value}\r\n'.encode()
+    body += f'--{boundary}\r\n'.encode()
+    body += (f'Content-Disposition: form-data; name="{file_field}"; '
+            f'filename="{filename}"\r\n').encode()
+    body += f'Content-Type: {content_type}\r\n\r\n'.encode()
+    body += file_bytes
+    body += f'\r\n--{boundary}--\r\n'.encode()
+
+    req = urllib.request.Request(
+        f'{base}{path}?token={urllib.parse.quote(token)}',
+        data=bytes(body),
+        headers={
+            'Content-Type': f'multipart/form-data; boundary={boundary}',
+            'User-Agent': 'artwork-proofing',
+        },
+        method='POST',
+    )
+    with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:
+        return json.loads(resp.read().decode('utf-8') or '{}')
+
+
+def _attach_file(version_id: str, kind: str, file_path) -> None:
+    """Attach one file (preview PNG or print PDF) to a just-ingested version.
+
+    Best-effort: a missing path, a 503 (ReadyDoc's R2 storage not configured),
+    or any other failure is logged and swallowed — the JSON ingest already
+    succeeded, and a thumbnail is a nice-to-have, never a reason to fail the
+    proof run.
+    """
+    if not file_path or not os.path.exists(file_path):
+        return
+    try:
+        _post_multipart(f'/api/artwork/ingest/{version_id}/files', {'kind': kind}, file_path)
+    except urllib.error.HTTPError as exc:
+        body = ''
+        try:
+            body = exc.read().decode('utf-8')[:200]
+        except Exception:
+            pass
+        print(f'[readydoc] file attach ({kind}): HTTP {exc.code} {body}')
+    except Exception as exc:
+        print(f'[readydoc] file attach ({kind}): {exc}')
 
 
 def fetch_prior_snapshot(gtin=None, sku=None) -> dict:
@@ -200,7 +265,7 @@ def publish_job(job_id: str, results: list) -> None:
             'die_template': result.get('die_template'),
         }
         try:
-            _post('/api/artwork/ingest', payload)
+            resp = _post('/api/artwork/ingest', payload)
         except urllib.error.HTTPError as exc:
             body = ''
             try:
@@ -208,8 +273,21 @@ def publish_job(job_id: str, results: list) -> None:
             except Exception:
                 pass
             print(f'[readydoc] {result.get("filename")}: HTTP {exc.code} {body}')
+            continue
         except Exception as exc:
             print(f'[readydoc] {result.get("filename")}: {exc}')
+            continue
+
+        # Attach the rendered preview (and the source print PDF, when available)
+        # to the version just ingested, so the Artwork board shows the actual
+        # pack instead of a generic icon. Best-effort — see _attach_file.
+        version_id = (resp or {}).get('version_id')
+        if not version_id:
+            print(f'[readydoc] {result.get("filename")}: ingest ok, no version_id '
+                 f'in response — skipping file attach')
+            continue
+        _attach_file(version_id, 'preview', result.get('img_path'))
+        _attach_file(version_id, 'print_pdf', result.get('pdf_path'))
 
 
 def publish_job_async(job_id: str, results: list) -> None:

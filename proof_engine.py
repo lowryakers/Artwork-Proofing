@@ -1435,6 +1435,9 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
         'filename': fname,
         'img_path': img_path,
         'img_web': img_path,
+        # Source print PDF — so a version filed to ReadyDoc can attach the actual
+        # press file (kind=print_pdf), not just the rendered preview PNG.
+        'pdf_path': pdf_path,
         'format': (_die_template.get('format') if _die_template else None),
         'die_template': _die_meta,
         'ocr_preview': ('[' + _vision_diag + ']\n\n' + combined_text)[:3000] if _vision_diag else combined_text[:3000],
