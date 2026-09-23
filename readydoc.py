@@ -32,6 +32,7 @@ _CHECK_LABEL = {
     'gtin': 'GTIN / barcode',
     'netwt': 'Nutrition panel vs net weight',
     'nfp': 'Nutrition panel vs front',
+    'panel': 'Nutrition panel vs approved (ReadyDoc)',
     'eyemark': 'Eyemark',
     'spelling': 'Spelling & brand names',
     'fda': 'FDA compliance',
@@ -50,8 +51,12 @@ _CHECK_LABEL = {
 _SEVERITY = {'critical': 'fail', 'warning': 'warn', 'suspect': 'warn', 'review': 'warn'}
 
 # Check-block statuses that mean "not evaluated" — must file as warn, never
-# pass, even when the block carries no graded issues.
-_UNVERIFIED_STATUSES = {'UNVERIFIED', 'UNKNOWN', 'SUSPECT'}
+# pass, even when the block carries no graded issues. PANEL_MISSING/
+# PANEL_NOT_APPROVED/PANEL_SUPERSEDED are the approved-nutrition-panel gate:
+# none of them says the artwork is wrong, only that nothing outside the artwork
+# has confirmed it yet — that must never read as a pass either.
+_UNVERIFIED_STATUSES = {'UNVERIFIED', 'UNKNOWN', 'SUSPECT',
+                        'PANEL_MISSING', 'PANEL_NOT_APPROVED', 'PANEL_SUPERSEDED'}
 
 
 def enabled() -> bool:
@@ -168,6 +173,65 @@ def fetch_prior_snapshot(gtin=None, sku=None) -> dict:
     return None
 
 
+def fetch_approved_panel(gtin=None, sku=None):
+    """The nutrition panel of record for a product, from ReadyDoc's
+    Products -> Nutrition panels tab, or None. Never raises — a ReadyDoc
+    outage, a 500, or a 404 (no panel record filed yet) all degrade to "no
+    panel to check against" (proof_engine reports that as PANEL_MISSING).
+
+    A 404 is distinct from a 200 with status:"draft" — a draft panel is a
+    real record that HAS NOT been approved (PANEL_NOT_APPROVED), while a 404
+    means no record exists at all (PANEL_MISSING). Both return values are
+    handled by the caller; this function only tells them apart by returning
+    the dict (draft or approved) or None (404 / outage / disabled).
+
+    Endpoint: GET /api/products/nutrition-panel?gtin=&sku=, returning
+    {"sku":, "gtin":, "version":, "status": "draft"|"approved", "panel": {...},
+    "front_callouts": {...}, ...}. See PROMPT_2 (companion: PROMPT_1 builds this
+    route in the ReadyDoc session) for the exact contract.
+    """
+    if not enabled() or (not gtin and not sku):
+        return None
+    try:
+        data = _get('/api/products/nutrition-panel', {'gtin': gtin, 'sku': sku})
+    except urllib.error.HTTPError as exc:
+        if exc.code != 404:
+            print(f'[readydoc] nutrition-panel fetch: HTTP {exc.code}')
+        return None
+    except Exception as exc:
+        print(f'[readydoc] nutrition-panel fetch: {exc}')
+        return None
+    return data if isinstance(data, dict) and data else None
+
+
+def fetch_prior_panel_version(gtin=None, sku=None):
+    """The nutrition-panel version this product was last proofed against, or
+    None. Detects PANEL_SUPERSEDED: the approved panel has been revised since
+    this SKU's last recorded proof, so even a clean match this run deserves a
+    conscious re-confirmation rather than being taken as still-current.
+
+    Reuses the same /api/artwork/snapshot endpoint as fetch_prior_snapshot —
+    ReadyDoc echoes panel_version back on that record when it was stored at
+    ingest time (see publish_job's payload). Degrades to None (no history, an
+    older ReadyDoc that doesn't echo it back, or an outage) — PANEL_SUPERSEDED
+    simply never fires without it. Never raises.
+    """
+    if not enabled() or (not gtin and not sku):
+        return None
+    try:
+        data = _get('/api/artwork/snapshot', {'gtin': gtin, 'sku': sku})
+    except Exception as exc:
+        print(f'[readydoc] prior panel-version fetch: {exc}')
+        return None
+    if not isinstance(data, dict):
+        return None
+    v = data.get('panel_version')
+    try:
+        return int(v) if v is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
 def _checks_from_result(result: dict) -> list:
     """Flatten one file's check output into ReadyDoc's flat check list.
 
@@ -263,6 +327,10 @@ def publish_job(job_id: str, results: list) -> None:
             # ReadyDoc; present only for bottle-sleeve (and future templated) jobs.
             'format': result.get('format'),
             'die_template': result.get('die_template'),
+            # The approved-panel version this file was proofed against, so a
+            # later run can detect PANEL_SUPERSEDED when the panel has since
+            # been revised. Additive — ignored by older ReadyDoc.
+            'panel_version': result.get('panel_version'),
         }
         try:
             resp = _post('/api/artwork/ingest', payload)

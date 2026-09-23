@@ -53,6 +53,14 @@ except ImportError:
 
 _UPLOAD_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'uploads')
 
+# Check-block statuses that mean "not evaluated" — a file carrying one of these
+# on any check is not fully_verified, regardless of severity. PANEL_MISSING/
+# PANEL_NOT_APPROVED/PANEL_SUPERSEDED are the approved-nutrition-panel gate:
+# none of them says the artwork is wrong, only that nothing outside the artwork
+# has confirmed it yet, which must never read as "checked and fine" either.
+_NOT_VERIFIED_STATUSES = ('UNVERIFIED', 'UNKNOWN', 'PANEL_MISSING', 'PANEL_NOT_APPROVED',
+                          'PANEL_SUPERSEDED')
+
 # ── In-memory job store ───────────────────────────────────────────────────────
 
 _jobs: dict = {}
@@ -553,16 +561,21 @@ def _read_front_panel(img_path: str, fraction) -> str:
         return ''
 
 
-def _should_run_vision(pre_claude_text: str, front_ocr: str, fname: str, fill_weight) -> bool:
+def _should_run_vision(pre_claude_text: str, front_ocr: str, fname: str, fill_weight,
+                       has_approved_panel: bool = False) -> bool:
     """Decide whether to escalate to Claude Vision. Run it when ANY compliance read
     is incomplete from Tesseract, OR when a fill weight is on file — a net-weight
     verdict is then in play and its serving/servings MUST come from a reliable
-    vision read, never Tesseract alone. Pure function so the gate is unit-testable."""
+    vision read, never Tesseract alone — OR when an approved nutrition panel is
+    on file to compare against: that comparison is exact-match, no tolerance, so
+    it must never rest on a Tesseract-only read either. Pure function so the
+    gate is unit-testable."""
     return bool(
         _ocr_needs_vision(pre_claude_text, front_text=front_ocr)          # nutrition missing
         or _is_film_rollstock(fname, pre_claude_text)                     # eyemark read
         or not re.search(r'\bcontains?\s*:', pre_claude_text.lower())     # FALCPA line missing
         or fill_weight is not None                                        # net-weight verdict in play
+        or has_approved_panel                                             # approved-panel verdict in play
     )
 
 
@@ -842,6 +855,20 @@ def _parse_vision_json(txt: str) -> dict:
         return dict(_empty, raw_text=txt)
 
 
+# Every field the durable crop read is asked for, beyond serving/servings
+# (handled separately). Field names match the ReadyDoc approved-panel contract
+# exactly (PROMPT_2 Part A) so the artwork read and the approved panel diff
+# without any renaming — see _PANEL_AMOUNT_FIELDS / _PANEL_DV_GROUPS below.
+_NFP_CROP_FIELDS = (
+    'serving_size_g', 'serving_size_cups', 'servings_per_container', 'calories',
+    'protein_g', 'total_carbohydrate_g', 'total_carbohydrate_dv', 'dietary_fiber_g',
+    'dietary_fiber_dv', 'sugar_alcohol_g', 'total_sugars_g', 'added_sugar_g',
+    'added_sugars_dv', 'total_fat_g', 'total_fat_dv', 'saturated_fat_g',
+    'saturated_fat_dv', 'trans_fat_g', 'cholesterol_mg', 'cholesterol_dv',
+    'sodium_mg', 'sodium_dv', 'vitamin_d_mcg', 'vitamin_d_dv', 'calcium_mg',
+    'calcium_dv', 'iron_mg', 'iron_dv', 'potassium_mg', 'potassium_dv',
+)
+
 _NFP_CROP_PROMPT = (
     'This image is a crop of ONE Nutrition Facts (or Supplement Facts) panel and nothing '
     'else. It may be MIRROR-REVERSED or rotated (these are film/pouch back panels printed '
@@ -850,17 +877,55 @@ _NFP_CROP_PROMPT = (
     'null>, "serving_size_desc": "<unit portion, e.g. \\"3/4 Cup\\", \\"4 Cupcakes\\", or '
     'null>", "serving_size_cups": <cup quantity as a decimal if given in cups, else null>, '
     '"servings_per_container": <the number on the line that literally reads "servings per '
-    'container"; keep decimals, drop "about"; null if absent>, "calories": <number or '
-    'null>, "protein_g": <number or null>, "total_carbohydrate_g": <number or null>, '
-    '"dietary_fiber_g": <number or null>, "sugar_alcohol_g": <grams of sugar alcohols / '
-    'erythritol, or null>, "added_sugar_g": <number or null>}\n'
+    'container"; keep decimals, drop "about"; null if absent>, '
+    '"calories": <number or null>, '
+    '"total_fat_g": <number or null>, "total_fat_dv": <the %DV integer for Total Fat, or '
+    'null>, "saturated_fat_g": <number or null>, "saturated_fat_dv": <%DV integer, or '
+    'null>, "trans_fat_g": <number or null>, '
+    '"cholesterol_mg": <number, or the string "<5" if the panel prints "<5mg", or null>, '
+    '"cholesterol_dv": <%DV integer, or null>, '
+    '"sodium_mg": <number or null>, "sodium_dv": <%DV integer, or null>, '
+    '"total_carbohydrate_g": <number or null>, "total_carbohydrate_dv": <%DV integer, or '
+    'null>, "dietary_fiber_g": <number, or the string "<1" if the panel prints "<1g", or '
+    'null>, "dietary_fiber_dv": <%DV integer, or null>, '
+    '"sugar_alcohol_g": <grams of sugar alcohols / erythritol, or null>, '
+    '"total_sugars_g": <number or null>, '
+    '"added_sugar_g": <number or null>, "added_sugars_dv": <%DV integer, or null>, '
+    '"protein_g": <number or null>, '
+    '"vitamin_d_mcg": <number or null>, "vitamin_d_dv": <%DV integer, or null>, '
+    '"calcium_mg": <number or null>, "calcium_dv": <%DV integer, or null>, '
+    '"iron_mg": <number or null>, "iron_dv": <%DV integer, or null>, '
+    '"potassium_mg": <number or null>, "potassium_dv": <%DV integer, or null>}\n'
     'Take servings-per-container ONLY from the literal "servings per container" line — '
-    'never a "Makes N" count. Read every row you can actually see, including Total '
-    'Carbohydrate, Dietary Fiber, and Sugar Alcohols. Numbers only, no units.\n'
+    'never a "Makes N" count. Read every row you can actually see. Numbers only, no units, '
+    'EXCEPT: a value printed as a threshold form ("<1", "<5", etc. — below the FDA rounding '
+    'threshold) must be returned as that exact string ("<1", "<5"), never coerced to 0 or to '
+    'the threshold number itself; those are three different, real declarations.\n'
     'CRITICAL: return null for any value you cannot clearly read FROM THIS IMAGE. Do NOT '
     'guess a typical or common value for the product type — a guessed "typical panel" '
     'number is a failure, not a fallback. If the crop is blurry, cut off, or unreadable, '
     'null is the correct answer for the fields you cannot see.')
+
+
+def _parse_nfp_amount(v):
+    """Parse one NFP amount from vision JSON. Numbers stay numbers; a '<1' / '<5'
+    threshold form (a real value below the FDA rounding threshold) is kept as
+    that exact string — coercing it to 0 or to the threshold number would
+    misrepresent what the panel actually prints, and an approved-panel diff
+    that did that could manufacture or hide a real mismatch."""
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        return v
+    if isinstance(v, str):
+        s = v.strip()
+        m = re.fullmatch(r'<\s*(\d+(?:\.\d+)?)', s)
+        if m:
+            return '<' + m.group(1)
+        m = re.search(r'-?\d+(?:\.\d+)?', s)
+        if m:
+            return float(m.group(0))
+    return None
 
 
 def _read_nfp_panel(img_path: str, bbox) -> dict:
@@ -924,16 +989,10 @@ def _read_nfp_panel(img_path: str, bbox) -> dict:
                 return {}
             data, _ = json.JSONDecoder().raw_decode(_txt[_start:])
             out = {}
-            for k in ('serving_size_g', 'serving_size_cups', 'servings_per_container', 'calories',
-                      'protein_g', 'total_carbohydrate_g', 'dietary_fiber_g', 'sugar_alcohol_g',
-                      'added_sugar_g'):
-                v = data.get(k)
-                if isinstance(v, (int, float)):
-                    out[k] = float(v)
-                elif isinstance(v, str):
-                    m = re.search(r'-?\d+(?:\.\d+)?', v)
-                    if m:
-                        out[k] = float(m.group(0))
+            for k in _NFP_CROP_FIELDS:
+                v = _parse_nfp_amount(data.get(k))
+                if v is not None:
+                    out[k] = v
             d = data.get('serving_size_desc')
             if isinstance(d, str) and d.strip() and d.strip().lower() not in ('null', 'none'):
                 out['serving_size_desc'] = d.strip()
@@ -1170,6 +1229,16 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
     if _fill_weight is None:
         _fill_weight = brand_config.get('fill_weight_g')
 
+    # Same reasoning, same source of truth pattern, one step further: an
+    # approved nutrition panel in ReadyDoc puts a verdict in play too, and that
+    # exact-match diff must not rest on a Tesseract-only read either. Computed
+    # up front (before the vision gate) so its presence can force vision on,
+    # same as fill weight above.
+    _gtin_lookup = barcode_gtins[0] if (barcode_gtins and len(set(barcode_gtins)) == 1) else None
+    _sku_lookup = matched_spec.get('sku') if matched_spec else None
+    _approved_panel = _fetch_approved_panel(_gtin_lookup, _sku_lookup)
+    _prior_panel_version = _fetch_prior_panel_version(_gtin_lookup, _sku_lookup)
+
     ocr_claude = ''
     vision_nutrition = None
     vision_allergens = None
@@ -1201,7 +1270,9 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
     # (flowwrap, sleeve, OCR-identified) always get the vision eyemark read.
     #   • a fill weight is on file (net-weight reconciliation will run and needs a
     #     RELIABLE serving/servings read — never trust Tesseract alone for a verdict)
-    _run_vision = _should_run_vision(_pre_claude_text, _front_ocr, fname, _fill_weight)
+    #   • an approved nutrition panel is on file (exact-match diff, same reasoning)
+    _run_vision = _should_run_vision(_pre_claude_text, _front_ocr, fname, _fill_weight,
+                                     has_approved_panel=_approved_panel is not None)
     if not ANTHROPIC_AVAILABLE:
         _vision_diag = 'vision: skipped — ANTHROPIC_API_KEY not set / anthropic not installed'
     elif not _run_vision:
@@ -1311,7 +1382,8 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
         or any((vision_panel or {}).get(k) is not None
                for k in ('serving_size_g', 'servings_per_container')))
 
-    # _fill_weight was computed up front (before the vision gate).
+    # _fill_weight, _approved_panel, and _prior_panel_version were all computed
+    # up front (before the vision gate). _gtin_lookup/_sku_lookup likewise.
 
     # Revision comparison (Checks 7 & 8): snapshot this label's content and pull
     # the prior proofed version for this SKU from stored history (ReadyDoc → local).
@@ -1319,9 +1391,28 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
     # DSHEA disclaimer detection is robust to vision omitting it from raw_text: the
     # first pass reports it as a structured boolean, OR-ed with the text regex.
     _snapshot['dshea_disclaimer'] = bool(_snapshot.get('dshea_disclaimer')) or vision_dshea
-    _gtin_lookup = barcode_gtins[0] if (barcode_gtins and len(set(barcode_gtins)) == 1) else None
-    _sku_lookup = matched_spec.get('sku') if matched_spec else None
     _prior_snapshot = _fetch_prior_snapshot(_gtin_lookup, _sku_lookup)
+
+    # Approved-nutrition-panel comparison (the outside-the-artwork source of
+    # truth): combine the isolated NFP-crop read (the full FDA field set) with
+    # the merged panel's more authoritative serving_size_g/servings_per_container
+    # and the settled calories/protein/added-sugar the front-vs-NFP check uses.
+    _artwork_panel_values = dict(nfp_read)
+    for _k in ('serving_size_g', 'servings_per_container'):
+        if _panel.get(_k) is not None:
+            _artwork_panel_values[_k] = _panel[_k]
+    _nfp_best = (vision_nutrition or {}).get('nfp') or {}
+    for _k in ('calories', 'protein_g', 'added_sugar_g'):
+        if _nfp_best.get(_k) is not None:
+            _artwork_panel_values[_k] = _nfp_best[_k]
+    _front_artwork_values = dict((vision_nutrition or {}).get('front_callout') or {})
+    _front_nc = _front_net_carbs_g(label_text)
+    if _front_nc is not None:
+        _front_artwork_values['net_carbs_g'] = _front_nc
+    _panel_check = _check_approved_panel(
+        _artwork_panel_values, _front_artwork_values, _snapshot.get('ingredients_raw'),
+        (vision_allergens or {}).get('contains_statement'),
+        _approved_panel, prior_panel_version=_prior_panel_version)
 
     # Locked die template (bottle shrink sleeve, …): registered once and reused
     # for every flavor on that die, so a proof never re-measures. Selected by the
@@ -1359,6 +1450,7 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
         proof_type = brand_config.get('proof_type', 'press')
         checks = {
             'gtin':     _check_gtin(combined_text, fname, gtin_rows, barcode_gtins),
+            'panel':    _panel_check,
             'netwt':    _check_net_weight(_panel, fill_weight_g=_fill_weight, fname=fname, serving_vision_backed=_netwt_vision_backed),
             'nfp':      _check_nfp(label_text, front_text=_nfp_front_text, vision_nutrition=vision_nutrition),
             'eyemark':  _check_eyemark(img, is_film, fname, required_eyemark, vision_eyemark=vision_eyemark),
@@ -1414,7 +1506,7 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
     # fine." Tracked separately from severity, counted in the run summary.
     unverified_checks = [k for k, c in checks.items()
                          if isinstance(c, dict)
-                         and str(c.get('status', '')).upper() in ('UNVERIFIED', 'UNKNOWN')]
+                         and str(c.get('status', '')).upper() in _NOT_VERIFIED_STATUSES]
 
     # Locked-die metadata: recorded on the result so the job record and the
     # ReadyDoc ingest summary both carry which die a flavor was proofed against.
@@ -1440,6 +1532,10 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
         'pdf_path': pdf_path,
         'format': (_die_template.get('format') if _die_template else None),
         'die_template': _die_meta,
+        # The approved-panel version this file was proofed against (None when
+        # no approved panel exists) — recorded so a later run can detect
+        # PANEL_SUPERSEDED once the panel is revised.
+        'panel_version': _panel_check.get('panel_version'),
         'ocr_preview': ('[' + _vision_diag + ']\n\n' + combined_text)[:3000] if _vision_diag else combined_text[:3000],
         'ocr_text': combined_text,
         'checks': checks,
@@ -2511,6 +2607,268 @@ def _check_superseded_nfp(panel: dict, matched_spec: dict) -> list:
     return issues
 
 
+# ── Approved nutrition panel (ReadyDoc source of truth) ───────────────────────
+#
+# Everything above compares the artwork to ITSELF (front vs its own NFP, its own
+# arithmetic). That catches a panel that contradicts itself, but not the more
+# dangerous case: a panel where every value is internally consistent and every
+# value is wrong, because it was transcribed from the wrong product. This check
+# compares the artwork to something OUTSIDE the artwork — the approved panel of
+# record in ReadyDoc — the same principle fill weight gave the net-weight check.
+
+# (engine field, approved-panel field, label, unit) — amount-only, no %DV row.
+_PANEL_AMOUNT_FIELDS = (
+    ('serving_size_g', 'serving_size_g', 'Serving size', 'g'),
+    ('servings_per_container', 'servings_per_container', 'Servings per container', ''),
+    ('calories', 'calories', 'Calories', ''),
+    ('trans_fat_g', 'trans_fat_g', 'Trans Fat', 'g'),
+    ('total_sugars_g', 'total_sugars_g', 'Total Sugars', 'g'),
+    ('protein_g', 'protein_g', 'Protein', 'g'),
+)
+# (amount engine field, amount approved field, dv engine field, dv approved field,
+#  label, unit) — amount + %DV reported together. added_sugar_g (singular) is
+# the engine's existing internal name; the approved-panel contract uses the
+# plural added_sugars_g — mapped here rather than renamed everywhere it's used.
+_PANEL_DV_GROUPS = (
+    ('total_fat_g', 'total_fat_g', 'total_fat_dv', 'total_fat_dv', 'Total Fat', 'g'),
+    ('saturated_fat_g', 'saturated_fat_g', 'saturated_fat_dv', 'saturated_fat_dv',
+     'Saturated Fat', 'g'),
+    ('cholesterol_mg', 'cholesterol_mg', 'cholesterol_dv', 'cholesterol_dv', 'Cholesterol', 'mg'),
+    ('sodium_mg', 'sodium_mg', 'sodium_dv', 'sodium_dv', 'Sodium', 'mg'),
+    ('total_carbohydrate_g', 'total_carbohydrate_g', 'total_carbohydrate_dv',
+     'total_carbohydrate_dv', 'Total Carbohydrate', 'g'),
+    ('dietary_fiber_g', 'dietary_fiber_g', 'dietary_fiber_dv', 'dietary_fiber_dv',
+     'Dietary Fiber', 'g'),
+    ('added_sugar_g', 'added_sugars_g', 'added_sugars_dv', 'added_sugars_dv', 'Added Sugars', 'g'),
+    ('vitamin_d_mcg', 'vitamin_d_mcg', 'vitamin_d_dv', 'vitamin_d_dv', 'Vitamin D', 'mcg'),
+    ('calcium_mg', 'calcium_mg', 'calcium_dv', 'calcium_dv', 'Calcium', 'mg'),
+    ('iron_mg', 'iron_mg', 'iron_dv', 'iron_dv', 'Iron', 'mg'),
+    ('potassium_mg', 'potassium_mg', 'potassium_dv', 'potassium_dv', 'Potassium', 'mg'),
+)
+
+
+def _fmt_amt(v) -> str:
+    """Format an amount for a message: '<5' stays '<5'; 25.0 -> '25'; 0.2 -> '0.2'."""
+    if isinstance(v, str):
+        return v
+    if isinstance(v, (int, float)):
+        s = f'{float(v):.2f}'.rstrip('0').rstrip('.')
+        return s or '0'
+    return str(v)
+
+
+def _amounts_equal(a, b) -> bool:
+    """Exact match, no tolerance — both sides are declaring the same number.
+    A '<5' threshold form only equals another '<5' (never a bare 5), so a real
+    change across the rounding threshold is never masked as a match."""
+    if a is None or b is None:
+        return False
+    if isinstance(a, str) or isinstance(b, str):
+        return str(a).strip().lower() == str(b).strip().lower()
+    try:
+        return abs(float(a) - float(b)) < 1e-9
+    except (TypeError, ValueError):
+        return a == b
+
+
+def _diff_panel_fields(artwork: dict, approved_panel: dict, version) -> tuple:
+    """Field-level diff between the artwork's read nutrition values and the
+    approved panel. Returns (issues, gap_notes):
+      - issues: one CRITICAL per field (or amount+%DV group) that both sides
+        declare and disagree on.
+      - gap_notes: (label, approved_value) pairs the approved panel declares
+        but the artwork could not read — a coverage gap, not a mismatch. Never
+        silently dropped: the caller surfaces these as 'review' issues so an
+        incomplete comparison can never pass as a clean VERIFIED.
+    """
+    issues, gaps = [], []
+    artwork = artwork or {}
+    approved_panel = approved_panel or {}
+
+    for a_key, p_key, label, unit in _PANEL_AMOUNT_FIELDS:
+        p_val = approved_panel.get(p_key)
+        if p_val is None:
+            continue
+        a_val = artwork.get(a_key)
+        if a_val is None:
+            gaps.append((label, p_val))
+            continue
+        if not _amounts_equal(a_val, p_val):
+            issues.append({'severity': 'critical', 'message': (
+                f'{label}: artwork reads {_fmt_amt(a_val)}{unit}, '
+                f'approved panel v{version} says {_fmt_amt(p_val)}{unit}')})
+
+    for a_amt_key, p_amt_key, a_dv_key, p_dv_key, label, unit in _PANEL_DV_GROUPS:
+        p_amt, p_dv = approved_panel.get(p_amt_key), approved_panel.get(p_dv_key)
+        a_amt, a_dv = artwork.get(a_amt_key), artwork.get(a_dv_key)
+        if p_amt is None and p_dv is None:
+            continue
+        if p_amt is not None and a_amt is None:
+            gaps.append((label, p_amt))
+        if p_dv is not None and a_dv is None and a_amt is not None:
+            gaps.append((f'{label} %DV', p_dv))
+
+        amt_mismatch = p_amt is not None and a_amt is not None and not _amounts_equal(a_amt, p_amt)
+        dv_mismatch  = p_dv  is not None and a_dv  is not None and not _amounts_equal(a_dv, p_dv)
+
+        if amt_mismatch:
+            # The amount itself differs — report the whole row (amount + %DV as
+            # printed on each side), even if the %DV component happens to match,
+            # so the designer sees the row exactly as it appears on each panel.
+            a_dv_txt = f' {_fmt_amt(a_dv)}%' if a_dv is not None else ''
+            p_dv_txt = f' {_fmt_amt(p_dv)}%' if p_dv is not None else ''
+            issues.append({'severity': 'critical', 'message': (
+                f'{label}: artwork reads {_fmt_amt(a_amt)}{unit}{a_dv_txt}, '
+                f'approved panel v{version} says {_fmt_amt(p_amt)}{unit}{p_dv_txt}')})
+        elif dv_mismatch:
+            # Amount agrees (or wasn't compared) but the declared %DV itself
+            # differs — %DV can be wrong independently of the amount.
+            issues.append({'severity': 'critical', 'message': (
+                f'{label} %DV: artwork reads {_fmt_amt(a_dv)}%, '
+                f'approved panel v{version} says {_fmt_amt(p_dv)}%')})
+
+    return issues, gaps
+
+
+def _front_net_carbs_g(text: str):
+    """Front 'Net Carbs' callout number, or None. Same pattern _check_net_carbs
+    uses to find the claim — its own tiny helper so this check can read the
+    front value without depending on _check_net_carbs's recompute logic."""
+    tl = (text or '').lower()
+    m = (re.search(r'(\d+(?:\.\d+)?)\s*g?\s*(?:total\s+)?net\s+carbs?', tl)
+        or re.search(r'net\s+carbs?\s*[:\-]?\s*(\d+(?:\.\d+)?)', tl))
+    return float(m.group(1)) if m else None
+
+
+def _diff_front_callouts(front_artwork: dict, approved_front: dict) -> tuple:
+    """Front call-outs have been wrong independently of the panel on this line
+    (protein, calories, net weight) — they get their own comparison rather than
+    being inferred from the NFP diff above."""
+    issues, gaps = [], []
+    front_artwork = front_artwork or {}
+    approved_front = approved_front or {}
+    for key, label in (('calories', 'Front Calories'), ('protein_g', 'Front Protein'),
+                       ('added_sugar_g', 'Front Added Sugar')):
+        p_val = approved_front.get(key)
+        if p_val is None:
+            continue
+        a_val = front_artwork.get(key)
+        if a_val is None:
+            gaps.append((label, p_val))
+            continue
+        if not _amounts_equal(a_val, p_val):
+            issues.append({'severity': 'critical', 'message': (
+                f'{label}: artwork reads {_fmt_amt(a_val)}, approved panel says {_fmt_amt(p_val)}')})
+    # net_carbs_g is a derived front claim with no universal rule — the approved
+    # panel states it explicitly or states null; null means skip, never invent one.
+    p_nc = approved_front.get('net_carbs_g')
+    if p_nc is not None:
+        a_nc = front_artwork.get('net_carbs_g')
+        if a_nc is None:
+            gaps.append(('Front Net Carbs', p_nc))
+        elif not _amounts_equal(a_nc, p_nc):
+            issues.append({'severity': 'critical', 'message': (
+                f'Front Net Carbs: artwork reads {_fmt_amt(a_nc)}, approved panel says {_fmt_amt(p_nc)}')})
+    return issues, gaps
+
+
+def _normalize_stmt(s: str) -> str:
+    """Normalize an ingredient/allergen statement for comparison: lowercase,
+    collapse whitespace, ensure a space after commas, strip a trailing period.
+    A missing space after a comma must not read as a wholesale mismatch."""
+    if not s:
+        return ''
+    s = re.sub(r'\s+', ' ', s.strip().lower())
+    s = re.sub(r',(?!\s)', ', ', s)
+    return s.rstrip('.').strip()
+
+
+def _diff_text_statement(label: str, artwork_raw, approved_raw, version) -> list:
+    """One CRITICAL if the normalized statements genuinely differ in content; a
+    lighter REVIEW note if only whitespace/punctuation differs — still reported
+    (several of these are in market) but not treated as a wholesale mismatch."""
+    if not approved_raw:
+        return []
+    if not artwork_raw:
+        return [{'severity': 'review', 'message': (
+            f'{label} could not be read from the artwork to compare against the approved '
+            f'panel v{version}. Approved panel says: "{str(approved_raw).strip()[:300]}".')}]
+    norm_a, norm_p = _normalize_stmt(artwork_raw), _normalize_stmt(approved_raw)
+    if norm_a == norm_p:
+        if str(artwork_raw).strip() != str(approved_raw).strip():
+            return [{'severity': 'review', 'message': (
+                f'{label} matches the approved panel v{version} in content, but the exact '
+                'formatting differs (whitespace/punctuation) — worth a cleanup pass.')}]
+        return []
+    return [{'severity': 'critical', 'message': (
+        f'{label} differs from the approved panel v{version}. Artwork: '
+        f'"{str(artwork_raw).strip()[:300]}" — Approved: "{str(approved_raw).strip()[:300]}"')}]
+
+
+def _check_approved_panel(artwork_panel: dict, front_artwork: dict, ingredients_raw: str,
+                          allergen_contains, approved, prior_panel_version=None) -> dict:
+    """Compare the artwork against the APPROVED nutrition panel of record in
+    ReadyDoc (Products -> Nutrition panels). Once a panel is approved, this diff
+    IS the nutrition source of truth; the front-vs-NFP self-consistency check
+    (checks['nfp']) keeps running regardless as a backstop, since it catches a
+    different failure (the artwork contradicting itself) that this cannot.
+
+    Exact match, no tolerance — both sides are declaring the same number.
+    Amounts printed as "<1" / "<5" compare as those exact strings, never
+    coerced to 0 or the threshold number.
+
+    Status (never CLEAN unless VERIFIED):
+      PANEL_MISSING      — no panel record in ReadyDoc for this product.
+      PANEL_NOT_APPROVED — a panel exists but is still a draft. Blocks print
+                           release regardless of whether the artwork is correct.
+      CRITICAL           — the artwork differs from an approved panel.
+      PANEL_SUPERSEDED   — matches, but the panel was revised since this SKU's
+                           last recorded proof; re-confirm before trusting it.
+      VERIFIED           — matches the current approved panel. The only status
+                           that permits release.
+    """
+    if approved is None:
+        return {'status': 'PANEL_MISSING', 'issues': [], 'panel_version': None, 'notes': [
+            'PANEL MISSING — no approved nutrition panel found in ReadyDoc for this product. '
+            'Nutrition cannot be verified against a source of truth outside the artwork.']}
+
+    version = approved.get('version')
+    if str(approved.get('status', '')).strip().lower() != 'approved':
+        return {'status': 'PANEL_NOT_APPROVED', 'issues': [], 'panel_version': version, 'notes': [
+            f'PANEL NOT APPROVED — the nutrition panel on file for this product (v{version}) '
+            'is still a draft. Approving it in ReadyDoc is what lets artwork be released to '
+            'print against it; this blocks print release whether or not the artwork itself '
+            'is correct.']}
+
+    approved_panel = approved.get('panel') or {}
+    approved_front = approved.get('front_callouts') or {}
+
+    issues, gaps = _diff_panel_fields(artwork_panel, approved_panel, version)
+    fc_issues, fc_gaps = _diff_front_callouts(front_artwork, approved_front)
+    issues += fc_issues
+    gaps += fc_gaps
+    issues += _diff_text_statement('Ingredient statement', ingredients_raw,
+                                   approved_panel.get('ingredients'), version)
+    _artwork_allergen = f'Contains: {allergen_contains}' if allergen_contains else ''
+    issues += _diff_text_statement('Allergen statement', _artwork_allergen,
+                                   approved_panel.get('allergen_statement'), version)
+    issues += [{'severity': 'review', 'message': (
+        f'{label} could not be read from the artwork to cross-check against the approved '
+        f'panel v{version} ({_fmt_amt(p_val)}) — verify manually.')} for label, p_val in gaps]
+
+    if any(i['severity'] == 'critical' for i in issues):
+        return {'status': 'CRITICAL', 'issues': issues, 'panel_version': version, 'notes': []}
+
+    if prior_panel_version is not None and version is not None and prior_panel_version < version:
+        return {'status': 'PANEL_SUPERSEDED', 'issues': issues, 'panel_version': version, 'notes': [
+            f'PANEL SUPERSEDED — this file was last proofed against panel v{prior_panel_version}; '
+            f'the approved panel is now v{version}. Today’s values still match, but re-confirm '
+            'this reflects an intentional re-approval before relying on it.']}
+
+    return {'status': 'VERIFIED', 'issues': issues, 'panel_version': version,
+           'notes': [f'Matches the approved nutrition panel v{version}.']}
+
+
 def _detect_extra_nfp_columns(tl: str) -> list:
     """Names of secondary NFP columns beyond the plain per-serving column
     ("As Prepared", "Protein Plus", "Dry Mix" dual columns)."""
@@ -2574,6 +2932,31 @@ def _fetch_prior_snapshot(gtin=None, sku=None) -> dict:
     return _find_prior_snapshot(gtin, sku)
 
 
+def _fetch_approved_panel(gtin=None, sku=None):
+    """The nutrition panel of record from ReadyDoc's Products -> Nutrition
+    panels tab, or None (no record / not approved yet is distinguished by the
+    caller from the returned dict's own 'status' field, not by this wrapper).
+    Never raises — an outage or a disabled integration degrades to PANEL_MISSING
+    in _check_approved_panel, same fail-soft contract as every other ReadyDoc call."""
+    try:
+        import readydoc
+        return readydoc.fetch_approved_panel(gtin, sku)
+    except Exception as _e:
+        print(f'[readydoc] approved-panel fetch skipped: {_e}')
+        return None
+
+
+def _fetch_prior_panel_version(gtin=None, sku=None):
+    """The panel version this SKU was last proofed against, or None. Feeds
+    PANEL_SUPERSEDED. Never raises."""
+    try:
+        import readydoc
+        return readydoc.fetch_prior_panel_version(gtin, sku)
+    except Exception as _e:
+        print(f'[readydoc] prior panel-version fetch skipped: {_e}')
+        return None
+
+
 def _recount_result(res: dict) -> None:
     """Recompute a result's severity and issue counts from its checks — used after
     a cross-file pass appends issues post-hoc."""
@@ -2593,7 +2976,7 @@ def _recount_result(res: dict) -> None:
                        else 'review' if review else 'info' if infos else 'clean')
     res['unverified_checks'] = [k for k, c in checks.items()
                                 if isinstance(c, dict)
-                                and str(c.get('status', '')).upper() in ('UNVERIFIED', 'UNKNOWN')]
+                                and str(c.get('status', '')).upper() in _NOT_VERIFIED_STATUSES]
     res['fully_verified'] = not res['unverified_checks']
 
 
@@ -4395,7 +4778,8 @@ def _build_summary(results: list) -> dict:
     if not_verified:
         # Distinct check names, friendly-labeled — not the per-file joined strings
         # (which produced "netwt, netwt, prep, prep").
-        _friendly = {'netwt': 'net weight', 'prep': 'prep block', 'nfp': 'front vs NFP'}
+        _friendly = {'netwt': 'net weight', 'prep': 'prep block', 'nfp': 'front vs NFP',
+                    'panel': 'approved nutrition panel'}
         _keys = sorted({c for r in not_verified for c in r.get('unverified_checks', [])})
         _names = ', '.join(_friendly.get(k, k) for k in _keys)
         verification_line = (
@@ -4411,6 +4795,23 @@ def _build_summary(results: list) -> dict:
             if issue['severity'] == 'critical':
                 fda_crits.append({'file': r['filename'], 'message': issue['message']})
 
+    # Approved-nutrition-panel verification — its own one-line count, separate
+    # from verification_line above: how many SKUs were checked against a
+    # signed-off panel of record versus how many were not (missing, still a
+    # draft, differ, or superseded). Only counts files that carry the check
+    # (checks['panel'] is ProDough/ReadyDoc-specific — see _proof_single).
+    _panel_statuses = [r.get('checks', {}).get('panel', {}).get('status')
+                       for r in results if not r.get('error') and r.get('checks', {}).get('panel')]
+    panel_verified_count = sum(1 for s in _panel_statuses if s == 'VERIFIED')
+    panel_not_verified_count = len(_panel_statuses) - panel_verified_count
+    if _panel_statuses:
+        panel_verification_line = (
+            f'{panel_verified_count} of {len(_panel_statuses)} SKUs verified against an approved '
+            f'nutrition panel; {panel_not_verified_count} were not '
+            '(missing panel, not yet approved, differs, or superseded).')
+    else:
+        panel_verification_line = ''
+
     return {
         'total_files': total,
         'severity_counts': counts,
@@ -4420,6 +4821,9 @@ def _build_summary(results: list) -> dict:
         'fully_verified_count': fully_verified_count,
         'not_fully_verified_count': len(not_verified),
         'verification_line': verification_line,
+        'panel_verified_count': panel_verified_count,
+        'panel_not_verified_count': panel_not_verified_count,
+        'panel_verification_line': panel_verification_line,
         'errored_count': errored_count,
         'checked_count': checked_count,
         'errored_files': [{'file': r.get('filename', ''), 'error': str(r.get('error', ''))}

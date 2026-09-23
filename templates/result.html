@@ -291,28 +291,31 @@
 
     <div class="checks-container">
     {{ _check_card('1','GTIN / Barcode',        'bi-upc-scan',           r.checks.gtin,     idx, r.filename, 'gtin',     dismissals, confirmations) }}
+    {% if r.checks.get('panel') is not none %}
+    {{ _check_card('2','Nutrition Panel vs Approved (ReadyDoc)', 'bi-patch-check', r.checks.panel, idx, r.filename, 'panel', dismissals, confirmations, always_open=true) }}
+    {% endif %}
     {% if r.checks.get('netwt') is not none %}
-    {{ _check_card('2','Nutrition Panel vs Net Weight', 'bi-calculator', r.checks.netwt,    idx, r.filename, 'netwt',    dismissals, confirmations, always_open=true) }}
+    {{ _check_card('3','Nutrition Panel vs Net Weight', 'bi-calculator', r.checks.netwt,    idx, r.filename, 'netwt',    dismissals, confirmations, always_open=true) }}
     {% endif %}
     {% if r.checks.get('nfp') is not none %}
-    {{ _check_card('3','Front Call-Out vs NFP', 'bi-clipboard2-pulse',   r.checks.nfp,      idx, r.filename, 'nfp',      dismissals, confirmations) }}
+    {{ _check_card('4','Front Call-Out vs NFP', 'bi-clipboard2-pulse',   r.checks.nfp,      idx, r.filename, 'nfp',      dismissals, confirmations) }}
     {% endif %}
-    {{ _check_card('4','Eyemark Contrast',       'bi-eye',                r.checks.eyemark,  idx, r.filename, 'eyemark',  dismissals, confirmations) }}
-    {{ _check_card('5','Spelling / Brand Name', 'bi-spellcheck',         r.checks.spelling, idx, r.filename, 'spelling', dismissals, confirmations) }}
-    {{ _check_card('6','FDA Audit Risk',         'bi-shield-exclamation', r.checks.fda,      idx, r.filename, 'fda',      dismissals, confirmations, always_open=true) }}
+    {{ _check_card('5','Eyemark Contrast',       'bi-eye',                r.checks.eyemark,  idx, r.filename, 'eyemark',  dismissals, confirmations) }}
+    {{ _check_card('6','Spelling / Brand Name', 'bi-spellcheck',         r.checks.spelling, idx, r.filename, 'spelling', dismissals, confirmations) }}
+    {{ _check_card('7','FDA Audit Risk',         'bi-shield-exclamation', r.checks.fda,      idx, r.filename, 'fda',      dismissals, confirmations, always_open=true) }}
     {% if r.checks.get('prep') is not none %}
-    {{ _check_card('7','Prep Block Type',        'bi-card-checklist',     r.checks.prep,     idx, r.filename, 'prep',     dismissals, confirmations) }}
+    {{ _check_card('8','Prep Block Type',        'bi-card-checklist',     r.checks.prep,     idx, r.filename, 'prep',     dismissals, confirmations) }}
     {% endif %}
     {% if r.checks.get('ingredients') is not none %}
-    {{ _check_card('8','Ingredient Statement Changes', 'bi-list-ul',      r.checks.ingredients, idx, r.filename, 'ingredients', dismissals, confirmations) }}
+    {{ _check_card('9','Ingredient Statement Changes', 'bi-list-ul',      r.checks.ingredients, idx, r.filename, 'ingredients', dismissals, confirmations) }}
     {% endif %}
     {% if r.checks.get('claims') is not none %}
-    {{ _check_card('9','Claims Review',          'bi-patch-question',     r.checks.claims,   idx, r.filename, 'claims',   dismissals, confirmations) }}
+    {{ _check_card('10','Claims Review',          'bi-patch-question',     r.checks.claims,   idx, r.filename, 'claims',   dismissals, confirmations) }}
     {% endif %}
     {% if r.checks.get('wind') is not none %}
-    {{ _check_card('10','Wind Direction',        'bi-arrow-repeat',       r.checks.wind,     idx, r.filename, 'wind',     dismissals, confirmations) }}
+    {{ _check_card('11','Wind Direction',        'bi-arrow-repeat',       r.checks.wind,     idx, r.filename, 'wind',     dismissals, confirmations) }}
     {% endif %}
-    {{ _check_card('11','Print Specifications', 'bi-rulers',             r.checks.specs,    idx, r.filename, 'specs',    dismissals, confirmations) }}
+    {{ _check_card('12','Print Specifications', 'bi-rulers',             r.checks.specs,    idx, r.filename, 'specs',    dismissals, confirmations) }}
     </div>
 
     <!-- Manual verify items -->
@@ -382,20 +385,32 @@
 {% set reviews  = issues | selectattr('severity','equalto','review')  | list %}
 {% set infos  = issues | selectattr('severity','equalto','info')     | list %}
 {% set card_id = 'chk' ~ num ~ '_' ~ idx %}
+{% set status = (check.get('status','') | upper) %}
+{# Not-verified statuses (PANEL_MISSING/PANEL_NOT_APPROVED/PANEL_SUPERSEDED,
+   plus UNVERIFIED/UNKNOWN for net weight / prep block) must never render like
+   a clean pass — but a CRITICAL diff always wins the visual over "not yet
+   approved," since a known-wrong panel is the stronger signal. #}
+{% set not_verified = status in ('UNVERIFIED','UNKNOWN','PANEL_MISSING','PANEL_NOT_APPROVED','PANEL_SUPERSEDED') and not crits and not warns %}
 
 <div class="card mb-2 check-card
   {% if crits %}border-danger check-has-issues check-has-critical{% if warns %} check-has-warning{% endif %}
   {% elif warns %}border-warning check-has-issues check-has-warning
+  {% elif not_verified %}border-secondary check-has-issues check-has-unverified
   {% else %}border-0{% endif %} shadow-sm" data-check="{{ check_key }}">
 
   <div class="card-header d-flex align-items-center gap-2 py-2
-    {% if crits %}bg-danger bg-opacity-10{% elif warns %}bg-warning bg-opacity-10{% else %}bg-light{% endif %}"
+    {% if crits %}bg-danger bg-opacity-10{% elif warns %}bg-warning bg-opacity-10{% elif not_verified %}bg-secondary bg-opacity-10{% else %}bg-light{% endif %}"
     data-bs-toggle="collapse" data-bs-target="#{{ card_id }}">
     <i class="bi {{ icon }}
       {% if crits %}text-danger{% elif warns %}text-warning{% else %}text-secondary{% endif %}"></i>
     <span class="fw-semibold small flex-grow-1">Check {{ num }}: {{ title }}</span>
     {% if   crits %}<span class="badge bg-danger">{{ crits|length }} critical</span>
     {% elif warns %}<span class="badge bg-warning text-dark">{{ warns|length }} warnings</span>
+    {% elif status == 'PANEL_NOT_APPROVED' %}<span class="badge bg-dark">BLOCKS PRINT — not approved</span>
+    {% elif status == 'PANEL_MISSING' %}<span class="badge bg-secondary">NOT VERIFIED — no approved panel</span>
+    {% elif status == 'PANEL_SUPERSEDED' %}<span class="badge bg-secondary">RE-PROOF — panel superseded</span>
+    {% elif status == 'VERIFIED' %}<span class="badge bg-success">Verified{% if check.get('panel_version') is not none %} v{{ check.get('panel_version') }}{% endif %}</span>
+    {% elif not_verified %}<span class="badge bg-secondary">NOT VERIFIED</span>
     {% elif suspects %}<span class="badge bg-secondary">{{ suspects|length }} suspect read</span>
     {% elif reviews %}<span class="badge bg-primary">{{ reviews|length }} review</span>
     {% elif infos %}<span class="badge bg-info text-dark">{{ infos|length }} notes</span>
@@ -1012,6 +1027,14 @@ function noteRows(notes) {
   ).join('')}</div>`;
 }
 
+// Check-block statuses that mean "not evaluated" — must never render like a
+// clean pass. PANEL_MISSING/PANEL_NOT_APPROVED/PANEL_SUPERSEDED are the
+// approved-nutrition-panel gate; UNVERIFIED/UNKNOWN cover net weight / prep
+// block when their own inputs were incomplete. None of these say the artwork
+// is wrong — only that nothing has confirmed it yet.
+const NOT_VERIFIED_STATUSES = ['UNVERIFIED', 'UNKNOWN', 'PANEL_MISSING',
+                               'PANEL_NOT_APPROVED', 'PANEL_SUPERSEDED'];
+
 function checkCard(num, title, icon, check, uid, filename, checkKey, alwaysOpen) {
   check = check || {};
   const issues = check.issues || [];
@@ -1019,18 +1042,33 @@ function checkCard(num, title, icon, check, uid, filename, checkKey, alwaysOpen)
   const crits  = issues.filter(i => i.severity === 'critical');
   const warns  = issues.filter(i => i.severity === 'warning');
   const infos  = issues.filter(i => i.severity === 'info');
+  const status = String(check.status || '').toUpperCase();
+  // A not-verified status only takes over the badge/border when there is no
+  // issue-level finding — a CRITICAL diff always wins the visual, since a
+  // known-wrong panel is a stronger signal than "not yet approved."
+  const notVerified = NOT_VERIFIED_STATUSES.includes(status) && !crits.length && !warns.length;
   const id     = `jschk${num}_${uid}`;
   const hasCrit = crits.length > 0;
   const hasIss  = crits.length > 0 || warns.length > 0;
-  const hdrCls  = crits.length ? 'bg-danger bg-opacity-10' : warns.length ? 'bg-warning bg-opacity-10' : 'bg-light';
+  const hdrCls  = crits.length ? 'bg-danger bg-opacity-10' : warns.length ? 'bg-warning bg-opacity-10'
+                : notVerified ? 'bg-secondary bg-opacity-10' : 'bg-light';
   const bdrCls  = crits.length ? ('border-danger check-has-issues check-has-critical' + (warns.length ? ' check-has-warning' : ''))
-                : warns.length ? 'border-warning check-has-issues check-has-warning' : 'border-0';
+                : warns.length ? 'border-warning check-has-issues check-has-warning'
+                : notVerified ? 'border-secondary check-has-issues check-has-unverified' : 'border-0';
   const checkAttr = checkKey ? ` data-check="${checkKey}"` : '';
   const iconCls = crits.length ? 'text-danger' : warns.length ? 'text-warning' : 'text-secondary';
-  const badge   = crits.length ? `<span class="badge bg-danger">${crits.length} critical</span>`
-                : warns.length ? `<span class="badge bg-warning text-dark">${warns.length} warnings</span>`
-                : infos.length ? `<span class="badge bg-info text-dark">${infos.length} notes</span>`
-                :                `<span class="badge bg-success">OK</span>`;
+  const pv = check.panel_version;
+  const pvTxt = (pv !== undefined && pv !== null) ? ` v${esc(String(pv))}` : '';
+  let badge;
+  if (crits.length)            badge = `<span class="badge bg-danger">${crits.length} critical</span>`;
+  else if (warns.length)       badge = `<span class="badge bg-warning text-dark">${warns.length} warnings</span>`;
+  else if (status === 'PANEL_NOT_APPROVED') badge = `<span class="badge bg-dark">BLOCKS PRINT — not approved</span>`;
+  else if (status === 'PANEL_MISSING')      badge = `<span class="badge bg-secondary">NOT VERIFIED — no approved panel</span>`;
+  else if (status === 'PANEL_SUPERSEDED')   badge = `<span class="badge bg-secondary">RE-PROOF — panel superseded</span>`;
+  else if (status === 'VERIFIED')           badge = `<span class="badge bg-success">Verified${pvTxt}</span>`;
+  else if (notVerified)                     badge = `<span class="badge bg-secondary">NOT VERIFIED</span>`;
+  else if (infos.length)       badge = `<span class="badge bg-info text-dark">${infos.length} notes</span>`;
+  else                          badge = `<span class="badge bg-success">OK</span>`;
   let extras = '';
   if (checkKey === 'gtin') {
     const detected = check.found_gtins?.length
@@ -1049,6 +1087,19 @@ function checkCard(num, title, icon, check, uid, filename, checkKey, alwaysOpen)
     extras += `<div class="mt-2 border rounded overflow-hidden" style="font-size:.8rem"><div class="row g-0">
       <div class="col-6 p-2 border-end"><div class="text-muted fw-semibold mb-1" style="font-size:.72rem;text-transform:uppercase;letter-spacing:.04em">Detected in Artwork</div>${detected}</div>
       <div class="col-6 p-2"><div class="text-muted fw-semibold mb-1" style="font-size:.72rem;text-transform:uppercase;letter-spacing:.04em">From Master Spreadsheet</div>${specHtml}</div>
+    </div></div>`;
+  }
+  if (checkKey === 'panel') {
+    const reviews = issues.filter(i => i.severity === 'review');
+    const rowsHtml = crits.length
+      ? crits.map(i => `<div class="mb-1">${esc(i.message)}</div>`).join('')
+      : `<span class="text-muted fst-italic">No field-level differences from the approved panel.</span>`;
+    const gapsHtml = reviews.length
+      ? reviews.map(i => `<div class="mb-1 text-muted">${esc(i.message)}</div>`).join('')
+      : '';
+    extras += `<div class="mt-2 border rounded overflow-hidden" style="font-size:.8rem"><div class="p-2">
+      <div class="text-muted fw-semibold mb-1" style="font-size:.72rem;text-transform:uppercase;letter-spacing:.04em">Approved Panel Comparison${pvTxt}</div>
+      ${rowsHtml}${gapsHtml ? `<div class="mt-1">${gapsHtml}</div>` : ''}
     </div></div>`;
   }
   if (checkKey === 'nfp') {
@@ -1188,16 +1239,17 @@ function fileResult(r, jobId, idx) {
 
   let checksHtml = '';
   checksHtml += checkCard('1','GTIN / Barcode',        'bi-upc-scan',           checks.gtin,     uid, r.filename, 'gtin',     false);
-  if (checks.netwt != null) checksHtml += checkCard('2','Nutrition Panel vs Net Weight','bi-calculator', checks.netwt, uid, r.filename, 'netwt', true);
-  if (checks.nfp != null) checksHtml += checkCard('3','Front Call-Out vs NFP','bi-clipboard2-pulse', checks.nfp, uid, r.filename, 'nfp', false);
-  checksHtml += checkCard('4','Eyemark Contrast',       'bi-eye',                checks.eyemark,  uid, r.filename, 'eyemark',  false);
-  checksHtml += checkCard('5','Spelling / Brand Name', 'bi-spellcheck',         checks.spelling, uid, r.filename, 'spelling', false);
-  checksHtml += checkCard('6','FDA Audit Risk',         'bi-shield-exclamation', checks.fda,      uid, r.filename, 'fda',      true);
-  if (checks.prep != null) checksHtml += checkCard('7','Prep Block Type','bi-card-checklist', checks.prep, uid, r.filename, 'prep', false);
-  if (checks.ingredients != null) checksHtml += checkCard('8','Ingredient Statement Changes','bi-list-ul', checks.ingredients, uid, r.filename, 'ingredients', false);
-  if (checks.claims != null) checksHtml += checkCard('9','Claims Review','bi-patch-question', checks.claims, uid, r.filename, 'claims', false);
-  if (checks.wind != null) checksHtml += checkCard('10','Wind Direction','bi-arrow-repeat', checks.wind, uid, r.filename, 'wind', false);
-  checksHtml += checkCard('11','Print Specifications',  'bi-rulers',             checks.specs,    uid, r.filename, 'specs',    false);
+  if (checks.panel != null) checksHtml += checkCard('2','Nutrition Panel vs Approved (ReadyDoc)','bi-patch-check', checks.panel, uid, r.filename, 'panel', true);
+  if (checks.netwt != null) checksHtml += checkCard('3','Nutrition Panel vs Net Weight','bi-calculator', checks.netwt, uid, r.filename, 'netwt', true);
+  if (checks.nfp != null) checksHtml += checkCard('4','Front Call-Out vs NFP','bi-clipboard2-pulse', checks.nfp, uid, r.filename, 'nfp', false);
+  checksHtml += checkCard('5','Eyemark Contrast',       'bi-eye',                checks.eyemark,  uid, r.filename, 'eyemark',  false);
+  checksHtml += checkCard('6','Spelling / Brand Name', 'bi-spellcheck',         checks.spelling, uid, r.filename, 'spelling', false);
+  checksHtml += checkCard('7','FDA Audit Risk',         'bi-shield-exclamation', checks.fda,      uid, r.filename, 'fda',      true);
+  if (checks.prep != null) checksHtml += checkCard('8','Prep Block Type','bi-card-checklist', checks.prep, uid, r.filename, 'prep', false);
+  if (checks.ingredients != null) checksHtml += checkCard('9','Ingredient Statement Changes','bi-list-ul', checks.ingredients, uid, r.filename, 'ingredients', false);
+  if (checks.claims != null) checksHtml += checkCard('10','Claims Review','bi-patch-question', checks.claims, uid, r.filename, 'claims', false);
+  if (checks.wind != null) checksHtml += checkCard('11','Wind Direction','bi-arrow-repeat', checks.wind, uid, r.filename, 'wind', false);
+  checksHtml += checkCard('12','Print Specifications',  'bi-rulers',             checks.specs,    uid, r.filename, 'specs',    false);
 
   const content = r.error
     ? `<div class="alert alert-danger"><strong>Error:</strong> ${esc(r.error)}</div>`
