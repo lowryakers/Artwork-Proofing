@@ -827,6 +827,14 @@ def _generate_report(job: dict, brand_name: str = 'ProDough') -> io.BytesIO:
         cvl.alignment = Alignment(wrap_text=True, vertical='center')
         if (job.get('summary') or {}).get('not_fully_verified_count'):
             cvl.font = Font(bold=True, color='9C4200')
+    # Approved-panel verification — its own one line: how many SKUs were
+    # checked against a signed-off panel of record in ReadyDoc.
+    _pline = (job.get('summary') or {}).get('panel_verification_line')
+    if _pline:
+        cpl = ws1.cell(row=2, column=5, value=_pline)
+        cpl.alignment = Alignment(wrap_text=True, vertical='center')
+        if (job.get('summary') or {}).get('panel_not_verified_count'):
+            cpl.font = Font(bold=True, color='9C4200')
     # Master-feed health banner — a broken/empty SKU feed must be loud, not silent.
     _mf = job.get('master_feed')
     if _mf and not _mf.get('ok'):
@@ -934,6 +942,61 @@ def _generate_report(job: dict, brand_name: str = 'ProDough') -> io.BytesIO:
             row_idx += 1
         for col, w in zip('ABCDEFGH', [40, 11, 16, 15, 14, 13, 12, 70]):
             wsn.column_dimensions[col].width = w
+
+    # ── Sheet: Approved Nutrition Panel (ReadyDoc) ────────────────────────────
+    # The nutrition source of truth once a panel is approved — created LAST so
+    # index=1 lands it right after Summary, ahead of Net Weight: a panel that
+    # was never approved, or that the artwork contradicts, is the more
+    # dangerous state (every value can be internally consistent and still be
+    # wrong, transcribed from the wrong product) than a net-weight mismatch.
+    panel_rows = [(r['filename'], r.get('checks', {}).get('panel'))
+                 for r in job['results'] if r.get('checks', {}).get('panel')]
+    if panel_rows:
+        wsp = wb.create_sheet('Approved Nutrition Panel', 1)
+        p_missing = sum(1 for _, p in panel_rows if p.get('status') == 'PANEL_MISSING')
+        p_draft   = sum(1 for _, p in panel_rows if p.get('status') == 'PANEL_NOT_APPROVED')
+        p_crit    = sum(1 for _, p in panel_rows if p.get('status') == 'CRITICAL')
+        p_super   = sum(1 for _, p in panel_rows if p.get('status') == 'PANEL_SUPERSEDED')
+        p_ok      = sum(1 for _, p in panel_rows if p.get('status') == 'VERIFIED')
+        wsp.merge_cells('A1:E1')
+        wsp['A1'] = 'ARTWORK vs APPROVED NUTRITION PANEL (source of truth outside the artwork)'
+        wsp['A1'].font = Font(bold=True, size=12)
+        _pparts = []
+        if p_crit:
+            _pparts.append(f'{p_crit} SKU(s) DIFFER from the approved panel')
+        if p_missing:
+            _pparts.append(f'{p_missing} have NO approved panel on file — NOT VERIFIED')
+        if p_draft:
+            _pparts.append(f'{p_draft} panel(s) still a DRAFT — blocks print release')
+        if p_super:
+            _pparts.append(f'{p_super} superseded — panel revised since last proof, re-confirm')
+        pbanner = ('; '.join(_pparts) + '.') if _pparts else f'All {p_ok} SKU(s) verified against an approved panel.'
+        wsp.merge_cells('A2:E2')
+        wsp['A2'] = pbanner
+        for col, hdr in enumerate(['File', 'Status', 'Panel Version', 'Findings', 'Notes'], 1):
+            c = wsp.cell(row=4, column=col, value=hdr)
+            c.font = hdr_font
+            c.fill = hdr_blue
+            c.alignment = center
+        row_idx = 5
+        for fname, p in panel_rows:
+            findings = '; '.join(i.get('message', '') for i in (p.get('issues') or [])
+                                 if i.get('severity') == 'critical')
+            pnotes = ' '.join(p.get('notes') or [])
+            vals = [fname, p.get('status', ''), _g(p.get('panel_version')), findings, pnotes]
+            for col, val in enumerate(vals, 1):
+                c = wsp.cell(row=row_idx, column=col, value=val)
+                c.alignment = wrap if col in (4, 5) else center
+            st = p.get('status')
+            fillc = (fill_crit if st == 'CRITICAL'
+                    else fill_warn if st in ('PANEL_MISSING', 'PANEL_NOT_APPROVED', 'PANEL_SUPERSEDED')
+                    else fill_ok if st == 'VERIFIED' else None)
+            if fillc:
+                for col in range(1, 6):
+                    wsp.cell(row=row_idx, column=col).fill = fillc
+            row_idx += 1
+        for col, w in zip('ABCDE', [40, 20, 14, 60, 50]):
+            wsp.column_dimensions[col].width = w
 
     # ── Sheet: Prep Block Classification ──────────────────────────────────────
     # Per-serving prep must be revised on a serving-size change; batch prep must
