@@ -1350,7 +1350,7 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
             'prep':     _check_prep_block(label_text, _panel),
             'ingredients': _check_ingredient_drift(_snapshot, _prior_snapshot),
             'claims':   _check_claims(_snapshot, _prior_snapshot),
-            'specs':    _check_print_specs(pdf_path, brand_config, matched_spec, template=_die_template),
+            'specs':    _check_print_specs(pdf_path, brand_config, matched_spec, template=_die_template, img_path=img_path),
         }
         if is_film:
             checks['wind'] = _check_wind_direction(combined_text, effective_wind)
@@ -1370,7 +1370,7 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
         }
         # Print Specs and Wind Direction are press-proof checks — skip for art proofs
         if proof_type != 'art':
-            checks['specs'] = _check_print_specs(pdf_path, brand_config, matched_spec, template=_die_template)
+            checks['specs'] = _check_print_specs(pdf_path, brand_config, matched_spec, template=_die_template, img_path=img_path)
             if effective_wind:
                 checks['wind'] = _check_wind_direction(combined_text, effective_wind)
 
@@ -4038,6 +4038,107 @@ def _extract_spot_colors(doc) -> set:
     return spots
 
 
+# The dieline/registration guide color used across ProDough print-ready files —
+# not a print color, so it must never show up as a "dominant" spot color.
+_DIELINE_GUIDE_HEX = (0x00, 0xAD, 0xEF)
+
+
+def _hex_channels(h):
+    """'#rrggbb' / 'rrggbb' / 'rgb' -> (r, g, b) ints, or None if unparseable."""
+    if not h:
+        return None
+    h = str(h).strip().lstrip('#')
+    if len(h) == 3:
+        h = ''.join(c * 2 for c in h)
+    if len(h) != 6:
+        return None
+    try:
+        return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+    except ValueError:
+        return None
+
+
+def _hex_close(a, b, tol: int = 6) -> bool:
+    """Per-channel tolerance match — a render is a JPEG/rasterized approximation
+    of the vector color, so an exact hex match is the wrong bar. ±6 per channel
+    covers real rendering variance while still catching an actually different
+    color (the Pumpkin Spice case differed by 1-2 units; a wrong color differs
+    by tens)."""
+    ca, cb = _hex_channels(a), _hex_channels(b)
+    if not ca or not cb:
+        return False
+    return all(abs(x - y) <= tol for x, y in zip(ca, cb))
+
+
+def _sample_dominant_colors(img_path: str, top_n: int = 6, min_frac: float = 0.01) -> list:
+    """Dominant colors of the rendered page as '#rrggbb' hex strings, most
+    common first. The proofing pipeline already rasterizes the PDF at 400 DPI
+    for OCR, so this is free — no extra render. Excludes white/near-white
+    (substrate/background) and the dieline guide color (registration marks,
+    not a print color). Returns [] on any failure (no PIL, bad path, etc.) —
+    the caller falls back to name-only matching, same as before this existed.
+    """
+    if not PIL_AVAILABLE:
+        return []
+    try:
+        im = Image.open(img_path).convert('RGB')
+        # Downsample — color proportions don't need full 400 DPI resolution,
+        # and getcolors() is a per-pixel histogram.
+        _max_dim = 500
+        if max(im.size) > _max_dim:
+            s = _max_dim / float(max(im.size))
+            im = im.resize((max(1, int(im.width * s)), max(1, int(im.height * s))))
+        counts = im.getcolors(maxcolors=im.width * im.height)
+        if not counts:
+            return []
+        total = sum(c for c, _ in counts)
+        out = []
+        for count, (r, g, b) in sorted(counts, key=lambda x: -x[0]):
+            if count / float(total) < min_frac:
+                break  # sorted descending — nothing after this clears the bar either
+            if r > 245 and g > 245 and b > 245:
+                continue  # white / near-white substrate
+            if all(abs(v - g2) <= 8 for v, g2 in zip((r, g, b), _DIELINE_GUIDE_HEX)):
+                continue  # dieline/registration guide color, not a print color
+            out.append('#{:02x}{:02x}{:02x}'.format(r, g, b))
+            if len(out) >= top_n:
+                break
+        return out
+    except Exception:
+        return []
+
+
+def _norm_pantone(name: str) -> str:
+    """Reduce a Pantone/PMS name to its bare number/name for comparison —
+    "PANTONE 4625 C", "PMS 4625C", and a PDF separation named
+    "PANTONE#204625#20C" (a literal space PDF-escaped as #20) all reduce to
+    "4625"."""
+    # PDF name objects encode certain characters as #XX hex escapes (a literal
+    # space becomes #20) — decode those FIRST. Otherwise "PANTONE#204625#20C"
+    # never reduces to "4625": the #20 sequences sit right where the
+    # prefix/suffix strips below expect whitespace.
+    n = re.sub(r'#([0-9A-Fa-f]{2})', lambda m: chr(int(m.group(1), 16)), name)
+    # Normalize prefix: "PANTONE" and "PMS" both reduced to just the number/name
+    n = re.sub(r'^(pantone|pms)\s*', '', n.strip(), flags=re.I)
+    # Strip trailing finish suffix (C=coated, U=uncoated, M=matte, CP, EC, etc.)
+    # — optional space before it, since "4625C" (no space) prints just as often
+    # as "4625 C" and both mean the same finish.
+    n = re.sub(r'\s*[CUMcum]{1,2}P?\s*$', '', n).strip()
+    return n.lower()
+
+
+def _spot_matches(req: str, file_colors: list) -> bool:
+    """Does a required spot-color name (from the spec sheet) match any
+    separation actually in the file?"""
+    req_n = _norm_pantone(req)
+    for c in file_colors:
+        c_n = _norm_pantone(c)
+        # Exact normalized match, or either side is a substring of the other
+        if req_n == c_n or req_n in c_n or c_n in req_n:
+            return True
+    return False
+
+
 def _get_ocg_names(doc) -> list:
     """Return Optional Content Group (layer) names from the document."""
     names = []
@@ -4059,7 +4160,8 @@ def _get_ocg_names(doc) -> list:
 
 
 def _check_print_specs(pdf_path: str, brand_config: dict = None,
-                       matched_spec: dict = None, template: dict = None) -> dict:
+                       matched_spec: dict = None, template: dict = None,
+                       img_path: str = None) -> dict:
     """
     Read actual PDF vector data using PyMuPDF.
     Checks dimensions, bleed, spot/Pantone colors, die lines, and RGB content.
@@ -4068,6 +4170,10 @@ def _check_print_specs(pdf_path: str, brand_config: dict = None,
     override brand_config for dimension/material/spot color validation.
     If a locked die template is provided, its trim / die-line rule are the
     authoritative expectation (reused for every flavor on that die).
+    img_path, when given, is the already-rendered 400 DPI page PNG — reused
+    (never re-rendered) to sample the artwork's actual printed color and
+    settle a spot-color name mismatch against the master list's hex value
+    (see the required-spot-color check below).
     """
     issues, notes = [], []
     brand_config = brand_config or {}
@@ -4194,33 +4300,64 @@ def _check_print_specs(pdf_path: str, brand_config: dict = None,
         if req_spots_raw:
             # Filter out blank/placeholder values like "PMS --", "--", "-", "N/A", "TBD"
             _PLACEHOLDER = re.compile(r'^[-–—]+$|^n/?a$|^tbd$|^none$|^pms\s*[-–—]+$', re.I)
+            # ReadyDoc delimits pms_spot_colors with " | ", not ",". Splitting only
+            # on comma left a multi-color cell as one unsplittable token that could
+            # never match a single-color PDF separation.
             req_spots = [
-                s.strip() for s in req_spots_raw.split(',')
+                s.strip() for s in re.split(r'[,|;]', req_spots_raw)
                 if s.strip() and not _PLACEHOLDER.match(s.strip())
             ]
 
-            def _norm_pantone(name: str) -> str:
-                # Normalize prefix: "PANTONE" and "PMS" both reduced to just the number/name
-                n = re.sub(r'^(pantone|pms)\s*', '', name.strip(), flags=re.I)
-                # Strip trailing finish suffix (C=coated, U=uncoated, M=matte, CP, EC, etc.)
-                n = re.sub(r'\s+[CUMcum]{1,2}P?\s*$', '', n).strip()
-                return n.lower()
+            # Parallel to pms_spot_colors — the master list column the check
+            # never read. Reading both turns "name not found" from ambiguous
+            # (wrong artwork? wrong master-list entry?) into decided: a render
+            # of the artwork already exists (400 DPI, from OCR) and sampling it
+            # says which record the evidence favors.
+            req_hex_raw = matched_spec.get('hex_spot_colors') or ''
+            req_hexes = [s.strip() for s in re.split(r'[,|;]', req_hex_raw) if s.strip()]
+            sampled_colors = _sample_dominant_colors(img_path) if img_path else []
 
-            def _spot_matches(req: str, file_colors: list) -> bool:
-                req_n = _norm_pantone(req)
-                for c in file_colors:
-                    c_n = _norm_pantone(c)
-                    # Exact normalized match, or either side is a substring of the other
-                    if req_n == c_n or req_n in c_n or c_n in req_n:
-                        return True
-                return False
+            for i, req in enumerate(req_spots):
+                name_ok = _spot_matches(req, spot_colors)
+                req_hex = req_hexes[i] if i < len(req_hexes) else None
+                hex_ok = (any(_hex_close(req_hex, s) for s in sampled_colors)
+                         if (req_hex and sampled_colors) else None)  # None = no evidence either way
 
-            for req in req_spots:
-                if not _spot_matches(req, spot_colors):
-                    issues.append({'severity': 'warning',
-                                   'message': f'Required spot color "{req}" (from spec sheet) '
-                                              'not found in the PDF. Verify color setup with '
-                                              'your designer before sending to print.'})
+                if name_ok and hex_ok is not False:
+                    continue  # matches by name, and nothing contradicts it by color — silent pass
+
+                if name_ok and hex_ok is False:
+                    # The expensive case: correctly labeled, wrong ink. A designer
+                    # copying a swatch's name without re-picking its color lands here.
+                    issues.append({'severity': 'critical', 'message': (
+                        f'Spot color "{req}" — the separation name matches, but the rendered color '
+                        f'does not match the spec sheet\'s hex ({req_hex}). The artwork may be built '
+                        'in the wrong color despite the correct label. Verify color setup with your '
+                        'designer before going to press.')})
+                elif not name_ok and hex_ok is True:
+                    # The rendered color is right; only the NAME on the spec sheet is
+                    # wrong. Say so plainly and point at the master list, not the designer —
+                    # a finding that only reports the disagreement makes the reader do
+                    # the work the tool exists to do.
+                    _found = ', '.join(spot_colors) if spot_colors else 'no separations detected'
+                    issues.append({'severity': 'review', 'message': (
+                        f'Spot color NAME mismatch, color correct — the spec sheet requires '
+                        f'"{req}", but no separation with that name is in the file (file uses: '
+                        f'{_found}). The rendered color matches the spec sheet\'s own hex ({req_hex}), '
+                        'so the artwork appears to be built correctly and the PMS number on the spec '
+                        'sheet or brand guide is the likely error, not the artwork. Confirm the '
+                        'correct PMS number against the brand guide\'s hex value.')})
+                elif not name_ok and hex_ok is False:
+                    issues.append({'severity': 'warning', 'message': (
+                        f'Required spot color "{req}" (from spec sheet) not found in the PDF, and '
+                        f'the rendered color does not match the spec sheet\'s hex ({req_hex}) either. '
+                        'Verify color setup with your designer before sending to print.')})
+                else:
+                    # No hex on file for this slot, or no render to sample against —
+                    # degrade to the original name-only finding rather than guess.
+                    issues.append({'severity': 'warning', 'message': (
+                        f'Required spot color "{req}" (from spec sheet) not found in the PDF. '
+                        'Verify color setup with your designer before sending to print.')})
 
         # ── Die line detection ────────────────────────────────────────────────
         die_spots  = [c for c in spot_colors
