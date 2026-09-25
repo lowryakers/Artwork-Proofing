@@ -4559,6 +4559,219 @@ def _get_ocg_names(doc) -> list:
     return names
 
 
+def _tokenize_content_stream(data: bytes) -> list:
+    """Minimal but correct PDF content-stream tokenizer: numbers, names, bare
+    operators, and literal/hex strings (content is skipped, not decoded — the
+    only thing callers need from a string here is that it consumed the right
+    span so operator parsing after it isn't corrupted). A naive split-on-
+    whitespace tokenizer breaks the moment a text-showing operator's string
+    argument contains something that looks like a number or a path operator —
+    which any label text on a packaging PDF (the SIDE/FRONT/BACK legend,
+    dimension callouts) reliably does."""
+    i, n = 0, len(data)
+    tokens = []
+    while i < n:
+        c = data[i:i + 1]
+        if c in b' \t\r\n\f\x00':
+            i += 1
+            continue
+        if c == b'%':
+            j = data.find(b'\n', i)
+            i = n if j < 0 else j + 1
+            continue
+        if c == b'(':
+            depth, j = 1, i + 1
+            while j < n and depth > 0:
+                if data[j:j + 1] == b'\\':
+                    j += 2
+                    continue
+                if data[j:j + 1] == b'(':
+                    depth += 1
+                elif data[j:j + 1] == b')':
+                    depth -= 1
+                j += 1
+            tokens.append(('str', None))
+            i = j
+            continue
+        if c == b'<':
+            if data[i:i + 2] == b'<<':
+                tokens.append(('op', '<<')); i += 2; continue
+            j = data.find(b'>', i)
+            i = n if j < 0 else j + 1
+            tokens.append(('str', None))
+            continue
+        if c == b'>':
+            if data[i:i + 2] == b'>>':
+                tokens.append(('op', '>>')); i += 2; continue
+            i += 1
+            continue
+        if c == b'/':
+            j = i + 1
+            while j < n and data[j:j + 1] not in b' \t\r\n\f()<>[]{}/%':
+                j += 1
+            tokens.append(('name', data[i:j].decode('latin-1')))
+            i = j
+            continue
+        if c in b'[]{}':
+            tokens.append(('op', c.decode())); i += 1; continue
+        j = i
+        while j < n and data[j:j + 1] not in b' \t\r\n\f()<>[]{}/%':
+            j += 1
+        tok = data[i:j].decode('latin-1')
+        i = j
+        try:
+            tokens.append(('num', float(tok)))
+        except ValueError:
+            tokens.append(('op', tok))
+    return tokens
+
+
+def _find_ocg_xref(doc, layer_name: str):
+    """xref of the Optional Content Group (PDF layer) with this exact name,
+    or None."""
+    try:
+        for xref in range(1, doc.xref_length()):
+            try:
+                obj = doc.xref_object(xref, compressed=False)
+            except Exception:
+                continue
+            if '/Type /OCG' in obj and f'/Name ({layer_name})' in obj:
+                return xref
+    except Exception:
+        pass
+    return None
+
+
+def _extract_layer_rects(pdf_path: str, layer_name: str, page_number: int = 0) -> list:
+    """Bounding boxes (mm, (x0, y0, x1, y1) in the PDF's native bottom-left-
+    origin page space) of every distinct rectangle drawn under a named
+    Optional Content Group (layer) — e.g. a vendor's 'Dieline' layer.
+
+    Why this exists: a converter's die-line layout PDF often has a page/
+    TrimBox sized to the full artboard (dimension callouts, a color legend,
+    a "call Bill Pendleton" footer) rather than the actual trim — the real
+    print/slit box only exists as vector geometry on a named layer. This
+    walks the page's content stream (tracking the CTM and the marked-content
+    stack, using _tokenize_content_stream so a label like "SIDE" or "197mm"
+    drawn as a text string can't be mistaken for path data) and collects the
+    bounding box of every closed rectangle painted while that layer is
+    active — both plain `re` rectangles and 4-point polylines closed by a
+    fill/stroke.
+
+    Best-effort: returns [] on any failure (PyMuPDF not installed, the named
+    layer doesn't exist, a malformed content stream, …). A die-box read is a
+    precision improvement over TrimBox/MediaBox, never a reason to fail
+    proofing.
+    """
+    try:
+        import fitz
+    except ImportError:
+        return []
+    try:
+        doc = fitz.open(pdf_path)
+        try:
+            page = doc[page_number]
+            ocg_xref = _find_ocg_xref(doc, layer_name)
+            if ocg_xref is None:
+                return []
+            page_obj = doc.xref_object(page.xref, compressed=False)
+            m = re.search(r'/Properties\s*<<(.*?)>>', page_obj, re.S)
+            if not m:
+                return []
+            prop_key = None
+            for km in re.finditer(r'/(\w+)\s+(\d+)\s+0\s+R', m.group(1)):
+                if int(km.group(2)) == ocg_xref:
+                    prop_key = '/' + km.group(1)
+                    break
+            if prop_key is None:
+                return []
+
+            tokens = _tokenize_content_stream(page.read_contents())
+
+            def mat_mul(a, b):
+                a0, a1, a2, a3, a4, a5 = a
+                b0, b1, b2, b3, b4, b5 = b
+                return (a0 * b0 + a1 * b2, a0 * b1 + a1 * b3,
+                       a2 * b0 + a3 * b2, a2 * b1 + a3 * b3,
+                       a4 * b0 + a5 * b2 + b4, a4 * b1 + a5 * b3 + b5)
+
+            def apply_m(m, x, y):
+                a, b, c, d, e, f = m
+                return (a * x + c * y + e, b * x + d * y + f)
+
+            IDENT = (1, 0, 0, 1, 0, 0)
+            ctm_stack, ctm = [], IDENT
+            mc_stack = []
+            operands = []
+            cur_subpath = []
+            rects = []
+
+            def nums(k):
+                vals = [t[1] for t in operands[-k:] if t[0] == 'num']
+                while len(vals) < k:
+                    vals.insert(0, 0.0)
+                return vals[-k:]
+
+            for kind, val in tokens:
+                if kind in ('num', 'str', 'name'):
+                    operands.append((kind, val))
+                    continue
+                op = val
+                if op == 'q':
+                    ctm_stack.append(ctm)
+                elif op == 'Q':
+                    if ctm_stack:
+                        ctm = ctm_stack.pop()
+                elif op == 'cm':
+                    ctm = mat_mul(tuple(nums(6)), ctm)
+                elif op == 'BDC':
+                    prop = operands[-1][1] if operands and operands[-1][0] == 'name' else None
+                    mc_stack.append(prop)
+                elif op == 'BMC':
+                    mc_stack.append(None)
+                elif op == 'EMC':
+                    if mc_stack:
+                        mc_stack.pop()
+                elif op == 'm':
+                    x, y = nums(2)
+                    cur_subpath = [apply_m(ctm, x, y)]
+                elif op == 'l':
+                    x, y = nums(2)
+                    cur_subpath.append(apply_m(ctm, x, y))
+                elif op in ('c', 'v', 'y'):
+                    vals = nums(6 if op == 'c' else 4)
+                    cur_subpath.append(apply_m(ctm, vals[-2], vals[-1]))
+                elif op == 're':
+                    x, y, w, h = nums(4)
+                    pts = [apply_m(ctm, cx, cy)
+                          for cx, cy in ((x, y), (x + w, y), (x + w, y + h), (x, y + h))]
+                    if prop_key in mc_stack:
+                        rects.append(pts)
+                    cur_subpath = []
+                elif op in ('f', 'F', 'f*', 'S', 's', 'B', 'B*', 'b', 'b*', 'n'):
+                    if cur_subpath and prop_key in mc_stack:
+                        rects.append(cur_subpath)
+                    cur_subpath = []
+                operands = []
+
+            pts_to_mm = 25.4 / 72.0
+            out, seen = [], set()
+            for pts in rects:
+                xs = [p[0] for p in pts]
+                ys = [p[1] for p in pts]
+                bbox = tuple(round(v * pts_to_mm, 2) for v in
+                            (min(xs), min(ys), max(xs), max(ys)))
+                if bbox in seen or (bbox[2] - bbox[0]) < 1 or (bbox[3] - bbox[1]) < 1:
+                    continue  # dedupe, and drop degenerate slivers (fold lines, not boxes)
+                seen.add(bbox)
+                out.append(bbox)
+            return out
+        finally:
+            doc.close()
+    except Exception:
+        return []
+
+
 def _check_print_specs(pdf_path: str, brand_config: dict = None,
                        matched_spec: dict = None, template: dict = None,
                        img_path: str = None) -> dict:
@@ -4639,6 +4852,35 @@ def _check_print_specs(pdf_path: str, brand_config: dict = None,
         spec_h = tmpl_spec.get('trim_height_mm') or matched_spec.get('trim_height_mm') or brand_config.get('spec_height_mm')
         dim_ref = (tb_w, tb_h) if tb_w else (mb_w, mb_h)
         dim_label = 'trim' if tb_w else 'page'
+
+        # A converter's die-line layout PDF can carry a page/TrimBox sized to
+        # the full artboard (dimension callouts, a color legend, a vendor
+        # footer) rather than the actual trim — the artboard is legitimate
+        # overhang, not a defect. When the locked die declares where to find
+        # its real print/slit box (a named vector layer), read that instead
+        # of trusting TrimBox/MediaBox. Falls back to the line above,
+        # unchanged, when no locator is set or no matching rectangle is found.
+        _locator = template.get('die_box_locator')
+        if _locator and _locator.get('ocg_layer'):
+            _accepted_wh = tmpl_spec.get('accepted_trims_mm') or []
+            _die_tol = 2.0
+            _hit_rect = None
+            for (rx0, ry0, rx1, ry1) in _extract_layer_rects(pdf_path, _locator['ocg_layer']):
+                rw, rh = round(rx1 - rx0, 2), round(ry1 - ry0, 2)
+                for (aw, ah) in _accepted_wh:
+                    if ((abs(rw - aw) <= _die_tol and abs(rh - ah) <= _die_tol) or
+                       (abs(rw - ah) <= _die_tol and abs(rh - aw) <= _die_tol)):
+                        _hit_rect = (rw, rh)
+                        break
+                if _hit_rect:
+                    break
+            if _hit_rect:
+                dim_ref = _hit_rect
+                dim_label = f'die box ({_locator["ocg_layer"]} layer)'
+                notes.append(
+                    f'Die box read from the {_locator["ocg_layer"]} layer: {_hit_rect[0]:g} × '
+                    f'{_hit_rect[1]:g} mm. Page/trim size ({mb_w} × {mb_h} mm) includes dimension '
+                    'callouts and a vendor legend — treated as overhang, not the trim.')
 
         # A die may accept several valid layouts (e.g. useable print area OR the
         # full slit × cut length for a shrink sleeve). Match against any of them.
