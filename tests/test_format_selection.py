@@ -4,11 +4,15 @@
 
 Exits non-zero on any failure. No test framework required.
 
-Ground truth (FINAL — Litho Flexo Grafics "108mmLF x 5.625inCL PLUS",
-Bill Pendleton, 2026-09-03): layflat 108 mm, cut length 5.625 in = 142.875 mm,
-print area 218 × 138.875 mm, slit 223 mm, 5 mm clear strip. The earlier Impact
-Sleeves numbers (107×125 / art 216×121 / 2.5 mm underlap) are SUPERSEDED and must
-not appear in the live template data.
+Ground truth (LIVE — v2, Litho Flexo Grafics "95mmLF x 6.625inCL PLUS",
+Bill Pendleton, 2026-09-24, derived from the converter layout PDF's own
+Dieline OCG layer + Die/Die2 separations + live-text legend): layflat 95 mm,
+cut length 6.625 in = 168.275 mm, print area 192 × 164.275 mm, slit 197 mm,
+5 mm clear strip. This supersedes v1 (108mmLF x 5.625inCL, 2026-09-03), which
+stays intact in the template's `superseded` list rather than being deleted.
+The earlier-still Impact Sleeves numbers (107×125 / art 216×121 / 2.5 mm
+underlap) are void and must not appear anywhere except as an archived note
+inside v1's own preserved provenance.
 """
 import json
 import os
@@ -30,41 +34,69 @@ def _run():
 
     T = dt.get('prodough_bottle_shrink_sleeve')
 
-    # ── Locked constants match the FINAL Litho Flexo table ────────────────────
+    # ── Locked constants match the LIVE (v2) converter-layout table ───────────
     mm = T['mm']
-    check('layflat 108 mm', mm['layflat'] == 108.0)
-    check('cut length 5.625 in = 142.875 mm', mm['cut_length'] == 142.875 and mm['cut_length_in'] == 5.625)
-    check('print area 218 × 138.875 mm', mm['print_w'] == 218.0 and mm['print_h'] == 138.875)
-    check('slit width 223 mm', mm['slit_w'] == 223.0)
+    check('template_version is 2 (live)', T['template_version'] == 2)
+    check('layflat 95 mm', mm['layflat'] == 95.0)
+    check('cut length 6.625 in = 168.275 mm', mm['cut_length'] == 168.275 and mm['cut_length_in'] == 6.625)
+    check('print area 192 × 164.275 mm', mm['print_w'] == 192.0 and mm['print_h'] == 164.275)
+    check('slit width 197 mm', mm['slit_w'] == 197.0)
     check('clear strip 5 mm', mm['clear_strip'] == 5.0)
     check('die line required', T['spec']['die_line_required'] is True)
     check('format is bottle_sleeve', T['format'] == 'bottle_sleeve')
-    check('template version present', isinstance(T['template_version'], int))
+    check('die_box_locator names the Dieline OCG layer',
+          T.get('die_box_locator', {}).get('ocg_layer') == 'Dieline')
 
-    # ── No superseded Impact numbers in the LIVE template data ────────────────
-    # (They are allowed ONLY inside the provenance "supersedes" note.)
-    live = json.dumps({k: v for k, v in T.items() if k != 'provenance'})
+    # ── No stray Impact numbers in the LIVE (non-superseded) template data ────
+    # (Impact is void everywhere except v1's own archived provenance note,
+    # checked separately below — that string legitimately contains "107".)
+    live = json.dumps({k: v for k, v in T.items() if k not in ('provenance', 'superseded')})
     for bad in ('107', '216', '125.0', '121.0', '2.5 mm', 'underlap'):
-        check(f'Impact token "{bad}" absent from live template data', bad not in live)
-    check('supersedes note names the Impact dims as void',
-          'void' in T['provenance']['supersedes'].lower()
-          and '107' in T['provenance']['supersedes'])
+        check(f'Impact token "{bad}" absent from live (non-superseded) template data', bad not in live)
+    # And no v1 (108LF) numbers leak into the live v2 data either — a
+    # supersession must actually replace the numbers, not just bump a version.
+    for bad in ('108.0', '142.875', '218.0', '138.875', '223.0'):
+        check(f'v1 (108LF) token "{bad}" absent from live v2 template data', bad not in live)
 
-    # ── Panel map: FRONT is the 108 mm layflat centre ─────────────────────────
+    # ── v1 preserved intact, provenance block and all ─────────────────────────
+    v1 = dt.get_superseded('prodough_bottle_shrink_sleeve', 1)
+    check('v1 (108LF) is preserved via get_superseded, not deleted', v1 is not None)
+    check('v1 keeps its own real numbers', v1['mm']['layflat'] == 108.0 and v1['mm']['cut_length'] == 142.875)
+    check('v1 keeps its own provenance block (contact, dates)',
+          v1['provenance']['contact'] == 'Bill Pendleton' and v1['provenance']['layout_date'] == '2026-09-03')
+    check("v1's provenance still names the Impact dims as void (kept, same as before)",
+          'void' in v1['provenance']['supersedes'].lower() and '107' in v1['provenance']['supersedes'])
+    check('no dangling second live template_id from the supersession',
+          list(dt.TEMPLATES.keys()) == ['prodough_bottle_shrink_sleeve'])
+
+    # ── Panel map: derived from the Dieline layer's own fold geometry ─────────
+    # (converter layout PDF: print-area box 32.32→224.32mm; layflat box
+    # 77.32→172.32mm; a stroked fold line at 123.32mm splits FRONT from a
+    # second SIDE — see docs/bottle-shrink-sleeve-die.md for the full
+    # derivation, cross-checked against the SIDE/FRONT/SIDE/BACK label
+    # positions in the Text layer.)
     names = [p['name'] for p in T['panel_map']]
-    check('panel map is wrap|FRONT|wrap', names == ['LEFT_WRAP', 'FRONT', 'RIGHT_WRAP'])
+    check('panel map is SIDE|FRONT|SIDE2|BACK (4 faces, not 3)',
+          names == ['SIDE', 'FRONT', 'SIDE2', 'BACK'])
     fr = dt.front_panel_fraction(T)
-    # Folds sit at 51/218 and 159/218 of the print width.
-    check('FRONT fraction ≈ 51/218 … 159/218',
-          abs(fr[0] - 51 / 218) < 0.01 and abs(fr[1] - 159 / 218) < 0.01)
-    b = dt.panel_bounds(T, 2180)
-    check('panel_bounds scales to pixel width', b[1]['name'] == 'FRONT' and b[1]['x0'] == 510 and b[0]['x0'] == 0 and b[-1]['x1'] == 2180)
+    # FRONT spans print-area 77.32->123.32mm = 45.00->91.00mm from the print
+    # area's own left edge, i.e. 45/192 .. 91/192 of print width.
+    check('FRONT fraction is 45/192 .. 91/192 of print width',
+          abs(fr[0] - 45 / 192) < 0.001 and abs(fr[1] - 91 / 192) < 0.001)
+    b = dt.panel_bounds(T, 1920)
+    check('panel_bounds scales to pixel width (SIDE|FRONT|SIDE2|BACK, edge to edge)',
+          b[0]['x0'] == 0 and b[-1]['x1'] == 1920
+          and b[0]['name'] == 'SIDE' and b[1]['name'] == 'FRONT'
+          and b[2]['name'] == 'SIDE2' and b[3]['name'] == 'BACK')
+    check('panel widths sum to the full print width (450+460+490+520 = 1920px @10px/mm)',
+          (b[0]['x1']-b[0]['x0']) + (b[1]['x1']-b[1]['x0'])
+          + (b[2]['x1']-b[2]['x0']) + (b[3]['x1']-b[3]['x0']) == 1920)
 
-    # ── Fixture sha is 'pending' until the binary is committed (no crash) ──────
-    check('die_sha256 is None when fixture absent (pending, not error)',
-          dt.die_sha256(T) is None or isinstance(dt.die_sha256(T), str))
-    check('mm_constants carries the reused numbers',
-          dt.mm_constants(T)['layflat'] == 108.0 and dt.mm_constants(T)['cut_length'] == 142.875)
+    # ── Fixture sha is real this time — the converter layout PDF is committed ──
+    check('die_sha256 is a real hash (the converter-layout PDF is committed, not pending)',
+          isinstance(dt.die_sha256(T), str) and len(dt.die_sha256(T)) == 64)
+    check('mm_constants carries the LIVE (v2) numbers',
+          dt.mm_constants(T)['layflat'] == 95.0 and dt.mm_constants(T)['cut_length'] == 168.275)
 
     # ── Committed JSON snapshot has not drifted from the Python source ─────────
     snap_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -110,7 +142,7 @@ def _run():
     stick = {'flavor': 'Cinnamon Bun', 'sku': 'WHY-STK-CPB', 'packaging_type': 'Stick Pack',
              'trim_width_mm': 60, 'trim_height_mm': 180, 'gtin': '111'}
     bottle = {'flavor': 'Cinnamon Bun', 'sku': 'WHY-BTL-CPB', 'packaging_type': 'Bottle Shrink Sleeve',
-              'trim_width_mm': 218, 'trim_height_mm': 138.875, 'gtin': '222'}
+              'trim_width_mm': 192, 'trim_height_mm': 164.275, 'gtin': '222'}
     rows = [stick, bottle]
 
     check('-BTL- file with both rows → bottle row',
@@ -144,8 +176,8 @@ def _run():
         check('CSV fixture parsed (3 bottle rows)', len(csv_rows) == 3)
         check('every CSV row is bottle_sleeve format',
               all(pe._spec_format(r) == 'bottle_sleeve' for r in csv_rows))
-        check('every CSV row uses Litho print trim (218 × 138.875), not Impact/stick',
-              all(r['trim_width_mm'] == 218 and r['trim_height_mm'] == 138.875 for r in csv_rows))
+        check('every CSV row uses the LIVE Litho print trim (192 × 164.275), not v1/Impact/stick',
+              all(r['trim_width_mm'] == 192 and r['trim_height_mm'] == 164.275 for r in csv_rows))
         # A -BTL- file resolves to its bottle row from the fixture …
         m = pe._match_spec_row([], 'WHY-BTL-CPB_cinnamon_protein_bun.pdf', csv_rows)
         check('CSV: -BTL- file matches its bottle row', m.get('sku') == 'WHY-BTL-CPB')
