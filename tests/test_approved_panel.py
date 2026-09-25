@@ -153,6 +153,28 @@ def _run():
     check('draft panel -> PANEL_NOT_APPROVED (not PANEL_MISSING)', r['status'] == 'PANEL_NOT_APPROVED')
     check('PANEL_NOT_APPROVED still carries the draft version', r['panel_version'] == 2)
 
+    # A draft is real, comparable data — not a reason to skip the diff. The
+    # useful middle state ("checkable, not yet releasable") must be reachable.
+    draft_art = _matching_artwork()
+    draft_art['protein_g'] = 20   # genuinely differs from the draft panel's 25
+    draft_front = dict(_APPROVED_FRONT, protein_g=20)
+    r = pe._check_approved_panel(draft_art, draft_front, _APPROVED_PANEL['ingredients'],
+                                 'Milk', _approved(version=2, status='draft'))
+    check('draft panel still runs the full diff (finds the protein mismatch)',
+          any('protein' in i['message'].lower() for i in r['issues']))
+    check('a mismatch against a draft never escalates status past PANEL_NOT_APPROVED',
+          r['status'] == 'PANEL_NOT_APPROVED')
+    check('every finding against a draft is prefixed so it reads as checked-not-released',
+          r['issues'] and all(i['message'].startswith('vs DRAFT panel v2 — ') for i in r['issues']))
+
+    # A draft the artwork fully matches is STILL not releasable — the diff
+    # ran and found nothing wrong, but that is not the same as VERIFIED.
+    r_clean_draft = pe._check_approved_panel(_matching_artwork(), dict(_APPROVED_FRONT),
+                                             _APPROVED_PANEL['ingredients'], 'Milk',
+                                             _approved(version=2, status='draft'))
+    check('draft panel the artwork matches -> still PANEL_NOT_APPROVED, never VERIFIED',
+          r_clean_draft['status'] == 'PANEL_NOT_APPROVED')
+
     # VERIFIED — everything read and matches.
     art = _matching_artwork()
     front = dict(_APPROVED_FRONT)

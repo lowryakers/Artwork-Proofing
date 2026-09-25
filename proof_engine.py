@@ -2818,10 +2818,16 @@ def _check_approved_panel(artwork_panel: dict, front_artwork: dict, ingredients_
     coerced to 0 or the threshold number.
 
     Status (never CLEAN unless VERIFIED):
-      PANEL_MISSING      — no panel record in ReadyDoc for this product.
-      PANEL_NOT_APPROVED — a panel exists but is still a draft. Blocks print
-                           release regardless of whether the artwork is correct.
-      CRITICAL           — the artwork differs from an approved panel.
+      PANEL_MISSING      — no panel record in ReadyDoc for this product. No
+                           diff runs — there is nothing to diff against.
+      PANEL_NOT_APPROVED — a panel exists but is still a draft. The full diff
+                           still runs against it (draft data is real, checkable
+                           data — just not yet authoritative enough to release
+                           on), with every finding prefixed to say it's against
+                           a draft. Status never escalates past this regardless
+                           of what the diff finds: it blocks print release
+                           whether the artwork matches the draft or not.
+      CRITICAL           — the artwork differs from an APPROVED panel.
       PANEL_SUPERSEDED   — matches, but the panel was revised since this SKU's
                            last recorded proof; re-confirm before trusting it.
       VERIFIED           — matches the current approved panel. The only status
@@ -2833,13 +2839,7 @@ def _check_approved_panel(artwork_panel: dict, front_artwork: dict, ingredients_
             'Nutrition cannot be verified against a source of truth outside the artwork.']}
 
     version = approved.get('version')
-    if str(approved.get('status', '')).strip().lower() != 'approved':
-        return {'status': 'PANEL_NOT_APPROVED', 'issues': [], 'panel_version': version, 'notes': [
-            f'PANEL NOT APPROVED — the nutrition panel on file for this product (v{version}) '
-            'is still a draft. Approving it in ReadyDoc is what lets artwork be released to '
-            'print against it; this blocks print release whether or not the artwork itself '
-            'is correct.']}
-
+    is_approved = str(approved.get('status', '')).strip().lower() == 'approved'
     approved_panel = approved.get('panel') or {}
     approved_front = approved.get('front_callouts') or {}
 
@@ -2855,6 +2855,23 @@ def _check_approved_panel(artwork_panel: dict, front_artwork: dict, ingredients_
     issues += [{'severity': 'review', 'message': (
         f'{label} could not be read from the artwork to cross-check against the approved '
         f'panel v{version} ({_fmt_amt(p_val)}) — verify manually.')} for label, p_val in gaps]
+
+    if not is_approved:
+        # Draft data is still real, comparable data — the useful middle state
+        # is "good enough to check against, not yet authoritative enough to
+        # release on." Run the same diff so a genuine mismatch surfaces early
+        # instead of waiting for approval to find out, but prefix every
+        # finding so it can never be mistaken for a match against the
+        # approved record, and never let the status move past
+        # PANEL_NOT_APPROVED — a draft is not a release clearance no matter
+        # what the diff finds.
+        for i in issues:
+            i['message'] = f'vs DRAFT panel v{version} — {i["message"]}'
+        return {'status': 'PANEL_NOT_APPROVED', 'issues': issues, 'panel_version': version, 'notes': [
+            f'PANEL NOT APPROVED — the nutrition panel on file for this product (v{version}) '
+            'is still a draft. Approving it in ReadyDoc is what lets artwork be released to '
+            'print against it; this blocks print release whether or not the artwork itself '
+            'is correct.']}
 
     if any(i['severity'] == 'critical' for i in issues):
         return {'status': 'CRITICAL', 'issues': issues, 'panel_version': version, 'notes': []}
