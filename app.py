@@ -904,6 +904,7 @@ def _generate_report(job: dict, brand_name: str = 'ProDough') -> io.BytesIO:
         n_crit = sum(1 for _, nw in nw_rows if nw.get('status') == 'CRITICAL')
         n_susp = sum(1 for _, nw in nw_rows if nw.get('status') == 'SUSPECT')
         n_unv  = sum(1 for _, nw in nw_rows if nw.get('status') == 'UNVERIFIED')
+        n_rev  = sum(1 for _, nw in nw_rows if nw.get('status') == 'REVIEW')
         wsn.merge_cells('A1:H1')
         wsn['A1'] = 'NUTRITION PANEL vs NET WEIGHT (must reconcile before print)'
         wsn['A1'].font = Font(bold=True, size=12)
@@ -916,6 +917,8 @@ def _generate_report(job: dict, brand_name: str = 'ProDough') -> io.BytesIO:
             _parts.append(f'{n_susp} suspect read(s) to re-check')
         if n_unv:
             _parts.append(f'{n_unv} could not be reconciled — the nutrition panel did not read')
+        if n_rev:
+            _parts.append(f'{n_rev} overfill(s) worth confirming (not a defect)')
         banner = ('; '.join(_parts) + '.') if _parts else 'All panels reconcile to actual fill weight.'
         wsn.merge_cells('A2:H2')
         wsn['A2'] = banner
@@ -936,7 +939,14 @@ def _generate_report(job: dict, brand_name: str = 'ProDough') -> io.BytesIO:
                 c = wsn.cell(row=row_idx, column=col, value=val)
                 c.alignment = wrap if col == 8 else center
             st = nw.get('status')
-            fillc = fill_crit if st == 'FAIL' else fill_warn if st == 'UNVERIFIED' else fill_ok
+            # 'FAIL' never matches — _check_net_weight returns 'CRITICAL' — so a
+            # critical net-weight row rendered with no fill at all until this line
+            # named the status net_weight actually uses. REVIEW (a >=5% overfill
+            # worth a glance, not a defect) gets the same amber as UNVERIFIED —
+            # a green row here must mean "reconciles," never "reconciles, but…".
+            fillc = (fill_crit if st == 'CRITICAL'
+                    else fill_warn if st in ('UNVERIFIED', 'REVIEW', 'SUSPECT')
+                    else fill_ok)
             for col in range(1, 9):
                 wsn.cell(row=row_idx, column=col).fill = fillc
             row_idx += 1
