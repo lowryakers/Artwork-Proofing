@@ -677,7 +677,9 @@ def _claude_vision_ocr(img_path: str) -> dict:
             'e.g. 0.75 for 3/4 cup, else null>, "servings_per_container": <number, e.g. 7; parse '
             '"about 4.5" as 4.5, or null>, "net_weight_g": <grams from the front Net Wt line, e.g. '
             '454 from "Net Wt 1lb (16oz) 454g", or null>, "unit_count": <number from a front '
-            '"Makes N ..." yield, e.g. 24 from "Makes 24 Cupcakes", or null>},\n'
+            '"Makes N ..." yield, e.g. 24 from "Makes 24 Cupcakes", or null>, '
+            '"net_weight_from_conversion": <true only if you converted net_weight_g from oz/lb '
+            'because no gram figure was printed, else false>},\n'
             '  "nfp_bbox": [<x0>, <y0>, <x1>, <y1>],  // bounding box of the Nutrition Facts '
             '(or Supplement Facts) panel in the FIRST image, as fractions of width/height in '
             '[0,1] (top-left origin): x0,y0 = top-left corner, x1,y1 = bottom-right. null if no '
@@ -718,11 +720,13 @@ def _claude_vision_ocr(img_path: str) -> dict:
             'immediately before that phrase; keep decimals and drop "about" (so "About 4.5 '
             'servings per container" → 4.5). This is NOT the "Makes N" unit count, NOT the prep '
             'block yield, and NOT any other number on the pack — if you cannot see the literal '
-            '"servings per container" line, return null. net_weight_g = the metric net weight on '
-            'the front; unit_count = only from an explicit front "Makes N" yield. Convert all '
-            'weights to grams (1 oz = 28.35g, 1 lb = 453.6g) and report grams only. Return null '
-            'for any panel value you cannot actually read — never guess a typical value for the '
-            'product type; a guessed number is worse than null.\n'
+            '"servings per container" line, return null. net_weight_g = the metric net weight '
+            'printed on the front. If the line prints a gram figure — "Net Wt. 1.23 oz (35g)" — '
+            'return THAT number verbatim (35), never a conversion of the ounce figure. Convert '
+            'from oz or lb ONLY when no gram figure is printed (1 oz = 28.35g, 1 lb = 453.6g), and '
+            'set net_weight_from_conversion true when you do. unit_count = only from an explicit '
+            'front "Makes N" yield. Return null for any panel value you cannot actually read — '
+            'never guess a typical value for the product type; a guessed number is worse than null.\n'
             'nfp_bbox = locate the Nutrition Facts / Supplement Facts panel in the FIRST image '
             '(the whole-package view) and give its bounding box as fractions of the image width '
             'and height in [0,1], top-left origin: [x0, y0, x1, y1]. Be generous rather than '
@@ -823,6 +827,11 @@ def _parse_vision_json(txt: str) -> dict:
             desc = p.get('serving_size_desc')
             if isinstance(desc, str) and desc.strip() and desc.strip().lower() not in ('null', 'none'):
                 out['serving_size_desc'] = desc.strip()
+            # Whether net_weight_g was converted from an oz/lb figure rather than
+            # read verbatim off a printed gram figure — lets the oz/gram
+            # self-consistency check below trust a verbatim read over a
+            # conversion when both are present.
+            out['net_weight_from_conversion'] = bool(p.get('net_weight_from_conversion'))
             return out
 
         def _clean_bbox(b):
@@ -905,6 +914,30 @@ _NFP_CROP_PROMPT = (
     'guess a typical or common value for the product type — a guessed "typical panel" '
     'number is a failure, not a fallback. If the crop is blurry, cut off, or unreadable, '
     'null is the correct answer for the fields you cannot see.')
+
+
+def _num_or_none(v):
+    """Coerce a panel amount to a float. Tolerates the '<1' / '<5' / '< 1 g' forms
+    that appear on real panels and that the approved-panel contract returns as
+    strings. Returns None when there is no number to read — never raises. A bare
+    int() at a call site that merges vision-read amounts took down a whole file
+    (job 8109022a: 'Includes <1g Added Sugars') instead of just one check."""
+    if v is None:
+        return None
+    if isinstance(v, (int, float)):
+        return float(v)
+    m = re.search(r'-?\d+(?:\.\d+)?', str(v))
+    return float(m.group(0)) if m else None
+
+
+def _is_below(v) -> bool:
+    """True when the amount was declared as a '<' bound rather than an exact
+    value. '<1g Added Sugars' is NOT the same claim as '0g' — FDA permits
+    rounding to 0g only below 0.5g, so a panel printing '<1g' is stating the
+    true value is somewhere in [0, 1), which a front '0G Added Sugar' callout
+    does not necessarily match. Treating '<1' as equal to 0 would silently
+    agree with a label that may be self-contradicting."""
+    return isinstance(v, str) and '<' in v
 
 
 def _parse_nfp_amount(v):
@@ -1359,11 +1392,11 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
         vision_nutrition = dict(vision_nutrition or {})
         _nfp_vals = dict(vision_nutrition.get('nfp') or {})
         if nfp_read.get('calories') is not None:
-            _nfp_vals['calories'] = int(nfp_read['calories'])
+            _nfp_vals['calories'] = _num_or_none(nfp_read['calories'])
         if nfp_read.get('protein_g') is not None:
-            _nfp_vals['protein_g'] = int(nfp_read['protein_g'])
+            _nfp_vals['protein_g'] = _num_or_none(nfp_read['protein_g'])
         if nfp_read.get('added_sugar_g') is not None:
-            _nfp_vals['added_sugar_g'] = int(nfp_read['added_sugar_g'])
+            _nfp_vals['added_sugar_g'] = _num_or_none(nfp_read['added_sugar_g'])
         # Carry the crop's carb components too, so the net-carb recompute reads the
         # same reliable source as the serving size (not a stale full-page read).
         for _ck in ('total_carbohydrate_g', 'dietary_fiber_g', 'sugar_alcohol_g'):
@@ -1826,17 +1859,23 @@ def _check_nfp(ocr_text: str, front_text: str = '', vision_nutrition: dict = Non
     # they cleanly separate the front callout from the NFP, which regex on a mixed
     # text blob cannot. Override the Tesseract-derived values with them.
     if _vfc.get('calories') is not None:
-        front_calories = [int(_vfc['calories'])]
+        front_calories = [_num_or_none(_vfc['calories'])]
     if _vfc.get('protein_g') is not None:
-        front_proteins = [int(_vfc['protein_g'])]
+        front_proteins = [_num_or_none(_vfc['protein_g'])]
     if _vfc.get('added_sugar_g') is not None:
-        front_zero_sugar = int(_vfc['added_sugar_g']) == 0
+        _as_front = _vfc['added_sugar_g']
+        # "<1g" is NOT zero — FDA permits declaring 0g only below 0.5g, so a
+        # panel that prints "<1g" is stating the value is at or above that.
+        # Treat it as non-zero so a front "0G Added Sugar" claim is still
+        # tested against it, instead of silently agreeing with it.
+        front_zero_sugar = (_num_or_none(_as_front) == 0 and not _is_below(_as_front))
     if _vnfp.get('calories') is not None:
-        nfp_calories = [int(_vnfp['calories'])]
+        nfp_calories = [_num_or_none(_vnfp['calories'])]
     if _vnfp.get('protein_g') is not None:
-        nfp_proteins = [int(_vnfp['protein_g'])]
+        nfp_proteins = [_num_or_none(_vnfp['protein_g'])]
     if _vnfp.get('added_sugar_g') is not None:
-        nfp_zero_sugar = int(_vnfp['added_sugar_g']) == 0
+        _as_nfp = _vnfp['added_sugar_g']
+        nfp_zero_sugar = (_num_or_none(_as_nfp) == 0 and not _is_below(_as_nfp))
 
     # Combined lists — used by the mismatch checks below
     calories = sorted(set(nfp_calories) | set(front_calories))
@@ -1909,7 +1948,25 @@ def _check_nfp(ocr_text: str, front_text: str = '', vision_nutrition: dict = Non
                 ),
             })
 
-    if re.search(r'0\s*g\s+added\s+sugar', tl):
+    # Added-sugar mismatch — a front "0G Added Sugar" claim contradicts an NFP
+    # that reads anything else, including "<1g": FDA permits rounding to 0g
+    # only below 0.5g, so a panel printing the threshold form is stating the
+    # true value is NOT confirmed zero. The structured vision reads settle
+    # this precisely when both sides were actually read; a text-only front
+    # claim with no NFP read at all still degrades to the old advisory note
+    # rather than asserting a mismatch it can't confirm.
+    if not has_dual_column and _vfc.get('added_sugar_g') is not None and _vnfp.get('added_sugar_g') is not None:
+        if front_zero_sugar and not nfp_zero_sugar:
+            issues.append({
+                'severity': 'critical',
+                'message': (
+                    f'Added sugar mismatch: front call-out declares "0G Added Sugar" but the NFP '
+                    f'reads {_vnfp["added_sugar_g"]}g. FDA permits rounding to 0g only below 0.5g — '
+                    'a panel printing a non-zero or "<1g" value states the opposite of the front '
+                    'claim. Front call-out must match the NFP added sugars declaration.'
+                ),
+            })
+    elif re.search(r'0\s*g\s+added\s+sugar', tl):
         if not re.search(r'added\s+sugars?\s+0\s*g|added\s+sugars?\s*\n?\s*0', tl):
             notes.append(
                 '"0G Added Sugar" front claim detected. '
@@ -2024,6 +2081,16 @@ def _parse_panel_from_text(text: str) -> dict:
             out['net_weight_g'] = round(float(moz.group(1)) * 28.35, 1)
         elif mlb:
             out['net_weight_g'] = round(float(mlb.group(1)) * 453.6, 1)
+
+    # Both figures printed on the same line must agree. Declared grams win; the
+    # ounce figure is the one that is usually stale (e.g. "Net Wt. 1.20 oz
+    # (35g)" — 1.20 oz is 34.0g, not 35). A gap under 0.6g absorbs normal
+    # rounding on a two-decimal oz declaration; anything more is worth a look.
+    _moz_check = re.search(r'net\s*wt\.?[^\n]{0,30}?(\d{1,3}(?:\.\d+)?)\s*oz\b', tl)
+    if _moz_check and out.get('net_weight_g') and not out.get('net_weight_from_conversion'):
+        _oz_g = float(_moz_check.group(1)) * 28.3495
+        if abs(_oz_g - out['net_weight_g']) > 0.6:
+            out['net_weight_oz_mismatch'] = (float(_moz_check.group(1)), round(_oz_g, 1))
     # Front unit yield ("Makes 24 Cupcakes", "Makes about 21 Pancakes").
     mu = re.search(r'makes\s+(?:about\s+)?(\d{1,3})\s+[a-z]', tl)
     if mu:
@@ -2062,6 +2129,9 @@ def _pct_off(a, b):
     return abs(a - b) / float(b)
 
 
+_OVERFILL_REVIEW_PCT = 5.0   # below this, an overfill is ordinary practice, not a finding
+
+
 def _check_net_weight(panel: dict, fill_weight_g=None, fname: str = '',
                       serving_vision_backed: bool = True) -> dict:
     """Reconcile the nutrition panel against net weight and real fill weight.
@@ -2078,6 +2148,18 @@ def _check_net_weight(panel: dict, fill_weight_g=None, fname: str = '',
     ss   = panel.get('serving_size_g')
     spc  = panel.get('servings_per_container')
     dnw  = panel.get('declared_net_weight_g')
+
+    # A net-weight line that contradicts itself — "Net Wt. 1.20 oz (35g)", where
+    # 1.20 oz is actually 34.0g — is a free find: no fill weight needed, just the
+    # printed line disagreeing with its own math. Usually the oz figure is stale
+    # from a prior revision.
+    _oz_mismatch = panel.get('net_weight_oz_mismatch')
+    if _oz_mismatch:
+        _oz_val, _oz_as_g = _oz_mismatch
+        issues.append({'severity': 'warning', 'message': (
+            f'Net weight line is self-contradicting: printed as {_oz_val:g} oz ({dnw:g}g), but '
+            f'{_oz_val:g} oz is actually {_oz_as_g:g}g. One of the two printed figures is stale — '
+            'verify against the current fill weight before going to press.')})
     fill = fill_weight_g
     unit_count = panel.get('unit_count')
     cups = panel.get('serving_size_cups')
@@ -2127,11 +2209,16 @@ def _check_net_weight(panel: dict, fill_weight_g=None, fname: str = '',
                     f'({pct:.1f}% over). Overstating net contents is materially worse than '
                     'understating — it is a short-measure / misbranding exposure. Correct the '
                     'declared net weight to the actual fill.')})
-            else:
-                issues.append({'severity': 'critical', 'message': (
-                    f'Net weight understated — declared {_g(dnw)}g but bags fill at {_g(fill)}g '
-                    f'({pct:.1f}% under). Declared net weight must equal the actual fill.')})
-            statuses.append('CRITICAL')
+                statuses.append('CRITICAL')
+            elif pct >= _OVERFILL_REVIEW_PCT:
+                issues.append({'severity': 'review', 'message': (
+                    f'Overfill worth confirming — declared {_g(dnw)}g but the formula fills at '
+                    f'{_g(fill)}g ({pct:.1f}% more than declared). A container holding more than '
+                    'it declares is the safe direction and normal fill practice, so this is not a '
+                    'labeling defect. A gap this size is worth confirming is intended rather than '
+                    'a stale declared weight.')})
+                statuses.append('REVIEW')
+            # Under the threshold: ordinary overfill. Say nothing.
 
     # ── Check C — panel reconciles to fill (±5%, absorbs the rounding artifact)
     if verified and implied is not None and not _within(implied, fill):
@@ -2148,12 +2235,30 @@ def _check_net_weight(panel: dict, fill_weight_g=None, fname: str = '',
             ratio = implied / fill
             clean_factor = (any(abs(ratio - f) <= 0.12 for f in (2, 3, 4))
                             or any(abs(ratio - 1.0 / f) <= 0.05 for f in (2, 3, 4)))
+            _implied_pct = abs(implied - fill) / fill * 100
             if clean_factor and dnw is None:
                 issues.append({'severity': 'suspect', 'message': (
                     f'SUSPECT READ — serving × servings ({implied:g}g) is ~{ratio:.2g}× the real '
                     f'fill ({fill:g}g), a clean multiple that usually means a misread of the '
                     'serving-size or servings-per-container field rather than a true label error.')})
                 statuses.append('SUSPECT')
+            elif ratio < 1.0 and not clean_factor and _implied_pct < 15.0:
+                # Same asymmetry as Check A: serving × servings implying LESS than
+                # the real fill is the safe direction (the package holds more than
+                # the panel adds up to) — ordinary overfill, not a misread or a
+                # labeling defect, as long as the gap is modest. A large gap (a
+                # clean 2x/3x/4x factor, or the 40-60%/135-170% carryover shapes
+                # below) still means a misread and is handled separately.
+                if _implied_pct >= _OVERFILL_REVIEW_PCT:
+                    issues.append({'severity': 'review', 'message': (
+                        f'Overfill worth confirming — serving × servings ({ss:g} × {spc:g} = '
+                        f'{implied:g}g) implies less than the actual fill ({fill:g}g, '
+                        f'{_implied_pct:.1f}% more). A container holding more than the panel adds '
+                        'up to is the safe direction and normal fill practice, so this is not a '
+                        'labeling defect — worth confirming it is intended rather than a stale '
+                        'servings-per-container value.')})
+                    statuses.append('REVIEW')
+                # Under the threshold: ordinary overfill. Say nothing.
             else:
                 msg = (f'Panel does not reconcile to fill — serving × servings '
                        f'({ss:g} × {spc:g} = {implied:g}g) vs actual fill {fill:g}g.')
@@ -2201,7 +2306,7 @@ def _check_net_weight(panel: dict, fill_weight_g=None, fname: str = '',
     # reconciliation actually ran (implied computable). An empty statuses list with
     # nothing computed means "no check could run" — UNVERIFIED, never PASS. "Nothing
     # evaluated" must never read as "evaluated and fine."
-    _rank = {'CRITICAL': 4, 'SUSPECT': 3, 'UNVERIFIED': 2, 'PASS': 1}
+    _rank = {'CRITICAL': 4, 'SUSPECT': 3, 'UNVERIFIED': 2, 'REVIEW': 1.5, 'PASS': 1}
     if statuses:
         status = max(statuses, key=lambda s: _rank.get(s, 0))
     elif implied is not None and verified and not serving_vision_backed:
@@ -2357,6 +2462,15 @@ def _check_prep_block(text: str, panel: dict = None) -> dict:
     prep_uses_cups = bool(re.search(r'\bcups?\b', block))
     unit_vs_cup_batch = unit_declared and prep_uses_cups and not serving_cups
 
+    # A single-serve container has no batch/per-serving distinction — the whole
+    # container is one serving, so its directions carry no mix quantity and no
+    # yield. That is a complete answer, not a failed read.
+    _spc = panel.get('servings_per_container')
+    try:
+        _single_serve = _spc is not None and float(_spc) == 1
+    except (TypeError, ValueError):
+        _single_serve = False
+
     if yield_m or quantity_mismatch or unit_vs_cup_batch:
         classification = 'batch'
         if yield_m:
@@ -2380,6 +2494,17 @@ def _check_prep_block(text: str, panel: dict = None) -> dict:
             'Prep block is PER-SERVING — quantities scale with the NFP serving size, so a '
             'serving-size change DOES require updating these quantities (and the back-panel '
             'prep copy).')
+    elif _single_serve and mix_cups is None and not yield_m:
+        # The container IS the serving — a single-serve bottle's directions
+        # (e.g. "Add water or milk to dotted line") carry no mix quantity and
+        # no yield because there is nothing to measure. Neither BATCH nor
+        # PER-SERVING describes that; UNKNOWN would misreport a complete,
+        # correct answer as a failed read.
+        classification = 'single-serve'
+        notes.append(
+            'Prep block is SINGLE-SERVE — the container is one serving, so the directions '
+            'carry no mix quantity and no yield statement. Nothing in this block scales with '
+            'a serving-size change.')
     else:
         # Neither signal available — never default to a value that looks like a verdict.
         classification = 'UNKNOWN'
@@ -3793,23 +3918,59 @@ def _check_fda(ocr_text: str, fname: str, vision_allergens: dict = None) -> dict
     #     NOT ingredient allergens; FALCPA "Contains:" applies only to ingredients.
     # (Contains:/advisory *declaration* detection below still scans the full text.)
     # NB: avoid bare "blend" — it matches the ingredient "Digestive Enzyme Blend".
-    _alg_text = re.sub(
-        r'[^.\n]*\b(?:directions?|serving\s+suggestion|shake|stir|dissolve|'
-        r'scoop|mix(?:es|ed)?\s+\d|may\s+(?:also\s+)?contain|facility|'
-        r'shared\s+(?:equipment|lines?))\b[^.\n]*',
-        ' ', tl,
+    #
+    # The strip anchors PER-LINE (`[^.\n]*` stops at a newline), so a STEP-style
+    # single-serve-bottle direction block leaves milk exposed:
+    #   DIRECTIONS
+    #   STEP 1 Add water or milk to dotted line (7oz).
+    #   STEP 2 Shake well. Do not top off.
+    # "DIRECTIONS" sits on its own line and strips only that line; "milk" on the
+    # STEP 1 line survives, and on a beef/plant SKU with no Contains: statement
+    # (correctly — beef and plant carry no milk) that reads as an undeclared
+    # allergen. Extending the verb list to the STEP-copy vocabulary itself closes
+    # this without needing every possible line boundary.
+    _PREP_VERBS = (
+        r'directions?|serving\s+suggestion|shake|stir|dissolve|scoop|'
+        r'mix(?:es|ed)?\s+\d|step\s*\d|add\s+(?:water|milk)|dotted\s+line|'
+        r'top\s+off|enjoy\s+your|'
+        r'may\s+(?:also\s+)?contain|facility|shared\s+(?:equipment|lines?)'
     )
+    _alg_text = re.sub(r'[^.\n]*\b(?:' + _PREP_VERBS + r')\b[^.\n]*', ' ', tl)
 
-    # Per-allergen ingredient presence (directions text removed)
-    _milk_in_ocr      = bool(re.search(r'\bmilk\b|\bnon.fat\s+milk\b|\bmilk\s+powder\b|\bskim\s+milk\b|\bdairy\b|\bcasein\b|\bwhey\b|\blactose\b', _alg_text))
-    _peanut_in_ocr    = bool(re.search(r'\bpeanut\b', _alg_text))
-    _tree_nut_in_ocr  = bool(re.search(_TREE_NUTS + r'|\btree\s+nut\b|\bcoconut\b', _alg_text))
-    _soy_in_ocr       = bool(re.search(r'\bsoy(?:bean)?\b|\bsoy\s+lecithin\b', _alg_text))
-    _egg_in_ocr       = bool(re.search(r'\begg\b|\begg\s+white\b|\balbumin\b', _alg_text))
-    _fish_in_ocr      = bool(re.search(r'\bfish\b|\bsalmon\b|\btuna\b|\bpollock\b|\bcod\b|\btilapia\b', _alg_text))
-    _shellfish_in_ocr = bool(re.search(r'\bshrimp\b|\bcrab\b|\blobster\b|\bscallop\b|\bclam\b|\bshellfish\b', _alg_text))
-    _sesame_in_ocr    = bool(re.search(r'\bsesame\b|\btahini\b', _alg_text))
-    _wheat_in_ocr     = bool(re.search(r'\bwheat\b|\bgluten\b', _alg_text))
+    # Belt and braces. A phrase naming a liquid to reconstitute with is a
+    # preparation instruction, never an ingredient declaration — and on a beef or
+    # plant bottle it is the only occurrence of "milk" anywhere on the label.
+    _alg_text = re.sub(
+        r'\b(?:water\s+or\s+milk|milk\s+or\s+water|with\s+milk|in\s+milk|to\s+milk)\b',
+        ' ', _alg_text)
+
+    # "Lactase" is a fungal/microbial digestive enzyme, not a milk ingredient.
+    # Tesseract reads it as "lactose" often enough to matter, and "lactose" IS a
+    # milk term — so remove the enzyme (with or without its activity units, e.g.
+    # "Lactase 20 ALU") before the milk presence test runs.
+    _alg_text = re.sub(r'\blact(?:ase|ose)\s*\d*\s*alu\b', ' ', _alg_text)
+    _alg_text = re.sub(r'\blactase\b', ' ', _alg_text)
+
+    # Per-allergen ingredient presence (directions/advisory text removed). Each
+    # hit records the matched TEXT, not just a bool — the finding this feeds can
+    # then show its own evidence instead of asking the reader to take it on faith.
+    _ALLERGEN_HITS = {}
+
+    def _hit(name, pattern):
+        m = re.search(pattern, _alg_text)
+        if m:
+            _ALLERGEN_HITS[name] = m.group(0).strip()
+        return bool(m)
+
+    _milk_in_ocr      = _hit('milk', r'\bmilk\b|\bnon.fat\s+milk\b|\bmilk\s+powder\b|\bskim\s+milk\b|\bdairy\b|\bcasein\b|\bwhey\b|\blactose\b')
+    _peanut_in_ocr    = _hit('peanut', r'\bpeanut\b')
+    _tree_nut_in_ocr  = _hit('tree nut', _TREE_NUTS + r'|\btree\s+nut\b|\bcoconut\b')
+    _soy_in_ocr       = _hit('soy', r'\bsoy(?:bean)?\b|\bsoy\s+lecithin\b')
+    _egg_in_ocr       = _hit('egg', r'\begg\b|\begg\s+white\b|\balbumin\b')
+    _fish_in_ocr      = _hit('fish', r'\bfish\b|\bsalmon\b|\btuna\b|\bpollock\b|\bcod\b|\btilapia\b')
+    _shellfish_in_ocr = _hit('shellfish', r'\bshrimp\b|\bcrab\b|\blobster\b|\bscallop\b|\bclam\b|\bshellfish\b')
+    _sesame_in_ocr    = _hit('sesame', r'\bsesame\b|\btahini\b')
+    _wheat_in_ocr     = _hit('wheat', r'\bwheat\b|\bgluten\b')
 
     # Cross-validate Claude Vision's structured allergen read against the actual
     # ingredient text. Vision sometimes over-reports — it lists allergens from a
@@ -3922,13 +4083,22 @@ def _check_fda(ocr_text: str, fname: str, vision_allergens: dict = None) -> dict
     # (could be allergen-free product), so only flag advisory mismatches.
     if not sparse and not specific_allergen_flagged and not has_contains_stmt:
         if _any_allergen_in_ocr:
+            # Named-product checks above (Step 1) have a filename signal behind
+            # them and stay CRITICAL. This generic one does not — it is a regex
+            # match on label text with no way to distinguish a genuine
+            # undeclared ingredient from a false hit on prep copy or a
+            # non-allergen term, and it has produced 16 false criticals across
+            # two runs and zero true ones. Downgraded to REVIEW, and the
+            # message now names its own evidence so a false hit is obvious on
+            # sight instead of requiring a re-read of the whole label.
+            _ev = ', '.join(f'"{v}" ({k})' for k, v in sorted(_ALLERGEN_HITS.items()))
             issues.append({
-                'severity': 'critical',
+                'severity': 'review',
                 'message': (
-                    'Allergen ingredients detected in product text but no "Contains: [allergen]" '
-                    'declaration found. FALCPA requires an explicit "Contains:" statement '
-                    'whenever a major allergen is present. '
-                    'Verify the declaration is present and readable on the artwork.'
+                    f'Possible undeclared allergen — matched {_ev} in the label text, but no '
+                    '"Contains:" declaration was found. This check cannot tell an undeclared '
+                    'ingredient from a false match on prep copy or a non-allergen term, so '
+                    'confirm against the printed ingredient statement before acting.'
                 ),
             })
         elif has_advisory:
