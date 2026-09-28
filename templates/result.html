@@ -390,7 +390,7 @@
    plus UNVERIFIED/UNKNOWN for net weight / prep block) must never render like
    a clean pass — but a CRITICAL diff always wins the visual over "not yet
    approved," since a known-wrong panel is the stronger signal. #}
-{% set not_verified = status in ('UNVERIFIED','UNKNOWN','PANEL_MISSING','PANEL_NOT_APPROVED','PANEL_SUPERSEDED') and not crits and not warns %}
+{% set not_verified = status in ('UNVERIFIED','UNKNOWN','PANEL_MISSING','PANEL_NOT_APPROVED','PANEL_SUPERSEDED','PANEL_UNAVAILABLE') and not crits and not warns %}
 
 <div class="card mb-2 check-card
   {% if crits %}border-danger check-has-issues check-has-critical{% if warns %} check-has-warning{% endif %}
@@ -408,6 +408,7 @@
     {% elif warns %}<span class="badge bg-warning text-dark">{{ warns|length }} warnings</span>
     {% elif status == 'PANEL_NOT_APPROVED' %}<span class="badge bg-dark">BLOCKS PRINT — not approved</span>
     {% elif status == 'PANEL_MISSING' %}<span class="badge bg-secondary">NOT VERIFIED — no approved panel</span>
+    {% elif status == 'PANEL_UNAVAILABLE' %}<span class="badge bg-secondary">NOT VERIFIED — ReadyDoc unavailable</span>
     {% elif status == 'PANEL_SUPERSEDED' %}<span class="badge bg-secondary">RE-PROOF — panel superseded</span>
     {% elif status == 'VERIFIED' %}<span class="badge bg-success">Verified{% if check.get('panel_version') is not none %} v{{ check.get('panel_version') }}{% endif %}</span>
     {% elif not_verified %}<span class="badge bg-secondary">NOT VERIFIED</span>
@@ -1033,7 +1034,7 @@ function noteRows(notes) {
 // block when their own inputs were incomplete. None of these say the artwork
 // is wrong — only that nothing has confirmed it yet.
 const NOT_VERIFIED_STATUSES = ['UNVERIFIED', 'UNKNOWN', 'PANEL_MISSING',
-                               'PANEL_NOT_APPROVED', 'PANEL_SUPERSEDED'];
+                               'PANEL_NOT_APPROVED', 'PANEL_SUPERSEDED', 'PANEL_UNAVAILABLE'];
 
 function checkCard(num, title, icon, check, uid, filename, checkKey, alwaysOpen) {
   check = check || {};
@@ -1064,6 +1065,7 @@ function checkCard(num, title, icon, check, uid, filename, checkKey, alwaysOpen)
   else if (warns.length)       badge = `<span class="badge bg-warning text-dark">${warns.length} warnings</span>`;
   else if (status === 'PANEL_NOT_APPROVED') badge = `<span class="badge bg-dark">BLOCKS PRINT — not approved</span>`;
   else if (status === 'PANEL_MISSING')      badge = `<span class="badge bg-secondary">NOT VERIFIED — no approved panel</span>`;
+  else if (status === 'PANEL_UNAVAILABLE')  badge = `<span class="badge bg-secondary">NOT VERIFIED — ReadyDoc unavailable</span>`;
   else if (status === 'PANEL_SUPERSEDED')   badge = `<span class="badge bg-secondary">RE-PROOF — panel superseded</span>`;
   else if (status === 'VERIFIED')           badge = `<span class="badge bg-success">Verified${pvTxt}</span>`;
   else if (notVerified)                     badge = `<span class="badge bg-secondary">NOT VERIFIED</span>`;

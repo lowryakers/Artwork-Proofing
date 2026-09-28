@@ -51,36 +51,39 @@ def _run():
             return _FakeResp(json.dumps({'sku': 'PSP-NEA', 'version': 3, 'status': 'approved',
                                          'panel': {'calories': 120}, 'front_callouts': {}}).encode())
         rd.urllib.request.urlopen = _urlopen_approved
-        p = rd.fetch_approved_panel(gtin='850079939479')
-        check('approved panel: returns the dict as-is', p and p['status'] == 'approved' and p['version'] == 3)
+        p, reason = rd.fetch_approved_panel(gtin='850079939479')
+        check('approved panel: returns the dict as-is',
+              p and p['status'] == 'approved' and p['version'] == 3 and reason == 'ok')
 
         def _urlopen_draft(req, timeout=None):
             return _FakeResp(json.dumps({'version': 2, 'status': 'draft', 'panel': {}}).encode())
         rd.urllib.request.urlopen = _urlopen_draft
-        p = rd.fetch_approved_panel(sku='PSP-NEA')
+        p, reason = rd.fetch_approved_panel(sku='PSP-NEA')
         check('draft panel: still returned (a real record, not missing)',
-              p and p['status'] == 'draft')
+              p and p['status'] == 'draft' and reason == 'ok')
 
         def _urlopen_404(req, timeout=None):
             raise urllib.error.HTTPError(req.full_url, 404, 'Not Found', hdrs=None, fp=io.BytesIO(b''))
         rd.urllib.request.urlopen = _urlopen_404
-        p = rd.fetch_approved_panel(gtin='000')
-        check('404 (no panel record at all) -> None', p is None)
+        p, reason = rd.fetch_approved_panel(gtin='000')
+        check('404 (no panel record at all) -> (None, "not_found")', p is None and reason == 'not_found')
 
         def _urlopen_500(req, timeout=None):
             raise urllib.error.HTTPError(req.full_url, 500, 'Server Error', hdrs=None, fp=io.BytesIO(b'boom'))
         rd.urllib.request.urlopen = _urlopen_500
-        p = rd.fetch_approved_panel(gtin='000')
-        check('500 -> None (degrades, does not raise)', p is None)
+        p, reason = rd.fetch_approved_panel(gtin='000')
+        check('500 -> (None, "server_error") (degrades, does not raise)',
+              p is None and reason == 'server_error')
 
         def _urlopen_raises(req, timeout=None):
             raise ConnectionError('outage')
         rd.urllib.request.urlopen = _urlopen_raises
-        p = rd.fetch_approved_panel(gtin='000')
-        check('network outage -> None (does not raise)', p is None)
+        p, reason = rd.fetch_approved_panel(gtin='000')
+        check('network outage -> (None, "network") (does not raise)', p is None and reason == 'network')
 
-        check('disabled (no gtin/sku) -> None without a network call',
-              rd.fetch_approved_panel() is None)
+        p, reason = rd.fetch_approved_panel()
+        check('disabled (no gtin/sku) -> (None, "disabled") without a network call',
+              p is None and reason == 'disabled')
 
         # ── fetch_prior_panel_version ──────────────────────────────────────────
         def _urlopen_prior(req, timeout=None):
