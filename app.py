@@ -3,6 +3,7 @@ import io
 import json
 import re
 import time
+import urllib.parse
 import urllib.request
 import openpyxl
 from datetime import datetime
@@ -97,39 +98,116 @@ def _save_gtin_store(rows: list, source_filename: str) -> dict:
     return store
 
 
-# ── Google Sheets sync ───────────────────────────────────────────────────────
+# ── Master-list source (env-authoritative — no Google Sheet fallback) ─────────
+#
+# There is exactly one correct source for master SKU data: GTIN_SHEET_URL,
+# pointed at ReadyDoc's master.csv. A cached runtime file (written by the UI,
+# or by a successful sync) used to be allowed to WIN over that env var — so
+# changing GTIN_SHEET_URL in Railway silently did nothing until a redeploy
+# wiped the file, with no log line saying so. Same failure shape as the
+# READYDOC_TOKEN 401: a configuration change that appears to work and doesn't.
 
-_DEFAULT_CFG_PATH = os.path.join(BASE_DIR, 'gtin_default_config.json')
+MASTER_ALLOW_EXTERNAL = os.environ.get('MASTER_ALLOW_EXTERNAL', 'false').strip().lower() in ('1', 'true', 'yes')
+
+
+def _redact_token(url: str) -> str:
+    """A url safe to print — any ?token=/&token= value replaced with ***."""
+    return re.sub(r'([?&]token=)[^&]*', r'\1***', url or '')
+
+
+def _url_host(url: str) -> str:
+    try:
+        return (urllib.parse.urlparse(url).hostname or '').lower()
+    except Exception:
+        return ''
+
+
+def _is_readydoc_host(url: str) -> bool:
+    """True when `url` is on the same host as READYDOC_URL. If READYDOC_URL
+    itself isn't configured there is no host to allow against, so nothing
+    passes — an unverifiable URL is refused, not accepted on faith."""
+    readydoc_host = _url_host(os.environ.get('READYDOC_URL', ''))
+    return bool(readydoc_host) and _url_host(url) == readydoc_host
+
 
 def _load_sheet_config() -> dict:
-    # 1. Runtime config file (set via UI, wiped on redeploy)
+    """Resolve the master-list URL. Returns {'sheet_url': ...} on success,
+    {'rejected_url': ..., 'reject_reason': ...} when a configured URL fails
+    the ReadyDoc-host check, or {} when nothing is configured at all.
+    """
+    # 1. Environment is authoritative. A deploy-time config change must take
+    #    effect immediately; a cached runtime file must never override it.
+    env_url = os.environ.get('GTIN_SHEET_URL', '').strip()
+    if env_url:
+        if not MASTER_ALLOW_EXTERNAL and not _is_readydoc_host(env_url):
+            return {'rejected_url': env_url, 'reject_reason': (
+                f'GTIN_SHEET_URL ({_url_host(env_url) or "unparseable host"}) is not on the '
+                'ReadyDoc host and MASTER_ALLOW_EXTERNAL is not set.')}
+        cfg = {'sheet_url': env_url}
+        # Carry forward sync metadata from the runtime file, never the URL.
+        try:
+            if os.path.exists(GTIN_SHEET_CFG_PATH):
+                with open(GTIN_SHEET_CFG_PATH) as f:
+                    old = json.load(f)
+                for k in ('last_synced', 'row_count'):
+                    if k in old:
+                        cfg[k] = old[k]
+        except Exception:
+            pass
+        return cfg
+    # 2. Runtime file (set via the UI) only when no environment value exists.
     if os.path.exists(GTIN_SHEET_CFG_PATH):
         try:
             with open(GTIN_SHEET_CFG_PATH) as f:
                 cfg = json.load(f)
-                if cfg.get('sheet_url'):
-                    return cfg
+            if cfg.get('sheet_url'):
+                if not MASTER_ALLOW_EXTERNAL and not _is_readydoc_host(cfg['sheet_url']):
+                    return {'rejected_url': cfg['sheet_url'], 'reject_reason': (
+                        f'The saved sheet URL ({_url_host(cfg["sheet_url"]) or "unparseable host"}) is '
+                        'not on the ReadyDoc host and MASTER_ALLOW_EXTERNAL is not set.')}
+                return cfg
         except Exception:
             pass
-    # 2. Environment variable
-    env_url = os.environ.get('GTIN_SHEET_URL', '').strip()
-    if env_url:
-        return {'sheet_url': env_url}
-    # 3. Default config baked into the image (survives redeploys)
-    if os.path.exists(_DEFAULT_CFG_PATH):
-        try:
-            with open(_DEFAULT_CFG_PATH) as f:
-                cfg = json.load(f)
-                if cfg.get('sheet_url'):
-                    return cfg
-        except Exception:
-            pass
+    # 3. No baked default any more.
     return {}
 
 
 def _save_sheet_config(cfg: dict):
+    """Persist ONLY sync metadata (last_synced, row_count) into the runtime
+    file, merged into whatever is already there. The URL is configuration,
+    not state — persisting it is what created the stale-override trap."""
+    existing = {}
+    try:
+        if os.path.exists(GTIN_SHEET_CFG_PATH):
+            with open(GTIN_SHEET_CFG_PATH) as f:
+                existing = json.load(f)
+    except Exception:
+        pass
+    for k in ('last_synced', 'row_count'):
+        if k in cfg:
+            existing[k] = cfg[k]
     with open(GTIN_SHEET_CFG_PATH, 'w') as f:
-        json.dump(cfg, f)
+        json.dump(existing, f)
+
+
+def _log_master_source_once(gtin_rows: list) -> None:
+    """One line per run stating exactly which master-list source was used —
+    env, runtime file, rejected, or none — token redacted. Answers 'which
+    feed am I actually reading' in a second instead of an afternoon."""
+    cfg = _load_sheet_config()
+    if cfg.get('rejected_url'):
+        print(f'[master] source=rejected url={_redact_token(cfg["rejected_url"])} '
+             f'reason="{cfg.get("reject_reason", "")}"')
+        return
+    url = cfg.get('sheet_url', '')
+    if not url:
+        print('[master] source=none (GTIN_SHEET_URL unset, no runtime config on file)')
+        return
+    env_url = os.environ.get('GTIN_SHEET_URL', '').strip()
+    source = 'env' if env_url and url == env_url else 'runtime_file'
+    print(f'[master] source={source}  url={_redact_token(url)}  rows={len(gtin_rows)}')
+
+
 
 
 def _sheet_url_to_csv(url: str) -> str:
@@ -299,9 +377,14 @@ def _fetch_sheet_rows(csv_url: str) -> list:
 
 
 def _get_sheet_gtin_rows(force: bool = False) -> list:
-    """Return GTIN rows from the synced Google Sheet, with a 5-minute in-memory cache."""
+    """Return GTIN rows from the synced master list, with a 5-minute in-memory
+    cache. A rejected (non-ReadyDoc) URL surfaces as an error, same as a fetch
+    failure — never silently returns [] as if nothing were configured."""
     global _sheet_cache
     cfg = _load_sheet_config()
+    if cfg.get('rejected_url'):
+        _sheet_cache['last_error'] = cfg.get('reject_reason', 'master URL rejected')
+        return []
     url = cfg.get('sheet_url', '')
     if not url:
         return []
@@ -330,15 +413,21 @@ def _master_feed_status(gtin_rows: list, from_upload: bool = False) -> dict:
     against, with no visible cause. This makes that state loud."""
     cfg = _load_sheet_config()
     has_url = bool(cfg.get('sheet_url'))
+    rejected = cfg.get('rejected_url')
     err = _sheet_cache.get('last_error')
     n = len(gtin_rows or [])
     source = ('uploaded GTIN file' if from_upload
               else 'synced master list' if has_url else 'none')
 
-    if not from_upload and not has_url:
+    if rejected and not from_upload:
+        level = 'rejected'
+        _reason = cfg.get('reject_reason') or 'the configured URL is not on the ReadyDoc host'
+        msg = (f'Master list REJECTED — {_reason} '
+               '0 rows loaded. Every GTIN, spec and fill-weight check was skipped.')
+    elif not from_upload and not has_url:
         level = 'none'
-        msg = ('No master SKU list configured — GTIN, spec, and net-weight checks have '
-               'nothing to match against. Connect the master list on the SKU Master page.')
+        msg = ('Master list NOT CONFIGURED — GTIN_SHEET_URL is unset on this service. '
+               '0 rows loaded. Every GTIN, spec and fill-weight check was skipped.')
     elif err and n == 0:
         level = 'error'
         msg = (f'Master list UNAVAILABLE ({err}) — proofed against 0 SKU rows. GTIN, spec, '
@@ -450,6 +539,8 @@ def upload():
 
     job_id  = proof_engine.create_job([f.filename for f in artwork_files if f.filename],
                                       brand_config=prodough_config)
+    if not _used_upload:
+        _log_master_source_once(gtin_rows)
     proof_engine._update_job(job_id, master_feed=_master_feed_status(gtin_rows, _used_upload))
     job_dir = os.path.join(UPLOAD_DIR, job_id)
     os.makedirs(job_dir, exist_ok=True)
@@ -651,26 +742,26 @@ def api_result(job_id):
 
 @app.route('/api/gtin-sheet', methods=['POST'])
 def api_gtin_sheet_save():
-    data = request.get_json() or {}
-    url = data.get('url', '').strip()
-    if url:
-        try:
-            _sheet_url_to_csv(url)  # validate it's a Sheets URL
-        except ValueError as e:
-            return jsonify({'ok': False, 'error': str(e)}), 400
-    cfg = _load_sheet_config()
-    cfg['sheet_url'] = url
-    cfg.pop('last_synced', None)
-    cfg.pop('row_count', None)
-    _save_sheet_config(cfg)
-    global _sheet_cache
-    _sheet_cache = {'rows': None, 'fetched_at': 0.0, 'url': ''}
-    return jsonify({'ok': True})
+    # GTIN_SHEET_URL is now the sole, authoritative source (see _load_sheet_config).
+    # This route can no longer set the master-list URL -- persisting a URL here
+    # is exactly the stale-override trap this precedence change eliminates. Saying
+    # {'ok': True} while quietly doing nothing would be the same silent-failure
+    # shape as the bug being fixed, so it refuses instead.
+    if os.environ.get('GTIN_SHEET_URL', '').strip():
+        return jsonify({'ok': False, 'error': (
+            'GTIN_SHEET_URL is set in the environment and is now the only source for '
+            'the master list. Change it in Railway instead; this UI can no longer '
+            'override it.')}), 400
+    return jsonify({'ok': False, 'error': (
+        'Setting the master-list URL from this UI is no longer supported. Set '
+        'GTIN_SHEET_URL in the environment instead.')}), 400
 
 
 @app.route('/api/gtin-sheet/sync', methods=['POST'])
 def api_gtin_sheet_sync():
     cfg = _load_sheet_config()
+    if cfg.get('rejected_url'):
+        return jsonify({'ok': False, 'error': cfg.get('reject_reason', 'master URL rejected')}), 400
     if not cfg.get('sheet_url'):
         return jsonify({'ok': False, 'error': 'No sheet URL configured'}), 400
     try:
