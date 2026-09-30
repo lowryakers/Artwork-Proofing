@@ -59,7 +59,7 @@ _UPLOAD_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'uploads'
 # none of them says the artwork is wrong, only that nothing outside the artwork
 # has confirmed it yet, which must never read as "checked and fine" either.
 _NOT_VERIFIED_STATUSES = ('UNVERIFIED', 'UNKNOWN', 'PANEL_MISSING', 'PANEL_NOT_APPROVED',
-                          'PANEL_SUPERSEDED')
+                          'PANEL_SUPERSEDED', 'PANEL_UNAVAILABLE')
 
 # ── In-memory job store ───────────────────────────────────────────────────────
 
@@ -252,6 +252,14 @@ _BATCH_WORKERS = 4
 def _process_job(job_id: str, pdf_paths: list, gtin_rows: list, work_dir: str,
                  brand_config: dict = None, spec_rows: list = None):
     _update_job(job_id, status='running')
+    # Log the panel-lookup endpoint (or "not configured") once for the whole
+    # run, token redacted — a GTIN/SKU key mismatch or a wrong base URL is
+    # otherwise invisible in the per-SKU noise.
+    try:
+        import readydoc
+        readydoc.log_panel_endpoint_once()
+    except Exception:
+        pass
     total = len(pdf_paths)
     results = [None] * total          # order-safe: fill by index, never append
     _done = {'n': 0}
@@ -1269,7 +1277,7 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
     # same as fill weight above.
     _gtin_lookup = barcode_gtins[0] if (barcode_gtins and len(set(barcode_gtins)) == 1) else None
     _sku_lookup = matched_spec.get('sku') if matched_spec else None
-    _approved_panel = _fetch_approved_panel(_gtin_lookup, _sku_lookup)
+    _approved_panel, _panel_fetch_reason = _fetch_approved_panel(_gtin_lookup, _sku_lookup)
     _prior_panel_version = _fetch_prior_panel_version(_gtin_lookup, _sku_lookup)
 
     ocr_claude = ''
@@ -1445,7 +1453,7 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
     _panel_check = _check_approved_panel(
         _artwork_panel_values, _front_artwork_values, _snapshot.get('ingredients_raw'),
         (vision_allergens or {}).get('contains_statement'),
-        _approved_panel, prior_panel_version=_prior_panel_version)
+        _approved_panel, prior_panel_version=_prior_panel_version, fetch_reason=_panel_fetch_reason)
 
     # Locked die template (bottle shrink sleeve, …): registered once and reused
     # for every flavor on that die, so a proof never re-measures. Selected by the
@@ -1582,6 +1590,12 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
         # no approved panel exists) — recorded so a later run can detect
         # PANEL_SUPERSEDED once the panel is revised.
         'panel_version': _panel_check.get('panel_version'),
+        # Why the approved-panel lookup came back empty, when it did — 'ok'
+        # means it succeeded (a status of PANEL_MISSING/PANEL_UNAVAILABLE is
+        # then read off checks['panel']['status'] itself). Aggregated job-wide
+        # in _build_summary so a run of uniform 401s reports as one
+        # configuration-failure line, not 38 "missing panel" lines.
+        'panel_fetch_reason': _panel_fetch_reason,
         'ocr_preview': ('[' + _vision_diag + ']\n\n' + combined_text)[:3000] if _vision_diag else combined_text[:3000],
         'ocr_text': combined_text,
         'checks': checks,
@@ -3043,7 +3057,8 @@ def _diff_text_statement(label: str, artwork_raw, approved_raw, version) -> list
 
 
 def _check_approved_panel(artwork_panel: dict, front_artwork: dict, ingredients_raw: str,
-                          allergen_contains, approved, prior_panel_version=None) -> dict:
+                          allergen_contains, approved, prior_panel_version=None,
+                          fetch_reason: str = 'not_found') -> dict:
     """Compare the artwork against the APPROVED nutrition panel of record in
     ReadyDoc (Products -> Nutrition panels). Once a panel is approved, this diff
     IS the nutrition source of truth; the front-vs-NFP self-consistency check
@@ -3055,8 +3070,16 @@ def _check_approved_panel(artwork_panel: dict, front_artwork: dict, ingredients_
     coerced to 0 or the threshold number.
 
     Status (never CLEAN unless VERIFIED):
-      PANEL_MISSING      — no panel record in ReadyDoc for this product. No
-                           diff runs — there is nothing to diff against.
+      PANEL_MISSING      — a genuine 404: no panel record in ReadyDoc for this
+                           product. No diff runs — there is nothing to diff
+                           against. Points at whoever files panels (Matt).
+      PANEL_UNAVAILABLE  — the lookup itself failed (integration disabled, the
+                           token was rejected, a ReadyDoc server error, or a
+                           network failure) — NOT evidence the panel doesn't
+                           exist. Points at ops, not the panel owner: run
+                           cd4a2150 reported PANEL_MISSING on all 38 SKUs when
+                           every lookup was actually a 401 (token rejected),
+                           costing an hour of looking at the wrong thing.
       PANEL_NOT_APPROVED — a panel exists but is still a draft. The full diff
                            still runs against it (draft data is real, checkable
                            data — just not yet authoritative enough to release
@@ -3071,9 +3094,27 @@ def _check_approved_panel(artwork_panel: dict, front_artwork: dict, ingredients_
                            that permits release.
     """
     if approved is None:
-        return {'status': 'PANEL_MISSING', 'issues': [], 'panel_version': None, 'notes': [
-            'PANEL MISSING — no approved nutrition panel found in ReadyDoc for this product. '
-            'Nutrition cannot be verified against a source of truth outside the artwork.']}
+        if fetch_reason == 'not_found':
+            return {'status': 'PANEL_MISSING', 'issues': [], 'panel_version': None, 'notes': [
+                'PANEL MISSING — no approved nutrition panel found in ReadyDoc for this product. '
+                'Nutrition cannot be verified against a source of truth outside the artwork. '
+                'File the panel in ReadyDoc (Products → Nutrition panels).']}
+        # disabled / unauthorized / server_error / network: the lookup itself
+        # failed. This is not evidence the panel is missing — it means nothing
+        # was learned either way — so it gets its own status and points at ops.
+        _reason_msg = {
+            'disabled': 'the ReadyDoc panel integration is not configured on this service '
+                        '(READYDOC_URL / READYDOC_TOKEN unset)',
+            'unauthorized': 'ReadyDoc rejected the request (401/403 — token rejected). '
+                            'READYDOC_TOKEN on this service is likely stale or does not match '
+                            'PRODUCT_MASTER_TOKEN on ReadyDoc',
+            'server_error': 'ReadyDoc returned a server error',
+            'network': 'the request to ReadyDoc failed (network/timeout)',
+        }.get(fetch_reason, 'the panel lookup did not complete')
+        return {'status': 'PANEL_UNAVAILABLE', 'issues': [], 'panel_version': None, 'notes': [
+            f'PANEL UNAVAILABLE — {_reason_msg}. This is a configuration or connectivity '
+            'problem, not missing panel data — nutrition cannot be verified until the '
+            'integration is fixed. This is an ops fix, not a panel-filing one.']}
 
     version = approved.get('version')
     is_approved = str(approved.get('status', '')).strip().lower() == 'approved'
@@ -3188,16 +3229,19 @@ def _fetch_prior_snapshot(gtin=None, sku=None) -> dict:
 
 def _fetch_approved_panel(gtin=None, sku=None):
     """The nutrition panel of record from ReadyDoc's Products -> Nutrition
-    panels tab, or None (no record / not approved yet is distinguished by the
-    caller from the returned dict's own 'status' field, not by this wrapper).
-    Never raises — an outage or a disabled integration degrades to PANEL_MISSING
-    in _check_approved_panel, same fail-soft contract as every other ReadyDoc call."""
+    panels tab. Returns (data, reason) — see readydoc.fetch_approved_panel for
+    the reason codes ('ok'/'disabled'/'not_found'/'unauthorized'/
+    'server_error'/'network'); _check_approved_panel uses the reason to tell a
+    genuinely unfiled panel (PANEL_MISSING) apart from a configuration or
+    connectivity failure (PANEL_UNAVAILABLE). Never raises — an import failure
+    here degrades to ('network'-flavored) unavailability, same fail-soft
+    contract as every other ReadyDoc call."""
     try:
         import readydoc
         return readydoc.fetch_approved_panel(gtin, sku)
     except Exception as _e:
         print(f'[readydoc] approved-panel fetch skipped: {_e}')
-        return None
+        return None, 'network'
 
 
 def _fetch_prior_panel_version(gtin=None, sku=None):
@@ -3322,10 +3366,66 @@ def _check_instruction_steps(text: str) -> list:
     return issues
 
 
+# Ingredients that indicate a genuine flavor identity — as opposed to the
+# generic "Natural Flavors" / "Organic & Natural Flavors" phrasing every
+# flavor on a shared-base line legitimately carries. Finding one of these in a
+# SKU whose own flavor name does not suggest it is the actual signal a
+# duplicate-statement match exists to surface — not the duplication itself,
+# which is the EXPECTED case on a flavor line built from one base.
+_NAMED_FLAVOR_INGREDIENTS = {
+    'cocoa powder':  {'chocolate', 'cocoa', 'neapolitan', 'mocha', 'fudge', 'brownie', 'oreo'},
+    'cocoa':         {'chocolate', 'cocoa', 'neapolitan', 'mocha', 'fudge', 'brownie', 'oreo'},
+    'cinnamon':      {'cinnamon', 'snickerdoodle', 'churro', 'pumpkin', 'apple', 'horchata'},
+    'peanut butter': {'peanut'},
+    'almond butter': {'almond'},
+    'cashew butter': {'cashew'},
+    'strawberry':    {'strawberry', 'neapolitan'},
+    'banana':        {'banana', 'monkey'},
+    'blueberry':     {'blueberry'},
+    'pumpkin':       {'pumpkin'},
+    'maple':         {'maple'},
+    'vanilla bean':  {'vanilla'},
+    'coconut':       {'coconut'},
+    'coffee':        {'coffee', 'mocha', 'latte', 'cafe', 'espresso'},
+    'espresso':      {'coffee', 'mocha', 'latte', 'cafe', 'espresso'},
+}
+
+
+def _sku_flavor_name(fname: str) -> str:
+    """A rough flavor-name string derived from the filename, for matching
+    against _NAMED_FLAVOR_INGREDIENTS — lowercased, extension and common
+    brand/format prefixes stripped, separators turned to spaces."""
+    base = re.sub(r'\.[a-z0-9]+$', '', (fname or '').lower())
+    base = re.sub(r'^(pd|prodough|why|plt|bef)[-_]*(btl|stk|bottle|stick)?[-_]*', '', base)
+    return re.sub(r'[-_]+', ' ', base).strip()
+
+
+def _named_flavor_mismatches(ingredients: list, flavor_name: str) -> list:
+    """Named flavor-defining ingredients present in `ingredients` that
+    `flavor_name` does not suggest. Order-preserving, de-duplicated."""
+    out = []
+    for ing in ingredients:
+        for phrase, keywords in _NAMED_FLAVOR_INGREDIENTS.items():
+            if phrase in ing and not any(kw in flavor_name for kw in keywords) and ing not in out:
+                out.append(ing)
+                break
+    return out
+
+
 def _flag_duplicate_ingredients(results: list) -> None:
-    """Check 7.4 — two distinct SKUs in the same batch with identical (or nearly
-    identical) ingredient statements. Usually a copy-paste in whatever generated
-    the panel. Appends a warning to each involved file's 'ingredients' check."""
+    """Check 7.4 — two distinct SKUs in the same batch with identical (or
+    nearly identical) ingredient statements.
+
+    On a flavor line built from one base where the flavor comes entirely from
+    "Natural Flavors", identical statements are the EXPECTED case, not the
+    exception — flagging every one as a WARNING produced 13 findings on one
+    run, 12 of them the normal state of the product line. The actual signal is
+    a NAMED flavor-defining ingredient (cocoa powder, ground cinnamon, a fruit
+    powder, a nut butter) present in a SKU whose own flavor name does not
+    suggest it — that stays a WARNING and names the ingredient. A shared
+    statement whose only difference from a sibling is flavor-descriptor
+    wording or ingredient order, with no such named-ingredient anomaly,
+    downgrades to INFO."""
     entries = []
     for res in results or []:
         snap = res.get('snapshot') or {}
@@ -3341,18 +3441,49 @@ def _flag_duplicate_ingredients(results: list) -> None:
             sa, sb = set(a), set(b)
             overlap = len(sa & sb) / max(1, len(sa | sb))
             # Identical sets, or same items in a different order → flag.
-            if overlap >= 0.92:
-                same_order = a == b
-                detail = ('identical' if same_order else
-                          'identical apart from ingredient order')
-                for res, other in ((res_a, res_b), (res_b, res_a)):
-                    chk = res.setdefault('checks', {}).setdefault(
-                        'ingredients', {'issues': [], 'notes': []})
-                    chk.setdefault('issues', []).append({'severity': 'warning', 'message': (
-                        f'Ingredient statement is {detail} to {other.get("filename")}. Two '
-                        'distinct SKUs with the same ingredient list is usually a copy-paste in '
-                        'whatever generated the panel — confirm each flavor\'s statement is correct.')})
-                    _recount_result(res)
+            if overlap < 0.92:
+                continue
+            same_order = a == b
+            detail = ('identical' if same_order else
+                      'identical apart from ingredient order')
+
+            # The named-flavor check runs on what each SKU actually carries —
+            # the question is whether THIS SKU's own flavor name explains
+            # what's in ITS panel, not just what the two share.
+            flavor_a = _sku_flavor_name(res_a.get('filename', ''))
+            flavor_b = _sku_flavor_name(res_b.get('filename', ''))
+            mismatch_a = _named_flavor_mismatches(a, flavor_a)
+            mismatch_b = _named_flavor_mismatches(b, flavor_b)
+
+            for res, other, flavor_self, mismatches_self, mismatches_other in (
+                (res_a, res_b, flavor_a, mismatch_a, mismatch_b),
+                (res_b, res_a, flavor_b, mismatch_b, mismatch_a),
+            ):
+                chk = res.setdefault('checks', {}).setdefault(
+                    'ingredients', {'issues': [], 'notes': []})
+                if mismatches_self:
+                    for ing in mismatches_self:
+                        if ing not in mismatches_other:
+                            # The sibling's flavor DOES explain this
+                            # ingredient — the strongest form of the signal:
+                            # this is probably where it belongs, and this
+                            # SKU's statement was probably copied from there.
+                            tail = (f'{ing.title()} is expected in a flavor like '
+                                    f'{other.get("filename")}; confirm it belongs in this '
+                                    f'{flavor_self or "flavor"}.')
+                        else:
+                            tail = (f'{ing.title()} is not obviously expected in either '
+                                    'flavor — confirm the ingredient statement.')
+                        chk.setdefault('issues', []).append({'severity': 'warning', 'message': (
+                            f'{res.get("filename")} and {other.get("filename")} carry {detail} '
+                            f'ingredient statements, both including {ing.title()}. {tail}')})
+                else:
+                    chk.setdefault('issues', []).append({'severity': 'info', 'message': (
+                        f'Ingredient statement is {detail} to {other.get("filename")}. Expected '
+                        'on a flavor line built from one base where the difference is entirely '
+                        'in "Natural Flavors" — no action needed unless the base itself should '
+                        'differ.')})
+                _recount_result(res)
 
 
 # ── Check: Ingredient statement drift between revisions ───────────────────────
@@ -5490,6 +5621,59 @@ def _build_summary(results: list) -> dict:
     else:
         panel_verification_line = ''
 
+    # Run-level panel-feed health: every fetch attempt this run, regardless of
+    # whether the result made it into checks['panel'] for this brand mode. A
+    # uniform failure across every SKU is the signature of a configuration
+    # problem (a rejected token, a wrong URL) — not of dozens of missing panel
+    # records — and the report should say so rather than leaving the reader to
+    # infer it (run cd4a2150: 38 SKUs, 38 HTTP 401s, reported as PANEL_MISSING
+    # on all of them; an hour went into checking whether the panels were filed
+    # before anyone looked at the token). Modeled on app.py's
+    # _master_feed_status for the same reason: a broken feed must never
+    # masquerade as "nothing filed."
+    _reasons = [r.get('panel_fetch_reason') for r in results
+               if not r.get('error') and r.get('panel_fetch_reason')]
+    _reason_counts = {}
+    for _r in _reasons:
+        _reason_counts[_r] = _reason_counts.get(_r, 0) + 1
+    _n_lookups = len(_reasons)
+    _n_disabled = _reason_counts.get('disabled', 0)
+
+    if _n_lookups == 0:
+        panel_feed_status = {'ok': True, 'level': 'none', 'message': ''}
+    elif _n_disabled == _n_lookups:
+        panel_feed_status = {'ok': False, 'level': 'disabled', 'message': (
+            'ReadyDoc panel integration NOT CONFIGURED — READYDOC_URL / READYDOC_TOKEN unset '
+            'on this service. 0 lookups attempted.')}
+    else:
+        _attempted = _n_lookups - _n_disabled
+        _reason_label = {
+            'not_found': '404 — no panel records found for these GTINs',
+            'unauthorized': 'HTTP 401 (token rejected)',
+            'server_error': 'a server error',
+            'network': 'a network/timeout failure',
+        }
+        # The one non-'ok'/'disabled' reason, if it accounts for every attempt
+        # — that uniformity is what marks this a configuration problem rather
+        # than a mix of genuinely different outcomes across SKUs.
+        _non_ok = {k: v for k, v in _reason_counts.items() if k not in ('ok', 'disabled')}
+        if _non_ok and sum(_non_ok.values()) == _attempted and len(_non_ok) == 1:
+            _reason, _count = next(iter(_non_ok.items()))
+            _label = _reason_label.get(_reason, _reason)
+            _is_config = _reason in ('unauthorized', 'server_error', 'network')
+            _tail = (' This is a configuration problem, not missing panel data — check '
+                    'READYDOC_TOKEN on this service.' if _is_config else '')
+            panel_feed_status = {
+                'ok': _reason == 'not_found', 'level': _reason,
+                'message': (f'ReadyDoc panel integration: {_attempted} lookups attempted, '
+                           f'{_count} returned {_label}.{_tail}'),
+            }
+        else:
+            _n_ok = _reason_counts.get('ok', 0)
+            panel_feed_status = {'ok': True, 'level': 'mixed', 'message': (
+                f'ReadyDoc panel integration: {_attempted} lookups attempted, '
+                f'{_n_ok} returned a panel record.')}
+
     return {
         'total_files': total,
         'severity_counts': counts,
@@ -5502,6 +5686,7 @@ def _build_summary(results: list) -> dict:
         'panel_verified_count': panel_verified_count,
         'panel_not_verified_count': panel_not_verified_count,
         'panel_verification_line': panel_verification_line,
+        'panel_feed_status': panel_feed_status,
         'errored_count': errored_count,
         'checked_count': checked_count,
         'errored_files': [{'file': r.get('filename', ''), 'error': str(r.get('error', ''))}

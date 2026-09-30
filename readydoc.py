@@ -52,11 +52,13 @@ _SEVERITY = {'critical': 'fail', 'warning': 'warn', 'suspect': 'warn', 'review':
 
 # Check-block statuses that mean "not evaluated" — must file as warn, never
 # pass, even when the block carries no graded issues. PANEL_MISSING/
-# PANEL_NOT_APPROVED/PANEL_SUPERSEDED are the approved-nutrition-panel gate:
-# none of them says the artwork is wrong, only that nothing outside the artwork
-# has confirmed it yet — that must never read as a pass either.
+# PANEL_NOT_APPROVED/PANEL_SUPERSEDED/PANEL_UNAVAILABLE are the
+# approved-nutrition-panel gate: none of them says the artwork is wrong, only
+# that nothing outside the artwork has confirmed it yet — that must never
+# read as a pass either.
 _UNVERIFIED_STATUSES = {'UNVERIFIED', 'UNKNOWN', 'SUSPECT',
-                        'PANEL_MISSING', 'PANEL_NOT_APPROVED', 'PANEL_SUPERSEDED'}
+                        'PANEL_MISSING', 'PANEL_NOT_APPROVED', 'PANEL_SUPERSEDED',
+                        'PANEL_UNAVAILABLE'}
 
 
 def enabled() -> bool:
@@ -173,17 +175,44 @@ def fetch_prior_snapshot(gtin=None, sku=None) -> dict:
     return None
 
 
+def log_panel_endpoint_once() -> None:
+    """Print the endpoint this run will call for approved panels, once, token
+    redacted. A GTIN/SKU key mismatch or a wrong base URL is otherwise
+    invisible — nothing about a fetch that returns 'not_found' distinguishes
+    a genuinely unfiled panel from a request that never reached the right
+    route at all. Call once per run (job-level), not once per SKU."""
+    if not enabled():
+        print('[readydoc] panel integration: NOT CONFIGURED (READYDOC_URL / READYDOC_TOKEN unset)')
+        return
+    base = os.environ['READYDOC_URL'].rstrip('/')
+    print(f'[readydoc] panel integration: GET {base}/api/products/nutrition-panel?gtin=...&sku=...&token=***')
+
+
 def fetch_approved_panel(gtin=None, sku=None):
     """The nutrition panel of record for a product, from ReadyDoc's
-    Products -> Nutrition panels tab, or None. Never raises — a ReadyDoc
-    outage, a 500, or a 404 (no panel record filed yet) all degrade to "no
-    panel to check against" (proof_engine reports that as PANEL_MISSING).
+    Products -> Nutrition panels tab.
+
+    Returns (data, reason) — data is the panel dict on success, else None.
+    reason is one of:
+      'ok'            panel record returned (draft or approved)
+      'disabled'      READYDOC_URL / READYDOC_TOKEN not set
+      'not_found'     HTTP 404 — no panel record filed for this product
+      'unauthorized'  HTTP 401/403 — the token was rejected
+      'server_error'  HTTP 5xx (or any other unexpected HTTP status)
+      'network'       timeout, DNS, connection reset, or any other failure
+    Never raises — same fail-soft contract regardless of reason.
+
+    These five used to collapse to the same bare None (PANEL_MISSING: "no
+    approved nutrition panel found"), even though only 'not_found' actually
+    means that. A rejected token is a configuration failure, not missing
+    data — run cd4a2150 reported PANEL_MISSING on all 38 SKUs because every
+    lookup got a 401, and an hour went into checking whether the panels were
+    filed before anyone looked at the token.
 
     A 404 is distinct from a 200 with status:"draft" — a draft panel is a
     real record that HAS NOT been approved (PANEL_NOT_APPROVED), while a 404
     means no record exists at all (PANEL_MISSING). Both return values are
-    handled by the caller; this function only tells them apart by returning
-    the dict (draft or approved) or None (404 / outage / disabled).
+    handled by the caller; this function only tells them apart via `reason`.
 
     Endpoint: GET /api/products/nutrition-panel?gtin=&sku=, returning
     {"sku":, "gtin":, "version":, "status": "draft"|"approved", "panel": {...},
@@ -191,17 +220,28 @@ def fetch_approved_panel(gtin=None, sku=None):
     route in the ReadyDoc session) for the exact contract.
     """
     if not enabled() or (not gtin and not sku):
-        return None
+        return None, 'disabled'
     try:
         data = _get('/api/products/nutrition-panel', {'gtin': gtin, 'sku': sku})
     except urllib.error.HTTPError as exc:
-        if exc.code != 404:
-            print(f'[readydoc] nutrition-panel fetch: HTTP {exc.code}')
-        return None
+        if exc.code == 404:
+            # Debug-level: this is the expected, unremarkable shape of "no
+            # panel filed yet" — logged so it stays distinguishable from a
+            # 401/route-not-deployed, never surfaced as a problem on its own.
+            print(f'[readydoc] nutrition-panel: 404 (no record) gtin={gtin} sku={sku}')
+            return None, 'not_found'
+        if exc.code in (401, 403):
+            print(f'[readydoc] nutrition-panel fetch: HTTP {exc.code} — token rejected')
+            return None, 'unauthorized'
+        print(f'[readydoc] nutrition-panel fetch: HTTP {exc.code}')
+        return None, 'server_error'
     except Exception as exc:
         print(f'[readydoc] nutrition-panel fetch: {exc}')
-        return None
-    return data if isinstance(data, dict) and data else None
+        return None, 'network'
+    if isinstance(data, dict) and data:
+        return data, 'ok'
+    # A 200 with an empty/non-dict body is functionally "nothing filed."
+    return None, 'not_found'
 
 
 def fetch_prior_panel_version(gtin=None, sku=None):

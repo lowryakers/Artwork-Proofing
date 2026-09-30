@@ -926,16 +926,40 @@ def _generate_report(job: dict, brand_name: str = 'ProDough') -> io.BytesIO:
         cpl.alignment = Alignment(wrap_text=True, vertical='center')
         if (job.get('summary') or {}).get('panel_not_verified_count'):
             cpl.font = Font(bold=True, color='9C4200')
-    # Master-feed health banner — a broken/empty SKU feed must be loud, not silent.
+    # ReadyDoc panel-FEED status: what actually happened on the lookups
+    # themselves (succeeded / not configured / 404 / rejected / down), as
+    # distinct from panel_verification_line above (which SKUs verified). A
+    # genuinely broken feed gets the loud banner below instead — shown here
+    # only for the quieter cases (worked fine, no panel records filed) so the
+    # same sentence doesn't appear twice.
+    _pfeed_summary = (job.get('summary') or {}).get('panel_feed_status') or {}
+    _pfeed_line = _pfeed_summary.get('message')
+    if _pfeed_line and _pfeed_summary.get('ok'):
+        cpf = ws1.cell(row=2, column=6, value=_pfeed_line)
+        cpf.alignment = Alignment(wrap_text=True, vertical='center')
+    # Master-feed + ReadyDoc panel-feed health banner — a broken/empty SKU feed,
+    # or a uniform panel-lookup failure (a rejected token, a down service), must
+    # be loud, not silent. Stacked in the same banner row when both apply.
     _mf = job.get('master_feed')
-    if _mf and not _mf.get('ok'):
+    _pfeed = (job.get('summary') or {}).get('panel_feed_status') or {}
+    _mf_bad = bool(_mf and not _mf.get('ok'))
+    _pfeed_bad = bool(_pfeed and not _pfeed.get('ok') and _pfeed.get('message'))
+    if _mf_bad or _pfeed_bad:
         ws1.merge_cells('A3:E3')
-        c = ws1.cell(row=3, column=1, value='⚠  MASTER LIST — ' + _mf.get('message', ''))
+        _lines = []
+        if _mf_bad:
+            _lines.append('⚠  MASTER LIST — ' + _mf.get('message', ''))
+        if _pfeed_bad:
+            _lines.append('⚠  ' + _pfeed.get('message', ''))
+        c = ws1.cell(row=3, column=1, value='\n'.join(_lines))
         c.font = Font(bold=True, color='FFFFFF')
+        _level = (_mf or {}).get('level') if _mf_bad else _pfeed.get('level')
         c.fill = PatternFill('solid',
-                             fgColor='C0392B' if _mf.get('level') in ('error', 'none') else 'B8860B')
+                             fgColor='C0392B' if _level in ('error', 'none', 'unauthorized',
+                                                            'server_error', 'network', 'disabled')
+                             else 'B8860B')
         c.alignment = Alignment(wrap_text=True, vertical='center')
-        ws1.row_dimensions[3].height = 30
+        ws1.row_dimensions[3].height = 30 * len(_lines)
     else:
         ws1.append([])
     for col, hdr in enumerate(['File', 'Overall Status', 'Critical', 'Warnings', 'Notes'], 1):
@@ -954,7 +978,7 @@ def _generate_report(job: dict, brand_name: str = 'ProDough') -> io.BytesIO:
                 ws1.cell(row=ws1.max_row, column=col).fill = f
 
     ws1.column_dimensions['A'].width = 45
-    for col in ['B', 'C', 'D', 'E']:
+    for col in ['B', 'C', 'D', 'E', 'F']:
         ws1.column_dimensions[col].width = 14
 
     # ── Errored files — their own section, never grey info rows ────────────────
@@ -1055,6 +1079,7 @@ def _generate_report(job: dict, brand_name: str = 'ProDough') -> io.BytesIO:
     if panel_rows:
         wsp = wb.create_sheet('Approved Nutrition Panel', 1)
         p_missing = sum(1 for _, p in panel_rows if p.get('status') == 'PANEL_MISSING')
+        p_unavail = sum(1 for _, p in panel_rows if p.get('status') == 'PANEL_UNAVAILABLE')
         p_draft   = sum(1 for _, p in panel_rows if p.get('status') == 'PANEL_NOT_APPROVED')
         p_crit    = sum(1 for _, p in panel_rows if p.get('status') == 'CRITICAL')
         p_super   = sum(1 for _, p in panel_rows if p.get('status') == 'PANEL_SUPERSEDED')
@@ -1067,6 +1092,9 @@ def _generate_report(job: dict, brand_name: str = 'ProDough') -> io.BytesIO:
             _pparts.append(f'{p_crit} SKU(s) DIFFER from the approved panel')
         if p_missing:
             _pparts.append(f'{p_missing} have NO approved panel on file — NOT VERIFIED')
+        if p_unavail:
+            _pparts.append(f'{p_unavail} could not be looked up (ReadyDoc unavailable — '
+                           'a config/connectivity problem, not missing data)')
         if p_draft:
             _pparts.append(f'{p_draft} panel(s) still a DRAFT — blocks print release')
         if p_super:
@@ -1090,7 +1118,8 @@ def _generate_report(job: dict, brand_name: str = 'ProDough') -> io.BytesIO:
                 c.alignment = wrap if col in (4, 5) else center
             st = p.get('status')
             fillc = (fill_crit if st == 'CRITICAL'
-                    else fill_warn if st in ('PANEL_MISSING', 'PANEL_NOT_APPROVED', 'PANEL_SUPERSEDED')
+                    else fill_warn if st in ('PANEL_MISSING', 'PANEL_NOT_APPROVED',
+                                             'PANEL_SUPERSEDED', 'PANEL_UNAVAILABLE')
                     else fill_ok if st == 'VERIFIED' else None)
             if fillc:
                 for col in range(1, 6):
