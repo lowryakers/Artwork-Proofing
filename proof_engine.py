@@ -1467,7 +1467,7 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
         brand_name = brand_config.get('brand_name', '')
         checks = {
             'gtin':     _check_gtin(combined_text, fname, gtin_rows, barcode_gtins),
-            'netwt':    _check_net_weight(_panel, fill_weight_g=_fill_weight, fname=fname, serving_vision_backed=_netwt_vision_backed),
+            'netwt':    _check_net_weight(_panel, fill_weight_g=_fill_weight, fname=fname, serving_vision_backed=_netwt_vision_backed, prior_snapshot=_prior_snapshot),
             'eyemark':  _check_eyemark(img, is_film, fname, required_eyemark, vision_eyemark=vision_eyemark),
             'spelling': _check_spelling_generic(label_text, brand_name),
             'fda':      _check_fda_light(label_text, fname),
@@ -1484,7 +1484,7 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
         checks = {
             'gtin':     _check_gtin(combined_text, fname, gtin_rows, barcode_gtins),
             'panel':    _panel_check,
-            'netwt':    _check_net_weight(_panel, fill_weight_g=_fill_weight, fname=fname, serving_vision_backed=_netwt_vision_backed),
+            'netwt':    _check_net_weight(_panel, fill_weight_g=_fill_weight, fname=fname, serving_vision_backed=_netwt_vision_backed, prior_snapshot=_prior_snapshot),
             'nfp':      _check_nfp(label_text, front_text=_nfp_front_text, vision_nutrition=vision_nutrition),
             'eyemark':  _check_eyemark(img, is_film, fname, required_eyemark, vision_eyemark=vision_eyemark),
             'spelling': _check_spelling(label_text, fname),
@@ -1499,11 +1499,24 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
             if effective_wind:
                 checks['wind'] = _check_wind_direction(combined_text, effective_wind)
 
-    # Front-callout traceability (net carbs, Check D) and superseded-NFP (Fix 7a)
-    # attach to the front-vs-NFP check card when present.
+    # Front-callout traceability (net carbs, Check D), superseded-NFP (Fix 7a),
+    # and whole-label protein claims (Check I) attach to the front-vs-NFP check
+    # card when present.
     if 'nfp' in checks and isinstance(checks['nfp'], dict):
+        # NFP protein reference for the whole-label protein-claims scan — same
+        # reliability order as everywhere else (isolated crop > vision panel >
+        # a single regex-detected NFP value), so it never rests on a weaker
+        # read than the number it's checking against.
+        _nfp_protein_ref = nfp_read.get('protein_g')
+        if _nfp_protein_ref is None:
+            _nfp_protein_ref = (vision_nutrition or {}).get('nfp', {}).get('protein_g')
+        if _nfp_protein_ref is None:
+            _regex_nfp_proteins = checks['nfp'].get('nfp_data', {}).get('proteins') or []
+            if len(_regex_nfp_proteins) == 1:
+                _nfp_protein_ref = _regex_nfp_proteins[0]
         extra = (_check_net_carbs(label_text, _panel.get('serving_size_g'), nfp_read)
-                 + _check_superseded_nfp(_panel, matched_spec))
+                 + _check_superseded_nfp(_panel, matched_spec)
+                 + _check_protein_claims(label_text, _nfp_protein_ref))
         if extra:
             checks['nfp'].setdefault('issues', []).extend(extra)
 
@@ -2133,12 +2146,16 @@ _OVERFILL_REVIEW_PCT = 5.0   # below this, an overfill is ordinary practice, not
 
 
 def _check_net_weight(panel: dict, fill_weight_g=None, fname: str = '',
-                      serving_vision_backed: bool = True) -> dict:
+                      serving_vision_backed: bool = True, prior_snapshot: dict = None) -> dict:
     """Reconcile the nutrition panel against net weight and real fill weight.
 
     panel: serving_size_g, serving_size_desc, servings_per_container,
            declared_net_weight_g, unit_count, serving_size_cups (any may be None).
     fill_weight_g: actual fill per the production formula (external truth) or None.
+    prior_snapshot: the last proofed version's label snapshot for this SKU, if
+           any (serving_size_g / servings_per_container) — lets a reconciliation
+           failure name WHICH field moved without its partner, instead of just
+           reporting that the arithmetic doesn't work.
 
     Returns the usual {issues, notes, ...} plus structured fields the report and
     UI card render. Status is PASS / FAIL / UNVERIFIED.
@@ -2262,7 +2279,25 @@ def _check_net_weight(panel: dict, fill_weight_g=None, fname: str = '',
             else:
                 msg = (f'Panel does not reconcile to fill — serving × servings '
                        f'({ss:g} × {spc:g} = {implied:g}g) vs actual fill {fill:g}g.')
-                if 0.40 <= ratio <= 0.60:
+                # Name the actual cause when it's visible: the serving size
+                # moved from the last proofed version of this SKU but the
+                # servings-per-container didn't follow it (or vice versa) —
+                # "does not reconcile" is the symptom; this is the diagnosis.
+                _prior_ss = (prior_snapshot or {}).get('serving_size_g')
+                _prior_spc = (prior_snapshot or {}).get('servings_per_container')
+                if (_prior_ss is not None and _prior_spc is not None
+                        and ss is not None and spc is not None
+                        and abs(_prior_ss - ss) > 0.01 and abs(_prior_spc - spc) <= 0.01):
+                    msg += (f' Serving size changed {_prior_ss:g}g → {ss:g}g since the last proof, '
+                            f'but servings per container is unchanged at {spc:g}. One of the two '
+                            'did not follow the other.')
+                elif (_prior_ss is not None and _prior_spc is not None
+                      and ss is not None and spc is not None
+                      and abs(_prior_spc - spc) > 0.01 and abs(_prior_ss - ss) <= 0.01):
+                    msg += (f' Servings per container changed {_prior_spc:g} → {spc:g} since the '
+                            f'last proof, but serving size is unchanged at {ss:g}g. One of the two '
+                            'did not follow the other.')
+                elif 0.40 <= ratio <= 0.60:
                     msg += (f' Serving weight looks understated ~{round(fill / implied, 1):g}× — '
                             'EVERY per-serving value on the panel is understated by that factor.')
                 elif 1.35 <= ratio <= 1.70:
@@ -2703,6 +2738,83 @@ def _check_net_carbs(text: str, serving_g=None, nfp_vals: dict = None) -> list:
         f'{recomputed:g}g (total carb {total_carb:g} − fiber {fiber:g} − sugar alcohol '
         f'{sugar_alc:g}). Recompute the derived front claim from this panel — it appears to '
         'quote a prior revision.')})
+    return issues
+
+
+# A protein value's nearby text describing reconstitution ("replace water
+# with...", "add an egg", "with milk", "as prepared") states a PREPARED food's
+# protein content, not the food in the package — FDA nutrition labeling is for
+# the food as packaged, and a protein-options strip ("20G Just Add Water /
+# 24G Replace water with milk / 30G Replace water with milk & add an egg") is
+# not a labeling error, it's a serving-suggestion menu. Only the unqualified
+# (or explicitly as-packaged: "just add water", "per serving", "as packaged")
+# figure is a real declaration of the food in the box.
+_AS_PREPARED_RE = re.compile(
+    r'replace\s+water\s+with|add\s+an?\s+egg|with\s+milk|as\s+prepared', re.I)
+_PROTEIN_ANCHOR_RE = re.compile(r'\bprotein\b', re.I)
+_PROTEIN_VALUE_RE = re.compile(r'(\d{1,3})\s*[Gg]\b\s*([^/\n]{0,80})')
+
+
+def _extract_protein_value_chain(text: str) -> list:
+    """Parse a slash/newline-chained "<N>G <description>" list starting at the
+    front of `text` (e.g. "20G Just Add Water / 24G Replace water with milk /
+    30G Replace water with milk & add an egg"). Stops at the first segment
+    that doesn't fit the shape, so it can never run on into unrelated later
+    text — no length cap needed, the shape itself bounds it. Returns
+    [(value, description), ...]."""
+    out = []
+    pos = 0
+    while True:
+        m = _PROTEIN_VALUE_RE.match(text, pos)
+        if not m:
+            break
+        out.append((int(m.group(1)), m.group(2).strip(' /')))
+        pos = m.end()
+        sep = re.match(r'\s*/\s*', text[pos:pos + 5])
+        if not sep:
+            break
+        pos += sep.end()
+    return out
+
+
+def _check_protein_claims(text: str, nfp_protein_g) -> list:
+    """Check I — scan the WHOLE label (not just the front callout badge, which
+    _check_nfp already verifies against the NFP and is left untouched here)
+    for every stated protein value. A back-panel "protein options" strip
+    listing reconstituted values is common on single-serve bottles and is not
+    itself a defect; only an unqualified (or as-packaged) value that
+    disagrees with the NFP is — and FDA labeling holds it to exact agreement,
+    the same standard the front badge is already held to."""
+    issues = []
+    if nfp_protein_g is None:
+        return issues
+    tl = text or ''
+    seen = set()
+    for anchor in _PROTEIN_ANCHOR_RE.finditer(tl):
+        # The value list must start close after the anchor (room for a short
+        # header word like "OPTIONS" or a colon) — not an unrelated later
+        # number that merely happens to follow a "protein" mention somewhere
+        # earlier in the ingredients or elsewhere on the label.
+        head = tl[anchor.end(): anchor.end() + 40]
+        first = _PROTEIN_VALUE_RE.search(head)
+        if not first or first.start() > 25:
+            continue
+        chain_start = anchor.end() + first.start()
+        for val, desc in _extract_protein_value_chain(tl[chain_start:]):
+            if not (0 < val < 100):
+                continue
+            key = (chain_start, val, desc)
+            if key in seen:
+                continue
+            seen.add(key)
+            if _AS_PREPARED_RE.search(desc):
+                continue  # describes a prepared food, not the food in the package
+            if val == nfp_protein_g:
+                continue  # agrees with the NFP — nothing to report
+            issues.append({'severity': 'critical', 'message': (
+                f'Protein value {val}G on the label ("{desc[:60]}") does not match the NFP '
+                f'protein of {nfp_protein_g:g}g. A protein value with no as-prepared qualifier '
+                '(or stated as-packaged) must equal the Nutrition Facts panel exactly.')})
     return issues
 
 
