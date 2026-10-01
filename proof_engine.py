@@ -703,7 +703,12 @@ def _claude_vision_ocr(img_path: str) -> dict:
             'nfp = the values inside the Nutrition Facts / Supplement Facts panel — read these '
             'digits CAREFULLY from the highest-resolution slice (e.g. "Calories 130", '
             '"Protein 26g", "Added Sugars 0g"). Front and NFP protein can legitimately differ '
-            'by 1g — report exactly what each panel prints, do not assume they match.\n'
+            'by 1g — report exactly what each panel prints, do not assume they match. IGNORE any '
+            'separate "protein options" / reconstituted-serving strip near the panel (e.g. '
+            '"19G as packaged / 23G replace water with milk / 29G replace water with milk and add '
+            'an egg") — that is a serving-suggestion menu, NOT part of the Nutrition Facts table, '
+            'even when printed directly above, below, or beside it. nfp.protein_g must come only '
+            'from the panel\'s own "Protein" row.\n'
             'allergens.contains_statement = the FALCPA "Contains:" line exactly as printed '
             '(whey IS milk — if you see whey, milk is an allergen). '
             'allergens.detected = list ONLY the FALCPA major allergens that are present as '
@@ -889,7 +894,12 @@ _NFP_CROP_FIELDS = (
 _NFP_CROP_PROMPT = (
     'This image is a crop of ONE Nutrition Facts (or Supplement Facts) panel and nothing '
     'else. It may be MIRROR-REVERSED or rotated (these are film/pouch back panels printed '
-    'through clear film); read it correctly oriented. Return ONLY this JSON object:\n'
+    'through clear film); read it correctly oriented. If the crop also caught part of an '
+    'adjacent "protein options" / reconstituted-serving strip (multiple gram values paired '
+    'with preparation text like "replace water with milk" or "add an egg") — IGNORE that '
+    'strip entirely; it is not the Nutrition Facts panel, even if it shares the crop. Read '
+    'protein_g, and every other field, only from the bordered Nutrition/Supplement Facts '
+    'table itself. Return ONLY this JSON object:\n'
     '{"serving_size_g": <grams in the Serving size line, e.g. 98 from "3/4 Cup (98g)", or '
     'null>, "serving_size_desc": "<unit portion, e.g. \\"3/4 Cup\\", \\"4 Cupcakes\\", or '
     'null>", "serving_size_cups": <cup quantity as a decimal if given in cups, else null>, '
@@ -1412,6 +1422,23 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
                 _nfp_vals[_ck] = nfp_read[_ck]
         vision_nutrition['nfp'] = _nfp_vals
 
+    # A protein-options strip ("19G as packaged / 23G replace water with milk /
+    # 29G ... add an egg") sits close to the NFP on the back panel, and its
+    # as-prepared values can be picked up as the panel's own protein read (job
+    # c2beb887). Correct it here, once, regardless of which read produced it —
+    # before it reaches any check. Every downstream consumer (front-vs-NFP,
+    # approved-panel diff, the protein-claims scan, cross-SKU collision) reads
+    # this same value.
+    if vision_nutrition and (vision_nutrition.get('nfp') or {}).get('protein_g') is not None:
+        _protein_g = vision_nutrition['nfp']['protein_g']
+        _corrected_protein, _protein_note = _correct_protein_from_strip(_protein_g, label_text)
+        if _protein_note:
+            print(f'[nfp] {_protein_note}')
+            vision_nutrition = dict(vision_nutrition, nfp=dict(vision_nutrition['nfp'],
+                                                                protein_g=_corrected_protein))
+            if nfp_read.get('protein_g') is not None:
+                nfp_read = dict(nfp_read, protein_g=_corrected_protein)
+
     # Was the serving/servings that a net-weight verdict rests on actually read by
     # VISION (the isolated crop, the vision panel, or vision's transcription that
     # label_text uses) — or only by Tesseract? A fill-weight PASS must never rest on
@@ -1531,6 +1558,11 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
     # Inject spec GTIN so the UI can show detected-vs-spec comparison
     if matched_spec:
         checks['gtin']['spec_gtin'] = str(matched_spec.get('gtin', '')).strip()
+
+    # A SUSPECT READ anywhere on this file means its extraction is doubted —
+    # a confident CRITICAL from a different value-comparison check on the same
+    # file inherits that doubt (job c2beb887). Must run before severity/counts.
+    _downgrade_criticals_on_suspect_file(checks)
 
     all_issues = [i for c in checks.values() if isinstance(c, dict) for i in c.get('issues', [])]
     crit    = [i for i in all_issues if i.get('severity') == 'critical']
@@ -2770,12 +2802,17 @@ _PROTEIN_VALUE_RE = re.compile(r'(\d{1,3})\s*[Gg]\b\s*([^/\n]{0,80})')
 
 
 def _extract_protein_value_chain(text: str) -> list:
-    """Parse a slash/newline-chained "<N>G <description>" list starting at the
-    front of `text` (e.g. "20G Just Add Water / 24G Replace water with milk /
-    30G Replace water with milk & add an egg"). Stops at the first segment
-    that doesn't fit the shape, so it can never run on into unrelated later
-    text — no length cap needed, the shape itself bounds it. Returns
-    [(value, description), ...]."""
+    """Parse a slash- or newline-chained "<N>G <description>" list starting at
+    the front of `text` — e.g. "20G Just Add Water / 24G Replace water with
+    milk / 30G Replace water with milk & add an egg" (slash-separated), or:
+        19G  as packaged
+        23G  Replace water with milk
+        29G  Replace water with milk & add an egg
+    (newline-separated — job c2beb887's actual layout; the slash-only
+    separator used to stop the chain after the first line, so only the first
+    value was ever checked). Stops at the first segment that doesn't fit the
+    shape, so it can never run on into unrelated later text — no length cap
+    needed, the shape itself bounds it. Returns [(value, description), ...]."""
     out = []
     pos = 0
     while True:
@@ -2784,11 +2821,61 @@ def _extract_protein_value_chain(text: str) -> list:
             break
         out.append((int(m.group(1)), m.group(2).strip(' /')))
         pos = m.end()
-        sep = re.match(r'\s*/\s*', text[pos:pos + 5])
+        sep = re.match(r'\s*(?:/|\n)\s*', text[pos:pos + 12])
         if not sep:
             break
         pos += sep.end()
     return out
+
+
+def _detect_protein_strip(text: str):
+    """Find a 'protein options' strip — a chain of two or more "<N>G
+    <description>" values where at least one carries an as-prepared qualifier
+    (the reconstituted-serving menu) and at least one does not (the
+    as-packaged figure). Returns {'as_packaged': <value>, 'as_prepared':
+    [<values>]} or None if no such strip is present. Shares the exact anchor
+    and chain logic _check_protein_claims uses, so 'is there a strip here'
+    and 'what does the strip say' can never disagree."""
+    tl = text or ''
+    for anchor in _PROTEIN_ANCHOR_RE.finditer(tl):
+        head = tl[anchor.end(): anchor.end() + 40]
+        first = _PROTEIN_VALUE_RE.search(head)
+        if not first or first.start() > 25:
+            continue
+        chain_start = anchor.end() + first.start()
+        chain = _extract_protein_value_chain(tl[chain_start:])
+        if len(chain) < 2:
+            continue
+        prepared = [v for v, d in chain if _AS_PREPARED_RE.search(d)]
+        unqualified = [v for v, d in chain if not _AS_PREPARED_RE.search(d)]
+        if prepared and unqualified:
+            return {'as_packaged': unqualified[0], 'as_prepared': prepared}
+    return None
+
+
+def _correct_protein_from_strip(nfp_protein_g, label_text: str):
+    """Job c2beb887: the panel read NFP protein as 29g — the strip's "replace
+    water with milk & add an egg" (as-prepared) figure — when the panel's own
+    Protein line, and the strip's own as-packaged figure, both actually read
+    19g. The protein-options strip sits close to the Nutrition Facts panel on
+    the back, and its values can be picked up as panel values.
+
+    If a read NFP protein value exactly matches one of a detected strip's
+    AS-PREPARED values rather than its as-packaged figure, the read almost
+    certainly grabbed the strip instead of the panel. Returns (corrected
+    value, note) — note is None when nothing looks wrong, so the caller only
+    logs when it actually changed something."""
+    if nfp_protein_g is None:
+        return nfp_protein_g, None
+    strip = _detect_protein_strip(label_text)
+    if not strip:
+        return nfp_protein_g, None
+    if nfp_protein_g in strip['as_prepared'] and nfp_protein_g != strip['as_packaged']:
+        note = (f'NFP protein read as {nfp_protein_g:g}g matches the as-prepared protein-options '
+                f'strip, not the panel itself — corrected to the as-packaged figure '
+                f'{strip["as_packaged"]:g}g.')
+        return strip['as_packaged'], note
+    return nfp_protein_g, None
 
 
 def _check_protein_claims(text: str, nfp_protein_g) -> list:
@@ -3255,10 +3342,54 @@ def _fetch_prior_panel_version(gtin=None, sku=None):
         return None
 
 
+# Checks whose CRITICAL findings are built by comparing extracted numeric
+# values against each other or against a reference — the same channel a
+# SUSPECT READ in _check_net_weight is doubting. A spelling, eyemark, or
+# allergen-text finding doesn't share that failure mode, so it's left alone.
+_VALUE_COMPARISON_CHECKS = {'netwt', 'nfp', 'panel'}
+_SUSPECT_FIELD_LABEL = {'netwt': 'serving size', 'nfp': 'an NFP value', 'panel': 'a panel value'}
+
+
+def _downgrade_criticals_on_suspect_file(checks: dict) -> None:
+    """Job c2beb887: the same file carried a correctly-hedged SUSPECT READ on
+    serving size (a 3/4-cup misread implying 2x the real density) alongside
+    three confident CRITICALs built from a different misread on the same
+    file, with no hedging at all. A tool that is uncertain about one number on
+    a page and certain about another number on the same page is telling the
+    reader something it does not know.
+
+    If ANY check on this file flagged a SUSPECT READ, every CRITICAL from a
+    value-comparison check is downgraded to SUSPECT in place, so a single
+    doubted extraction can never coexist with confident criticals built on the
+    same unreliable read."""
+    if not isinstance(checks, dict):
+        return
+    suspect_source = None
+    for key, c in checks.items():
+        if isinstance(c, dict) and any(i.get('severity') == 'suspect' for i in c.get('issues', [])):
+            suspect_source = key
+            break
+    if suspect_source is None:
+        return
+    field_label = _SUSPECT_FIELD_LABEL.get(suspect_source, 'a value')
+    for key, c in checks.items():
+        if key not in _VALUE_COMPARISON_CHECKS or not isinstance(c, dict):
+            continue
+        for issue in c.get('issues', []):
+            if issue.get('severity') != 'critical':
+                continue
+            issue['severity'] = 'suspect'
+            issue['message'] = (
+                f'SUSPECT — downgraded from CRITICAL because another value read from this file '
+                f'({field_label}) was flagged as a suspect read. Re-check the extraction before '
+                f'treating this as a label error. Original finding: {issue["message"]}')
+
+
 def _recount_result(res: dict) -> None:
     """Recompute a result's severity and issue counts from its checks — used after
     a cross-file pass appends issues post-hoc."""
     checks = res.get('checks') or {}
+    _downgrade_criticals_on_suspect_file(checks)
     all_issues = [i for c in checks.values() if isinstance(c, dict) for i in c.get('issues', [])]
     crit    = [i for i in all_issues if i.get('severity') == 'critical']
     warns   = [i for i in all_issues if i.get('severity') == 'warning']

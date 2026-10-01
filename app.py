@@ -109,6 +109,14 @@ def _save_gtin_store(rows: list, source_filename: str) -> dict:
 
 MASTER_ALLOW_EXTERNAL = os.environ.get('MASTER_ALLOW_EXTERNAL', 'false').strip().lower() in ('1', 'true', 'yes')
 
+# The known ReadyDoc host, used only when READYDOC_URL isn't set. Run c2beb887
+# rejected GTIN_SHEET_URL=app.powder-ops.com/... outright because READYDOC_URL
+# wasn't configured on that service — "no host to verify against" refused the
+# one host that should always be accepted. A hardcoded guess would be worse
+# (silently wrong the day ReadyDoc moves), so this is a narrow, named fallback,
+# not a replacement for setting READYDOC_URL.
+_READYDOC_HOST_FALLBACK = 'app.powder-ops.com'
+
 
 def _redact_token(url: str) -> str:
     """A url safe to print — any ?token=/&token= value replaced with ***."""
@@ -122,12 +130,18 @@ def _url_host(url: str) -> str:
         return ''
 
 
+def _allowed_master_host() -> str:
+    """The host a master-list URL must be on. Derived from READYDOC_URL so the
+    allowlist is never a hardcoded guess; falls back to the known ReadyDoc host
+    only when READYDOC_URL itself isn't set, so that omission doesn't block the
+    one URL that should always be accepted."""
+    return _url_host(os.environ.get('READYDOC_URL', '')) or _READYDOC_HOST_FALLBACK
+
+
 def _is_readydoc_host(url: str) -> bool:
-    """True when `url` is on the same host as READYDOC_URL. If READYDOC_URL
-    itself isn't configured there is no host to allow against, so nothing
-    passes — an unverifiable URL is refused, not accepted on faith."""
-    readydoc_host = _url_host(os.environ.get('READYDOC_URL', ''))
-    return bool(readydoc_host) and _url_host(url) == readydoc_host
+    """True when `url` is on the allowed master-list host (see
+    _allowed_master_host)."""
+    return _url_host(url) == _allowed_master_host()
 
 
 def _load_sheet_config() -> dict:
@@ -190,11 +204,25 @@ def _save_sheet_config(cfg: dict):
         json.dump(existing, f)
 
 
+def _log_host_check_once(candidate_url: str) -> None:
+    """Log the master-URL host-allowlist comparison once per run, so 'why is
+    the master list empty' is a two-second answer instead of a guess (run
+    c2beb887: the guard was silently refusing the correct host)."""
+    cand_host = _url_host(candidate_url)
+    allowed_host = _allowed_master_host()
+    verdict = 'allowed' if cand_host == allowed_host else 'rejected'
+    print(f'[master] host check: GTIN_SHEET_URL host={cand_host}')
+    print(f'         READYDOC_URL host={allowed_host}  -> {verdict}')
+
+
 def _log_master_source_once(gtin_rows: list) -> None:
     """One line per run stating exactly which master-list source was used —
     env, runtime file, rejected, or none — token redacted. Answers 'which
     feed am I actually reading' in a second instead of an afternoon."""
     cfg = _load_sheet_config()
+    candidate = cfg.get('sheet_url') or cfg.get('rejected_url')
+    if candidate:
+        _log_host_check_once(candidate)
     if cfg.get('rejected_url'):
         print(f'[master] source=rejected url={_redact_token(cfg["rejected_url"])} '
              f'reason="{cfg.get("reject_reason", "")}"')
