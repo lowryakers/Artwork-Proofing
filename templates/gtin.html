@@ -33,48 +33,68 @@
   </div>
 </div>
 
-{# ── Google Sheets sync card ─────────────────────────────────────────────── #}
-<div class="card shadow-sm mb-4 {% if sheet_cfg.get('sheet_url') %}border-success{% endif %}">
+{# ── Master-list source card ─────────────────────────────────────────────────
+   GTIN_SHEET_URL is the sole, authoritative source (no UI override, no Google
+   Sheet fallback — see the "remove the Google Sheet fallback" change). This
+   card only ever reports what _load_sheet_config() actually resolved:
+   connected / rejected (configured but refused) / not configured — it never
+   collapses "rejected" into the same generic banner as "nothing set", which
+   is what used to hide the real cause. #}
+<div class="card shadow-sm mb-4
+            {% if sheet_cfg.get('sheet_url') %}border-success
+            {% elif sheet_cfg.get('rejected_url') %}border-danger{% endif %}">
   <div class="card-header py-2 d-flex align-items-center gap-2
-              {% if sheet_cfg.get('sheet_url') %}bg-success bg-opacity-10{% else %}bg-light{% endif %}">
+              {% if sheet_cfg.get('sheet_url') %}bg-success bg-opacity-10
+              {% elif sheet_cfg.get('rejected_url') %}bg-danger bg-opacity-10
+              {% else %}bg-light{% endif %}">
     <i class="bi bi-cloud-arrow-down{% if sheet_cfg.get('sheet_url') %}-fill text-success{% endif %} me-1"></i>
-    <span class="fw-semibold small">Google Sheets Connection</span>
+    <span class="fw-semibold small">Master SKU List Source</span>
     {% if sheet_cfg.get('sheet_url') %}
     <span class="badge bg-success ms-1">Connected</span>
     {% if sheet_cfg.get('last_synced') %}
     <span class="text-muted small ms-2">Last sync: {{ sheet_cfg.last_synced[:16].replace('T',' ') }} &bull; {{ sheet_cfg.get('row_count', 0) }} SKUs</span>
     {% endif %}
+    {% elif sheet_cfg.get('rejected_url') %}
+    <span class="badge bg-danger ms-1">Rejected</span>
+    {% else %}
+    <span class="badge bg-secondary ms-1">Not configured</span>
     {% endif %}
   </div>
   <div class="card-body py-3">
-    {% if not sheet_cfg.get('sheet_url') %}
+    {% if sheet_cfg.get('sheet_url') %}
+    <p class="text-muted small mb-0">
+      Source: <code>{{ env_sheet_url and 'GTIN_SHEET_URL (environment)' or 'runtime config' }}</code>
+    </p>
+
+    {% elif sheet_cfg.get('rejected_url') %}
+    <div class="alert alert-danger py-2 small mb-3">
+      <i class="bi bi-x-circle-fill me-1"></i>
+      <strong>Master list REJECTED</strong> — {{ sheet_cfg.get('reject_reason', 'the configured URL was refused.') }}
+      0 rows loaded. Every GTIN, spec and fill-weight check was skipped.
+    </div>
+    <p class="text-muted small mb-0">
+      A master-list URL is configured ({{ sheet_cfg.rejected_url | truncate(70) }}) but isn't on the
+      ReadyDoc host, so it's refused by default. Fix it in Railway on this service:
+    </p>
+    <ul class="text-muted small mb-0">
+      <li>Set <code>READYDOC_URL</code> to ReadyDoc's base URL, and make sure <code>GTIN_SHEET_URL</code>
+          is on that same host (e.g. ReadyDoc's <code>/api/products/master.csv</code> endpoint).</li>
+      <li>Only if you deliberately need a non-ReadyDoc feed, set <code>MASTER_ALLOW_EXTERNAL=true</code>.</li>
+    </ul>
+
+    {% else %}
     <div class="alert alert-warning py-2 small mb-3">
       <i class="bi bi-exclamation-triangle-fill me-1"></i>
-      No sheet connected — GTIN and spec checks will not have a master list to validate against.
+      No master list configured — GTIN_SHEET_URL is unset on this service. GTIN and spec checks will
+      not have a master list to validate against.
     </div>
-    <p class="text-muted small mb-3">
-      Connect your Master SKU Google Sheet to automatically sync GTIN, material, dimensions, colors,
-      and all spec data with every proof run. Set the <code>GTIN_SHEET_URL</code> environment variable
-      in Railway, or paste the URL below. The sheet must be published:
-      <strong>File → Share → Publish to web → CSV</strong>.
+    <p class="text-muted small mb-0">
+      Set the <code>GTIN_SHEET_URL</code> environment variable in Railway to ReadyDoc's master.csv
+      endpoint (and <code>READYDOC_URL</code> to the same host). This can no longer be set from this
+      page — the master list has exactly one source, the environment, so a change here can never
+      silently disagree with it.
     </p>
     {% endif %}
-    <div class="d-flex gap-2 flex-wrap align-items-end">
-      <div class="flex-grow-1">
-        <label class="form-label small mb-1 fw-semibold">Google Sheets URL</label>
-        <input type="url" id="sheetUrl" class="form-control form-control-sm"
-               placeholder="https://docs.google.com/spreadsheets/d/…"
-               value="{{ sheet_cfg.get('sheet_url', '') }}">
-      </div>
-      <button class="btn btn-sm btn-dark" onclick="saveSheetUrl()" id="saveBtn">
-        <i class="bi bi-cloud-check me-1"></i>Save & Sync
-      </button>
-      {% if sheet_cfg.get('sheet_url') %}
-      <button class="btn btn-sm btn-outline-danger" onclick="clearSheet()" title="Disconnect sheet">
-        <i class="bi bi-x-circle me-1"></i>Disconnect
-      </button>
-      {% endif %}
-    </div>
     <div id="sheetStatus" class="small mt-2"></div>
   </div>
 </div>
@@ -211,33 +231,6 @@ function setStatus(msg, cls='text-muted') {
   document.getElementById('sheetStatus').innerHTML = `<span class="${cls}">${msg}</span>`;
 }
 
-async function saveSheetUrl() {
-  const url = document.getElementById('sheetUrl').value.trim();
-  const btn = document.getElementById('saveBtn');
-  btn.disabled = true;
-  btn.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>Saving…';
-  try {
-    const r = await fetch('/api/gtin-sheet', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({url}),
-    });
-    const d = await r.json();
-    if (!d.ok) { setStatus('<i class="bi bi-x-circle-fill text-danger me-1"></i>' + d.error, 'text-danger'); return; }
-    if (url) {
-      setStatus('<i class="bi bi-arrow-clockwise me-1"></i>Syncing…', 'text-muted');
-      await syncNow();
-    } else {
-      location.reload();
-    }
-  } catch(e) {
-    setStatus('<i class="bi bi-x-circle-fill text-danger me-1"></i>Save failed: ' + e, 'text-danger');
-  } finally {
-    btn.disabled = false;
-    btn.innerHTML = '<i class="bi bi-cloud-check me-1"></i>Save & Sync';
-  }
-}
-
 async function syncNow() {
   const btn = document.getElementById('syncBtn');
   if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>Syncing…'; }
@@ -256,16 +249,6 @@ async function syncNow() {
   } finally {
     if (btn) { btn.disabled = false; btn.innerHTML = '<i class="bi bi-arrow-clockwise me-1"></i>Sync Now'; }
   }
-}
-
-async function clearSheet() {
-  if (!confirm('Disconnect the Google Sheet? Spec and GTIN checks will have no master list to validate against.')) return;
-  await fetch('/api/gtin-sheet', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({url: ''}),
-  });
-  location.reload();
 }
 </script>
 {% endblock %}
