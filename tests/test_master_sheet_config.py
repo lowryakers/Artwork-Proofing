@@ -121,10 +121,16 @@ def _run():
             A._log_master_source_once([{'sku': 'A'}, {'sku': 'B'}])
         finally:
             sys.stdout = _orig_stdout
-        line = buf.getvalue().strip()
-        check("log line starts with '[master] source=env'", line.startswith('[master] source=env'))
-        check('token is redacted in the logged url', 'SECRET123' not in line and 'token=***' in line)
-        check('row count included in the logged line', 'rows=2' in line)
+        out = buf.getvalue()
+        lines = [ln for ln in out.splitlines() if ln.strip()]
+        check("a '[master] source=env' line is printed",
+              any(ln.startswith('[master] source=env') for ln in lines))
+        check('token is redacted in the logged url', 'SECRET123' not in out and 'token=***' in out)
+        check('row count included in the logged line', 'rows=2' in out)
+        check('host-check line reports the GTIN_SHEET_URL host',
+              any('host check: GTIN_SHEET_URL host=app.powder-ops.com' in ln for ln in lines))
+        check('host-check line reports the allowed (READYDOC_URL) host and verdict',
+              any('READYDOC_URL host=app.powder-ops.com  -> allowed' in ln for ln in lines))
 
         _reset(env_url='', readydoc_url='https://app.powder-ops.com')
         buf = io.StringIO()
@@ -162,11 +168,20 @@ def _run():
         check('a ReadyDoc-hosted URL is accepted with MASTER_ALLOW_EXTERNAL=false',
               cfg.get('sheet_url') == 'https://app.powder-ops.com/api/products/master.csv?token=abc')
 
-        # with READYDOC_URL unset there is no host to verify against -> refuse
+        # with READYDOC_URL unset, the allowed host falls back to the known
+        # ReadyDoc host (app.powder-ops.com) rather than refusing everything —
+        # run c2beb887 showed refusing the correct host outright is worse than
+        # a narrow, named fallback.
         _reset(env_url='https://app.powder-ops.com/api/products/master.csv?token=abc',
                readydoc_url='', allow_external=False)
         cfg = A._load_sheet_config()
-        check('an unverifiable URL (no READYDOC_URL configured) is refused, not accepted on faith',
+        check('with READYDOC_URL unset, app.powder-ops.com is still accepted via the fallback host',
+              cfg.get('sheet_url') == 'https://app.powder-ops.com/api/products/master.csv?token=abc')
+
+        # ...but a genuinely different host is still refused via that same fallback
+        _reset(env_url='https://evil.example.com/sheet.csv', readydoc_url='', allow_external=False)
+        cfg = A._load_sheet_config()
+        check('with READYDOC_URL unset, a non-fallback host is still refused',
               'rejected_url' in cfg)
 
         # a rejected runtime-file URL (no env var set) is also caught
