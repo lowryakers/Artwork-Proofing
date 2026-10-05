@@ -979,6 +979,72 @@ def _parse_nfp_amount(v):
     return None
 
 
+def _largest_white_region_bbox_frac(im, white_threshold: int = 238, min_frac: float = 0.15,
+                                    max_cells: int = 90):
+    """Bounding box of the largest connected near-white region within `im` (a
+    PIL Image), as (x0, y0, x1, y1) fractions of im's own width/height — or
+    None if nothing covering at least `min_frac` of the area is found.
+
+    The Nutrition/Supplement Facts panel on a ProDough layflat is printed on
+    its own white-filled rectangle, geometrically distinguishable from the
+    surrounding artwork. A loose vision-reported bounding box, padded for
+    safety, can pull in an adjacent block (a protein-options strip sitting
+    just outside the panel) — this tightens that padded box down to the
+    panel's actual extent, which the adjacent strip (printed on a colored or
+    bordered ground) sits outside of.
+
+    Uses a connected-component flood fill, not "largest solid rectangle" — a
+    real Nutrition Facts panel is crossed by black rule lines and text, which
+    would shatter a solid-rectangle search into disconnected slivers between
+    the rules. A flood fill treats those as holes in one region and still
+    recovers the panel's true outer extent, as long as the rules don't reach
+    the panel's own white margin (true for every ProDough layout this
+    targets). Downsamples to at most `max_cells` cells on the long axis — a
+    geometric find, not a pixel-precise one."""
+    try:
+        g = im.convert('L')
+        W, H = g.size
+        if W < 4 or H < 4:
+            return None
+        scale = min(1.0, max_cells / float(max(W, H)))
+        sw, sh = max(2, int(W * scale)), max(2, int(H * scale))
+        g = g.resize((sw, sh))
+        px = g.load()
+        mask = [[px[x, y] >= white_threshold for x in range(sw)] for y in range(sh)]
+        visited = [[False] * sw for _ in range(sh)]
+
+        best_area, best_bbox = 0, None
+        for sy in range(sh):
+            for sx in range(sw):
+                if not mask[sy][sx] or visited[sy][sx]:
+                    continue
+                stack = [(sx, sy)]
+                visited[sy][sx] = True
+                minx = maxx = sx
+                miny = maxy = sy
+                while stack:
+                    x, y = stack.pop()
+                    if x < minx: minx = x
+                    if x > maxx: maxx = x
+                    if y < miny: miny = y
+                    if y > maxy: maxy = y
+                    for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                        nx, ny = x + dx, y + dy
+                        if 0 <= nx < sw and 0 <= ny < sh and mask[ny][nx] and not visited[ny][nx]:
+                            visited[ny][nx] = True
+                            stack.append((nx, ny))
+                bbox_area = (maxx - minx + 1) * (maxy - miny + 1)
+                if bbox_area > best_area:
+                    best_area = bbox_area
+                    best_bbox = (minx, miny, maxx + 1, maxy + 1)
+        if best_bbox is None or best_area < min_frac * sw * sh:
+            return None
+        x0, y0, x1, y1 = best_bbox
+        return (x0 / sw, y0 / sh, x1 / sw, y1 / sh)
+    except Exception:
+        return None
+
+
 def _read_nfp_panel(img_path: str, bbox) -> dict:
     """Durable NFP read: crop the Nutrition/Supplement Facts panel to its own image
     (using the bbox from the first vision pass) and read that rectangle in isolation.
@@ -1003,7 +1069,19 @@ def _read_nfp_panel(img_path: str, bbox) -> dict:
             px1, py1 = min(W, int((x1 + pw) * W)), min(H, int((y1 + ph) * H))
             if px1 - px0 < 8 or py1 - py0 < 8:
                 return {}
-            crop = im.crop((px0, py0, px1, py1))
+            candidate = im.crop((px0, py0, px1, py1))
+            # Tighten the padded box to the panel's own white-filled rectangle,
+            # located geometrically — excludes an adjacent strip or other
+            # artwork the padding can otherwise pull into the crop.
+            refined = _largest_white_region_bbox_frac(candidate)
+            if refined:
+                rx0, ry0, rx1, ry1 = refined
+                cw, ch = candidate.size
+                tx0, ty0 = px0 + int(rx0 * cw), py0 + int(ry0 * ch)
+                tx1, ty1 = px0 + int(rx1 * cw), py0 + int(ry1 * ch)
+                crop = im.crop((tx0, ty0, tx1, ty1)) if (tx1 - tx0 >= 8 and ty1 - ty0 >= 8) else candidate
+            else:
+                crop = candidate
         else:
             # No bbox — vision couldn't locate the panel. Fall back to the whole
             # image with the focused prompt + orientation flips; better than leaving
@@ -2387,6 +2465,7 @@ def _check_net_weight(panel: dict, fill_weight_g=None, fname: str = '',
     # reconciliation actually ran (implied computable). An empty statuses list with
     # nothing computed means "no check could run" — UNVERIFIED, never PASS. "Nothing
     # evaluated" must never read as "evaluated and fine."
+    _reconciles_note = None  # set below if a confident PASS reconciliation note is written
     _rank = {'CRITICAL': 4, 'SUSPECT': 3, 'UNVERIFIED': 2, 'REVIEW': 1.5, 'PASS': 1}
     if statuses:
         status = max(statuses, key=lambda s: _rank.get(s, 0))
@@ -2404,10 +2483,11 @@ def _check_net_weight(panel: dict, fill_weight_g=None, fname: str = '',
     elif implied is not None:
         status = 'PASS'
         if verified:
-            notes.append(
+            _reconciles_note = (
                 f'Reconciles: net {dnw:g}g = fill {fill:g}g; {ss:g}g × {spc:g} = {implied:g}g '
                 f'(within 5% of fill).' if dnw is not None else
                 f'Reconciles: {ss:g}g × {spc:g} = {implied:g}g ≈ fill {fill:g}g (within 5%).')
+            notes.append(_reconciles_note)
     else:
         # Could not compute serving × servings — reconciliation is incomplete even
         # if the declared net weight happened to match fill.
@@ -2458,6 +2538,18 @@ def _check_net_weight(panel: dict, fill_weight_g=None, fname: str = '',
             # Re-evaluate overall status if the density check raised the severity.
             _rank2 = {'CRITICAL': 4, 'SUSPECT': 3, 'UNVERIFIED': 2, 'PASS': 1}
             status = max([status] + statuses, key=lambda s: _rank2.get(s, 0))
+            # A SUSPECT serving-size read means the "Reconciles" note already
+            # written above (when status still looked like a confident PASS)
+            # computed a reconciliation from an input now known to be doubtful.
+            # The arithmetic is right and the input may be invented — a reader
+            # skimming the sheet must never see "Reconciles" next to a row
+            # that is not evaluated. Replace it, naming the suspect input.
+            if status != 'PASS' and _reconciles_note is not None and _reconciles_note in notes:
+                notes.remove(_reconciles_note)
+                notes.append(
+                    f'NOT EVALUATED — the serving size read ({ss:g}g) is flagged as suspect, so '
+                    'the panel-versus-net-weight reconciliation was not computed. Re-check the '
+                    'serving size.')
 
     return {
         'status': status,
@@ -5014,6 +5106,117 @@ def _hex_close(a, b, tol: int = 6) -> bool:
     return all(abs(x - y) <= tol for x, y in zip(ca, cb))
 
 
+def _lab_to_hex(L: float, a: float, b: float) -> str:
+    """CIE L*a*b* (D50, the print-industry reference white) -> sRGB hex, via
+    Bradford chromatic adaptation to D65. The standard conversion path for a
+    Lab-alternate Separation's full-tint color (job 66dc8e69: these files
+    define their spot colors with a Lab alternate colorspace, not CMYK)."""
+    _Xn, _Yn, _Zn = 96.422, 100.0, 82.521  # D50 reference white
+    fy = (L + 16) / 116
+    fx = fy + a / 500
+    fz = fy - b / 200
+
+    def _finv(t):
+        return t ** 3 if t ** 3 > 0.008856 else (t - 16 / 116) / 7.787
+
+    X, Y, Z = _Xn * _finv(fx), _Yn * _finv(fy), _Zn * _finv(fz)
+    X, Y, Z = X / 100.0, Y / 100.0, Z / 100.0
+    # Bradford-adapted D50 -> D65 XYZ, then the standard sRGB primaries matrix.
+    Xa = 0.9555766 * X - 0.0230393 * Y + 0.0631636 * Z
+    Ya = -0.0282895 * X + 1.0099416 * Y + 0.0210077 * Z
+    Za = 0.0122982 * X - 0.0204830 * Y + 1.3299098 * Z
+    r = 3.2404542 * Xa - 1.5371385 * Ya - 0.4985314 * Za
+    g = -0.9692660 * Xa + 1.8760108 * Ya + 0.0415560 * Za
+    bl = 0.0556434 * Xa - 0.2040259 * Ya + 1.0572252 * Za
+
+    def _gamma(c):
+        c = max(0.0, min(1.0, c))
+        return 12.92 * c if c <= 0.0031308 else 1.055 * (c ** (1 / 2.4)) - 0.055
+
+    r, g, bl = _gamma(r), _gamma(g), _gamma(bl)
+    return '#{:02X}{:02X}{:02X}'.format(
+        max(0, min(255, round(r * 255))),
+        max(0, min(255, round(g * 255))),
+        max(0, min(255, round(bl * 255))))
+
+
+def _cmyk_to_hex(c: float, m: float, y: float, k: float) -> str:
+    """DeviceCMYK (0-100 each, as PDF tint-transform /C1 values are written)
+    -> sRGB hex via the standard naive subtractive conversion."""
+    c, m, y, k = (max(0.0, min(100.0, v)) / 100.0 for v in (c, m, y, k))
+    r = 255 * (1 - c) * (1 - k)
+    g = 255 * (1 - m) * (1 - k)
+    bl = 255 * (1 - y) * (1 - k)
+    return '#{:02X}{:02X}{:02X}'.format(
+        max(0, min(255, round(r))), max(0, min(255, round(g))), max(0, min(255, round(bl))))
+
+
+def _extract_spot_color_hexes(doc) -> dict:
+    """For each /Separation spot color, compute the color it actually defines
+    at full tint, directly from its tint-transform function (/C1) — NOT from
+    a rendered-pixel sample, which depends on the renderer's own color
+    management and can disagree with the artwork's intended color for a
+    non-CMYK alternate space. Job 66dc8e69: these files define their spot
+    colors with a Lab alternate colorspace; comparing against a rendered
+    sample (or assuming CMYK) produced 12 false "does not match" CRITICALs
+    on artwork that was, in every case, correct.
+
+    Returns {name: {'hex': '#rrggbb'}} for a resolved CMYK or Lab separation,
+    or {name: {'unresolved': '<why>'}} for a /C1 whose colorspace this can't
+    interpret — kept distinct so the caller can say "could not evaluate"
+    rather than silently falling back to a comparison that might be wrong.
+    """
+    out = {}
+    for xref in range(1, doc.xref_length()):
+        try:
+            obj = doc.xref_object(xref, compressed=False)
+        except Exception:
+            continue
+        for m in re.finditer(r'/Separation\s+/([^\s/\[\]()<>{}]+)', obj):
+            name = m.group(1)
+            if name.lower() in _PROCESS_CS or name in out:
+                continue
+            # The alternate colorspace + tint-transform function follow the
+            # name in the Separation array — scope the search to a window
+            # after it rather than requiring a specific key order.
+            window = obj[m.end(): m.end() + 600]
+            c1_m = re.search(r'/C1\s*\[\s*([^\]]+?)\s*\]', window)
+            if not c1_m:
+                continue
+            try:
+                c1 = [float(v) for v in c1_m.group(1).split()]
+            except ValueError:
+                continue
+            range_m = re.search(r'/Range\s*\[\s*([^\]]+?)\s*\]', window)
+            hex_val, reason = None, None
+            if len(c1) == 4:
+                hex_val = _cmyk_to_hex(*c1)
+            elif len(c1) == 3:
+                is_lab = False
+                if range_m:
+                    try:
+                        rng = [float(v) for v in range_m.group(1).split()]
+                        # Lab's range is roughly [0 100 -128 127 -128 127] —
+                        # an L channel bound well above 1 distinguishes it
+                        # from a plain [0,1]-domain RGB alternate.
+                        is_lab = len(rng) == 6 and rng[1] > 50
+                    except ValueError:
+                        pass
+                if is_lab:
+                    hex_val = _lab_to_hex(*c1)
+                elif not range_m:
+                    reason = 'unrecognized 3-component alternate colorspace (no /Range to classify it)'
+                else:
+                    reason = 'unrecognized 3-component alternate colorspace'
+            else:
+                reason = f'unrecognized colorspace ({len(c1)} components in /C1)'
+            if hex_val:
+                out[name] = {'hex': hex_val}
+            elif reason:
+                out[name] = {'unresolved': reason}
+    return out
+
+
 def _sample_dominant_colors(img_path: str, top_n: int = 6, min_frac: float = 0.01) -> list:
     """Dominant colors of the rendered page as '#rrggbb' hex strings, most
     common first. The proofing pipeline already rasterizes the PDF at 400 DPI
@@ -5074,13 +5277,20 @@ def _norm_pantone(name: str) -> str:
 def _spot_matches(req: str, file_colors: list) -> bool:
     """Does a required spot-color name (from the spec sheet) match any
     separation actually in the file?"""
+    return _matched_spot_name(req, file_colors) is not None
+
+
+def _matched_spot_name(req: str, file_colors: list):
+    """The actual separation name in the file that a required spot-color name
+    matches, or None. Same matching rule as _spot_matches, but returns the
+    name itself so its computed color (from _extract_spot_color_hexes) can be
+    looked up."""
     req_n = _norm_pantone(req)
     for c in file_colors:
         c_n = _norm_pantone(c)
-        # Exact normalized match, or either side is a substring of the other
         if req_n == c_n or req_n in c_n or c_n in req_n:
-            return True
-    return False
+            return c
+    return None
 
 
 def _get_ocg_names(doc) -> list:
@@ -5502,12 +5712,37 @@ def _check_print_specs(pdf_path: str, brand_config: dict = None,
             req_hex_raw = matched_spec.get('hex_spot_colors') or ''
             req_hexes = [s.strip() for s in re.split(r'[,|;]', req_hex_raw) if s.strip()]
             sampled_colors = _sample_dominant_colors(img_path) if img_path else []
+            # The color each separation actually DEFINES, read from its own
+            # tint-transform function (Lab- or CMYK-aware) — more precise than
+            # a rendered-pixel sample, and the authoritative comparison when
+            # it resolves (job 66dc8e69: these files use a Lab alternate
+            # colorspace, which a rendered sample doesn't reliably reflect).
+            spot_color_hexes = _extract_spot_color_hexes(doc)
 
             for i, req in enumerate(req_spots):
-                name_ok = _spot_matches(req, spot_colors)
+                matched_name = _matched_spot_name(req, spot_colors)
+                name_ok = matched_name is not None
                 req_hex = req_hexes[i] if i < len(req_hexes) else None
-                hex_ok = (any(_hex_close(req_hex, s) for s in sampled_colors)
-                         if (req_hex and sampled_colors) else None)  # None = no evidence either way
+                computed = spot_color_hexes.get(matched_name) if matched_name else None
+
+                if computed and computed.get('unresolved'):
+                    # Neither CMYK nor Lab — say so; "does not match" would be
+                    # asserting something this can't actually verify.
+                    issues.append({'severity': 'review', 'message': (
+                        f'Spot color "{req}" — could not evaluate this separation\'s color '
+                        f'({computed["unresolved"]}). Verify the color manually against the spec '
+                        f'sheet\'s hex ({req_hex}).')})
+                    continue
+
+                computed_hex = computed.get('hex') if computed else None
+                if computed_hex and req_hex:
+                    # Any conversion between color models loses some precision —
+                    # a wider tolerance than the pixel-sampled comparison, which
+                    # accounts for conversion rounding rather than render noise.
+                    hex_ok = _hex_close(req_hex, computed_hex, tol=8)
+                else:
+                    hex_ok = (any(_hex_close(req_hex, s) for s in sampled_colors)
+                             if (req_hex and sampled_colors) else None)  # None = no evidence either way
 
                 if name_ok and hex_ok is not False:
                     continue  # matches by name, and nothing contradicts it by color — silent pass
@@ -5515,11 +5750,12 @@ def _check_print_specs(pdf_path: str, brand_config: dict = None,
                 if name_ok and hex_ok is False:
                     # The expensive case: correctly labeled, wrong ink. A designer
                     # copying a swatch's name without re-picking its color lands here.
+                    _computed_note = f' (computed from the artwork: {computed_hex})' if computed_hex else ''
                     issues.append({'severity': 'critical', 'message': (
-                        f'Spot color "{req}" — the separation name matches, but the rendered color '
-                        f'does not match the spec sheet\'s hex ({req_hex}). The artwork may be built '
-                        'in the wrong color despite the correct label. Verify color setup with your '
-                        'designer before going to press.')})
+                        f'Spot color "{req}" — the separation name matches, but the rendered color'
+                        f'{_computed_note} does not match the spec sheet\'s hex ({req_hex}). The '
+                        'artwork may be built in the wrong color despite the correct label. Verify '
+                        'color setup with your designer before going to press.')})
                 elif not name_ok and hex_ok is True:
                     # The rendered color is right; only the NAME on the spec sheet is
                     # wrong. Say so plainly and point at the master list, not the designer —
