@@ -221,6 +221,7 @@
   {% if   sev == 'critical' %}<i class="bi bi-x-circle-fill text-danger me-1"></i>
   {% elif sev == 'warning'  %}<i class="bi bi-exclamation-triangle-fill text-warning me-1"></i>
   {% elif sev == 'clean'    %}<i class="bi bi-check-circle-fill text-success me-1"></i>
+  {% elif sev == 'incomplete' %}<i class="bi bi-slash-circle-fill text-warning me-1"></i>
   {% else                   %}<i class="bi bi-dash-circle text-secondary me-1"></i>
   {% endif %}
 {% endmacro %}
@@ -284,6 +285,8 @@
         <span class="badge bg-warning text-dark ms-auto">{{ r.warning_count }} warnings</span>
       {% elif r.severity == 'clean' %}
         <span class="badge bg-success ms-auto">Clean</span>
+      {% elif r.severity == 'incomplete' %}
+        <span class="badge bg-warning text-dark ms-auto" title="{{ (r.checks_skipped or []) | join(', ') }}">Incomplete — {{ (r.checks_skipped or []) | length }} check(s) not run</span>
       {% elif r.severity == 'info' %}
         <span class="badge bg-info text-dark ms-auto">{{ r.info_count }} notes</span>
       {% endif %}
@@ -1202,6 +1205,7 @@ function sevIcon(sev) {
   if (sev === 'critical') return '<i class="bi bi-x-circle-fill text-danger me-1"></i>';
   if (sev === 'warning')  return '<i class="bi bi-exclamation-triangle-fill text-warning me-1"></i>';
   if (sev === 'clean')    return '<i class="bi bi-check-circle-fill text-success me-1"></i>';
+  if (sev === 'incomplete') return '<i class="bi bi-slash-circle-fill text-warning me-1"></i>';
   return '<i class="bi bi-dash-circle text-secondary me-1"></i>';
 }
 
@@ -1209,6 +1213,7 @@ function sevBadge(r) {
   if (r.severity === 'critical') return `<span class="badge bg-danger ms-auto">${r.critical_count} critical</span>`;
   if (r.severity === 'warning')  return `<span class="badge bg-warning text-dark ms-auto">${r.warning_count} warnings</span>`;
   if (r.severity === 'clean')    return `<span class="badge bg-success ms-auto">Clean</span>`;
+  if (r.severity === 'incomplete') return `<span class="badge bg-warning text-dark ms-auto">Incomplete — ${(r.checks_skipped || []).length} check(s) not run</span>`;
   if (r.severity === 'info')     return `<span class="badge bg-info text-dark ms-auto">${r.info_count} notes</span>`;
   return '';
 }
