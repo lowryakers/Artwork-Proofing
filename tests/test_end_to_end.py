@@ -37,7 +37,7 @@ import tempfile
 import threading
 import time
 import urllib.error
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
@@ -237,18 +237,21 @@ def _run():
                                spec_rows=rows)
         return sid, fname, res, time.time() - t
 
+    # Each run is printed the moment it finishes, so a timeout or a crash
+    # part-way through a ~45-minute run still leaves every completed result.
     t0 = time.time()
+    results = []
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        results = list(ex.map(_one, jobs))
+        for fut in as_completed([ex.submit(_one, j) for j in jobs]):
+            sid, fname, res, secs = fut.result()
+            results.append((sid, fname, res, secs))
+            print(f'  [{len(results)}/{len(jobs)}] {sid:<40} {fname:<50} '
+                  f'{res.get("severity", "?").upper():<10} crit={res.get("critical_count")} '
+                  f'warn={res.get("warning_count")} skipped={res.get("checks_skipped")} {secs:.0f}s',
+                  flush=True)
+            for k, i in _graded(res):
+                print(f'      {i["severity"].upper():<8} [{k}] {i["message"][:150]}', flush=True)
     print(f'\n{len(results)} pipeline runs in {time.time() - t0:.0f}s\n')
-
-    for sid, fname, res, secs in results:
-        print(f'  {sid:<40} {fname:<50} {res.get("severity", "?").upper():<10} '
-              f'crit={res.get("critical_count")} warn={res.get("warning_count")} '
-              f'skipped={res.get("checks_skipped")} {secs:.0f}s')
-        for k, i in _graded(res):
-            print(f'      {i["severity"].upper():<8} [{k}] {i["message"][:150]}')
-    print()
 
     # ── Score: clean files ──────────────────────────────────────────────────
     clean_fp = 0
