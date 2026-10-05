@@ -1,0 +1,9 @@
+{
+  "_about": "Local stand-in for the ReadyDoc master.csv, so test_end_to_end.py can never be turned green (or red) by the network. Keys match the normalized row shape app._fetch_sheet_rows emits. Replace every FILL_ME with the real value from master.csv for these four SKUs; the harness refuses to score while any FILL_ME remains.",
+  "rows": [
+    {"sku": "FILL_ME", "flavor": "Buttermilk Pancake",     "gtin": "FILL_ME", "fill_weight_g": 454, "pms_spot_colors": "FILL_ME", "hex_spot_colors": "FILL_ME", "packaging_type": "pouch"},
+    {"sku": "FILL_ME", "flavor": "Chocolate Pancake",      "gtin": "FILL_ME", "fill_weight_g": 454, "pms_spot_colors": "FILL_ME", "hex_spot_colors": "FILL_ME", "packaging_type": "pouch"},
+    {"sku": "FILL_ME", "flavor": "Cinnamon Swirl Pancake", "gtin": "FILL_ME", "fill_weight_g": 454, "pms_spot_colors": "FILL_ME", "hex_spot_colors": "FILL_ME", "packaging_type": "pouch"},
+    {"sku": "FILL_ME", "flavor": "Pumpkin Pancake",        "gtin": "FILL_ME", "fill_weight_g": 454, "pms_spot_colors": "FILL_ME", "hex_spot_colors": "FILL_ME", "packaging_type": "pouch"}
+  ]
+}

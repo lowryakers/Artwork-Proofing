@@ -404,6 +404,64 @@ def _fetch_sheet_rows(csv_url: str) -> list:
     return rows
 
 
+_MASTER_FETCH_ATTEMPTS = 3
+_MASTER_FETCH_BACKOFF_S = (1.0, 2.0, 4.0)
+
+
+def _is_transient_fetch_error(exc: Exception) -> bool:
+    """A 5xx, a connection/timeout failure, or a reset is worth retrying; a 4xx
+    (bad token, wrong URL) or a non-CSV body (our own ValueError) is not —
+    retrying those only delays the same answer."""
+    import urllib.error
+    if isinstance(exc, urllib.error.HTTPError):
+        return exc.code >= 500
+    if isinstance(exc, ValueError):
+        return False
+    return isinstance(exc, (urllib.error.URLError, OSError, TimeoutError))
+
+
+def _fetch_sheet_rows_with_retry(csv_url: str) -> list:
+    """Fetch the master list, retrying a transient failure up to three times
+    with backoff before declaring it unavailable. Run 9ffb350f lost its whole
+    master list — and with it every fill weight and spec value — to a single
+    HTTP 502, which is usually transient. Raises the last error if every
+    attempt fails, so the caller's 'unavailable' path still fires."""
+    last = None
+    for attempt in range(_MASTER_FETCH_ATTEMPTS):
+        try:
+            return _fetch_sheet_rows(csv_url)
+        except Exception as exc:
+            last = exc
+            if not _is_transient_fetch_error(exc) or attempt == _MASTER_FETCH_ATTEMPTS - 1:
+                raise
+            wait = _MASTER_FETCH_BACKOFF_S[min(attempt, len(_MASTER_FETCH_BACKOFF_S) - 1)]
+            print(f'[master] fetch attempt {attempt + 1}/{_MASTER_FETCH_ATTEMPTS} failed '
+                  f'({exc}); retrying in {wait:g}s')
+            time.sleep(wait)
+    raise last  # pragma: no cover — loop always returns or raises
+
+
+def _master_list_blocker(gtin_rows: list, used_upload: bool):
+    """Why this run must NOT proceed, or None. A configured master list that
+    returned nothing (unavailable after retries, or a rejected URL) is an
+    infrastructure failure, not a proofing result — emitting per-file verdicts
+    on top of it produced run 9ffb350f's CLEAN files with no fill weights, no
+    spec values and nothing read from their panels."""
+    if used_upload or gtin_rows:
+        return None
+    cfg = _load_sheet_config()
+    if cfg.get('rejected_url'):
+        return ('Run aborted — the master list URL is rejected: '
+                f'{cfg.get("reject_reason", "not on the ReadyDoc host")} '
+                'No per-file verdicts were produced.')
+    if cfg.get('sheet_url'):
+        return ('Run aborted — the master list is UNAVAILABLE after '
+                f'{_MASTER_FETCH_ATTEMPTS} attempts ({_sheet_cache.get("last_error") or "no rows"}). '
+                'An infrastructure failure is not a proofing result; no per-file verdicts were '
+                'produced. Fix the feed and re-run.')
+    return None
+
+
 def _get_sheet_gtin_rows(force: bool = False) -> list:
     """Return GTIN rows from the synced master list, with a 5-minute in-memory
     cache. A rejected (non-ReadyDoc) URL surfaces as an error, same as a fetch
@@ -423,7 +481,7 @@ def _get_sheet_gtin_rows(force: bool = False) -> list:
         return _sheet_cache['rows']
     try:
         csv_url = _sheet_url_to_csv(url)
-        rows = _fetch_sheet_rows(csv_url)
+        rows = _fetch_sheet_rows_with_retry(csv_url)
         _sheet_cache = {'rows': rows, 'fetched_at': now, 'url': url}
         cfg['last_synced'] = datetime.now().isoformat()
         cfg['row_count'] = len(rows)
@@ -540,7 +598,13 @@ def upload():
     if not gtin_rows:
         gtin_rows = _get_sheet_gtin_rows()  # use cache; background-refresh below
         if not gtin_rows and _sheet_cache.get('last_error'):
-            flash(f'Google Sheet sync failed: {_sheet_cache["last_error"]}', 'danger')
+            flash(f'Master list fetch failed: {_sheet_cache["last_error"]}', 'danger')
+
+    _blocker = _master_list_blocker(gtin_rows, _used_upload)
+    if _blocker:
+        print('[master] ' + _blocker)
+        flash(_blocker, 'danger')
+        return redirect(url_for('prodough_proof'))
 
     # Kick off a background sheet refresh so the *next* proof run has fresh data
     # without blocking this one on a network round-trip.
@@ -990,24 +1054,91 @@ def _generate_report(job: dict, brand_name: str = 'ProDough') -> io.BytesIO:
         ws1.row_dimensions[3].height = 30 * len(_lines)
     else:
         ws1.append([])
-    for col, hdr in enumerate(['File', 'Overall Status', 'Critical', 'Warnings', 'Notes'], 1):
+    for col, hdr in enumerate(['File', 'Overall Status', 'Critical', 'Warnings', 'Notes',
+                               'Checks run', 'Checks skipped'], 1):
         c = ws1.cell(row=4, column=col, value=hdr)
         c.font = hdr_font
         c.fill = hdr_blue
         c.alignment = center
 
+    fill_incomplete = PatternFill('solid', fgColor='FFE5B4')
     for r in job['results']:
+        _run = r.get('checks_run') or []
+        _skipped = r.get('checks_skipped') or r.get('unverified_checks') or []
         ws1.append([r['filename'], r.get('severity', 'error').upper(),
-                    r.get('critical_count', 0), r.get('warning_count', 0), r.get('info_count', 0)])
+                    r.get('critical_count', 0), r.get('warning_count', 0), r.get('info_count', 0),
+                    f'{len(_run)}: ' + ', '.join(_run) if _run else '0',
+                    f'{len(_skipped)}: ' + ', '.join(_skipped) if _skipped else '0'])
         sev = r.get('severity', 'error')
-        f = fill_crit if sev == 'critical' else fill_warn if sev == 'warning' else fill_ok if sev == 'clean' else None
+        f = (fill_crit if sev == 'critical' else fill_warn if sev == 'warning'
+             else fill_ok if sev == 'clean' else fill_incomplete if sev == 'incomplete' else None)
         if f:
-            for col in range(1, 6):
+            for col in range(1, 8):
                 ws1.cell(row=ws1.max_row, column=col).fill = f
+        if _skipped:
+            ws1.cell(row=ws1.max_row, column=7).font = Font(bold=True, color='9C4200')
 
     ws1.column_dimensions['A'].width = 45
-    for col in ['B', 'C', 'D', 'E', 'F']:
+    for col in ['B', 'C', 'D', 'E']:
         ws1.column_dimensions[col].width = 14
+    ws1.column_dimensions['F'].width = 40
+    ws1.column_dimensions['G'].width = 40
+
+    # ── Reader Provenance — which reader produced each panel field ────────────
+    # Run 9ffb350f could not tell a value read cleanly from the panel crop from
+    # one scraped off the whole page, or from one never read at all. This sheet
+    # makes that distinction visible per file, per field. A page_regex value is
+    # a warning, not data: it was deliberately NOT used by any check.
+    _PROV_FIELDS = ('serving_size_g', 'serving_size_cups', 'servings_per_container',
+                    'serving_size_desc', 'declared_net_weight_g', 'unit_count')
+    _PROV_LABEL = {'nfp_crop': 'nfp_crop (isolated panel crop)',
+                   'vision_struct': 'vision_struct (full-page vision)',
+                   'page_regex': 'PAGE_REGEX — not used by any check', None: 'absent — NOT RUN'}
+    wsp = wb.create_sheet('Reader Provenance', 1)
+    wsp.merge_cells('A1:H1')
+    wsp['A1'] = 'READER PROVENANCE — which reader produced each panel field'
+    wsp['A1'].font = Font(bold=True, size=12)
+    wsp['A2'] = ('nfp_crop = read from the isolated, geometrically-located Nutrition Facts crop '
+                 '(authoritative). vision_struct = full-page vision structured read. '
+                 'PAGE_REGEX = scraped from the whole-page OCR and NOT used by any check. '
+                 'absent = never read; dependent checks report NOT RUN.')
+    wsp['A2'].alignment = wrap
+    wsp.merge_cells('A2:H2')
+    wsp.row_dimensions[2].height = 45
+    _hdrs = ['File'] + [f'{k}' for k in _PROV_FIELDS] + ['page_regex candidates (unused)']
+    for col, hdr in enumerate(_hdrs, 1):
+        c = wsp.cell(row=4, column=col, value=hdr)
+        c.font = hdr_font
+        c.fill = hdr_blue
+        c.alignment = center
+    fill_prov_warn = PatternFill('solid', fgColor='FFF3CD')
+    fill_prov_absent = PatternFill('solid', fgColor='FFE5B4')
+    for ridx, r in enumerate([x for x in job['results'] if not x.get('error')], start=5):
+        wsp.cell(row=ridx, column=1, value=r.get('filename', '')).alignment = wrap
+        prov = r.get('panel_provenance') or {}
+        vals = r.get('panel_values') or {}
+        for cidx, k in enumerate(_PROV_FIELDS, start=2):
+            src = prov.get(k)
+            v = vals.get(k)
+            c = wsp.cell(row=ridx, column=cidx,
+                         value=(f'{v} — {_PROV_LABEL.get(src, src)}' if v not in (None, '')
+                                else _PROV_LABEL[None]))
+            c.alignment = wrap
+            if src == 'page_regex':
+                c.fill = fill_prov_warn
+                c.font = Font(bold=True, color='9C4200')
+            elif v in (None, ''):
+                c.fill = fill_prov_absent
+        pr = r.get('panel_page_regex') or {}
+        c = wsp.cell(row=ridx, column=len(_PROV_FIELDS) + 2,
+                     value=', '.join(f'{k}={v}' for k, v in pr.items()) if pr else '')
+        c.alignment = wrap
+        if pr:
+            c.fill = fill_prov_warn
+    wsp.column_dimensions['A'].width = 42
+    for col in 'BCDEFG':
+        wsp.column_dimensions[col].width = 30
+    wsp.column_dimensions['H'].width = 44
 
     # ── Errored files — their own section, never grey info rows ────────────────
     # A file that crashed produced no checks. It must not read like a clean file

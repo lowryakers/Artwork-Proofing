@@ -72,7 +72,9 @@ def _run():
              'declared_net_weight_g': None, 'unit_count': None,
              'serving_size_cups': None, 'serving_size_desc': ''}
     r = pe._check_net_weight(empty, fill_weight_g=380)
-    check('unreadable panel + fill → UNVERIFIED (no crash, never PASS)', r['status'] == 'UNVERIFIED')
+    check('unreadable panel + fill → NOT_RUN (no crash, never PASS)', r['status'] == 'NOT_RUN')
+    check('NOT_RUN note names the missing crop-sourced fields',
+          any(n.startswith('NOT RUN') and 'serving size' in n for n in r['notes']))
 
     # A fill-weight PASS must NOT rest on a Tesseract-only serving read (the
     # arithmetic-twin false-PASS hole). Reconciles, but OCR-only → SUSPECT.
@@ -85,16 +87,19 @@ def _run():
                                  serving_vision_backed=True)
     check('reconciling fill-weight PASS on vision-backed serving → PASS', r_vis['status'] == 'PASS')
 
-    # The vision gate FORCES vision when a fill weight is on file (net-weight
-    # verdict in play) — even if Tesseract read everything else.
+    # The vision gate is no longer keyed to the fill weight (a consumer of the
+    # panel read, not evidence about it — run 9ffb350f). It escalates whenever
+    # the whole-page text is not panel-scoped, which is what guarantees the
+    # net-weight verdict a crop-sourced serving read regardless of the master list.
     _orig = pe._ocr_needs_vision
     pe._ocr_needs_vision = lambda *a, **k: False   # pretend Tesseract read the nutrition
     try:
-        _complete = 'nutrition facts calories 130 protein 25 contains: milk'
-        check('gate: no fill + complete OCR → vision skipped',
-              pe._should_run_vision(_complete, '', 'PD_cupcake.pdf', None) is False)
-        check('gate: fill on file forces vision',
-              pe._should_run_vision(_complete, '', 'PD_cupcake.pdf', 380.0) is True)
+        _unscoped = 'nutrition facts calories 130 protein 25 contains: milk'
+        check('gate: no panel-scoped serving line → vision runs',
+              pe._should_run_vision(_unscoped, '', 'PD_cupcake.pdf') is True)
+        _scoped = _unscoped + '\nserving size 4 cupcakes (63g)\nabout 6 servings per container'
+        check('gate: panel-scoped text + complete OCR → vision skipped',
+              pe._should_run_vision(_scoped, '', 'PD_cupcake.pdf') is False)
     finally:
         pe._ocr_needs_vision = _orig
 
@@ -112,7 +117,7 @@ def _run():
         {'serving_size_g': 63, 'servings_per_container': None, 'declared_net_weight_g': 380,
          'unit_count': 24, 'serving_size_cups': None, 'serving_size_desc': '4 Cupcakes'},
         fill_weight_g=380)
-    check('partial panel + fill → not PASS', r['status'] in ('UNVERIFIED', 'SUSPECT', 'CRITICAL'))
+    check('partial panel + fill → not PASS', r['status'] in ('NOT_RUN', 'UNVERIFIED', 'SUSPECT', 'CRITICAL'))
 
     print()
     if fails:

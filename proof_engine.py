@@ -58,8 +58,43 @@ _UPLOAD_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'uploads'
 # PANEL_NOT_APPROVED/PANEL_SUPERSEDED are the approved-nutrition-panel gate:
 # none of them says the artwork is wrong, only that nothing outside the artwork
 # has confirmed it yet, which must never read as "checked and fine" either.
-_NOT_VERIFIED_STATUSES = ('UNVERIFIED', 'UNKNOWN', 'PANEL_MISSING', 'PANEL_NOT_APPROVED',
-                          'PANEL_SUPERSEDED', 'PANEL_UNAVAILABLE')
+_NOT_VERIFIED_STATUSES = ('UNVERIFIED', 'UNKNOWN', 'NOT_RUN', 'PANEL_MISSING',
+                          'PANEL_NOT_APPROVED', 'PANEL_SUPERSEDED', 'PANEL_UNAVAILABLE')
+
+
+def _completeness(checks: dict) -> tuple:
+    """(checks_run, checks_skipped) for one file's check blocks. A check whose
+    status says "not evaluated" (NOT_RUN, UNVERIFIED, UNKNOWN, PANEL_*) was
+    skipped, whatever its issue list says. CLEAN is only earned when
+    checks_skipped is empty — zero findings from zero checks is not a pass
+    (run 9ffb350f: a file whose nutrition panel was never read filed CLEAN)."""
+    run, skipped = [], []
+    for k, c in (checks or {}).items():
+        if not isinstance(c, dict):
+            continue
+        (skipped if str(c.get('status', '')).upper() in _NOT_VERIFIED_STATUSES else run).append(k)
+    return run, skipped
+
+
+def _file_severity(crit, warns, suspect, review, infos, checks_skipped) -> str:
+    """Severity precedence. SUSPECT READ ranks below WARNING and can never be
+    critical — it means "the tool's read is doubtful," not "the label is
+    wrong." INCOMPLETE replaces what would otherwise be clean/info when any
+    check did not run: it is not CLEAN (nothing confirmed the file is right)
+    and not SUSPECT (which implies a check ran and was unsure)."""
+    if crit:
+        return 'critical'
+    if warns:
+        return 'warning'
+    if suspect:
+        return 'suspect'
+    if review:
+        return 'review'
+    if checks_skipped:
+        return 'incomplete'
+    if infos:
+        return 'info'
+    return 'clean'
 
 # ── In-memory job store ───────────────────────────────────────────────────────
 
@@ -569,21 +604,54 @@ def _read_front_panel(img_path: str, fraction) -> str:
         return ''
 
 
-def _should_run_vision(pre_claude_text: str, front_ocr: str, fname: str, fill_weight,
-                       has_approved_panel: bool = False) -> bool:
-    """Decide whether to escalate to Claude Vision. Run it when ANY compliance read
-    is incomplete from Tesseract, OR when a fill weight is on file — a net-weight
-    verdict is then in play and its serving/servings MUST come from a reliable
-    vision read, never Tesseract alone — OR when an approved nutrition panel is
-    on file to compare against: that comparison is exact-match, no tolerance, so
-    it must never rest on a Tesseract-only read either. Pure function so the
-    gate is unit-testable."""
+# The serving-size line, anchored on the literal phrase and requiring the gram
+# figure to sit inside the parentheses that follow the measure ("3/4 Cup (83g)",
+# "4 Cupcakes (63g)"). A lazy 50-character window used to take the first
+# "<digits>g" that landed anywhere near the words "serving size" — from ANY
+# column of a multi-column layflat — which is where run 9ffb350f's 65g and 43g
+# came from. 65 cannot match this: it is not inside a parenthesis that follows a
+# measure word.
+_SERVING_LINE_RE = re.compile(
+    r'serving\s+size\s*[:\-]?\s*((?:\d+\s+\d+\s*/\s*\d+|\d+\s*/\s*\d+|\d+(?:\.\d+)?)\s*'
+    r'(cups?|scoops?|sachets?|sticks?|bottles?|packets?|tbsp|tsp|'
+    r'cupcakes?|crepes?|pancakes?|waffles?|cookies?|muffins?|bars?)\s*\(\s*([\d.]+)\s*g\s*\))')
+_SERVINGS_PER_RE = (
+    re.compile(r'(?:about\s+)?(\d+(?:\.\d+)?)\s+servings?\s+per\s+container'),
+    re.compile(r'servings?\s+per\s+container[:\s]+(?:about\s+)?(\d+(?:\.\d+)?)'),
+)
+
+
+def _text_parse_is_panel_scoped(pre_claude_text: str) -> bool:
+    """Can the whole-page text parse stand in for a panel-scoped read? Only when
+    the anchored serving-size line and the servings-per-container line each
+    match exactly once — one panel, one answer, no second column to be read
+    from. Anything else (no match, or competing matches from a superseded
+    panel or a neighbouring column) means the panel fields must come from the
+    isolated, geometrically-located crop, so the caller escalates to vision.
+    Pure function so the gate is unit-testable."""
+    tl = _normalize_fractions((pre_claude_text or '').lower())
+    servings = [m for rx in _SERVINGS_PER_RE for m in rx.finditer(tl)]
+    serving_lines = _SERVING_LINE_RE.findall(tl)
+    return len(serving_lines) == 1 and len({m.group(1) for m in servings}) == 1
+
+
+def _should_run_vision(pre_claude_text: str, front_ocr: str, fname: str) -> bool:
+    """Decide whether to escalate to Claude Vision. Run it when ANY compliance
+    read is incomplete from Tesseract, OR when the panel fields did not come
+    from a panel-scoped read — regardless of what the master list returned.
+
+    This gate used to escalate on "a fill weight is on file" / "an approved
+    panel is on file". Both are CONSUMERS of the panel read, not evidence about
+    whether the panel is legible — so a master-list 502 (fill weight None,
+    panels not yet filed) switched the geometric panel reader off, and the
+    whole-page regex silently supplied wrong serving sizes to every check
+    (run 9ffb350f). A failed dependency must never downgrade the reader.
+    Pure function so the gate is unit-testable."""
     return bool(
         _ocr_needs_vision(pre_claude_text, front_text=front_ocr)          # nutrition missing
         or _is_film_rollstock(fname, pre_claude_text)                     # eyemark read
         or not re.search(r'\bcontains?\s*:', pre_claude_text.lower())     # FALCPA line missing
-        or fill_weight is not None                                        # net-weight verdict in play
-        or has_approved_panel                                             # approved-panel verdict in play
+        or not _text_parse_is_panel_scoped(pre_claude_text)               # panel fields need the crop
     )
 
 
@@ -1400,8 +1468,7 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
     #   • a fill weight is on file (net-weight reconciliation will run and needs a
     #     RELIABLE serving/servings read — never trust Tesseract alone for a verdict)
     #   • an approved nutrition panel is on file (exact-match diff, same reasoning)
-    _run_vision = _should_run_vision(_pre_claude_text, _front_ocr, fname, _fill_weight,
-                                     has_approved_panel=_approved_panel is not None)
+    _run_vision = _should_run_vision(_pre_claude_text, _front_ocr, fname)
     if not ANTHROPIC_AVAILABLE:
         _vision_diag = 'vision: skipped — ANTHROPIC_API_KEY not set / anthropic not installed'
     elif not _run_vision:
@@ -1477,11 +1544,22 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
     # (spec sheet > brand_config). Fill weight absent → the check runs UNVERIFIED.
     _panel = _merge_panel(_parse_panel_from_text(label_text), vision_panel)
     # The isolated NFP-crop read is the most reliable source for the panel fields —
-    # it wins over both the anchored text parse and the full-page vision structured
-    # read. Only overwrite with values it actually returned.
+    # it wins over the full-page vision structured read. Only overwrite with
+    # values it actually returned. Every field carries its reader in _src
+    # ('nfp_crop' | 'vision_struct' | 'page_regex' | None) so the report can tell
+    # a value read cleanly from the panel crop from one scraped off the page.
     for _k in ('serving_size_g', 'serving_size_cups', 'servings_per_container', 'serving_size_desc'):
         if nfp_read.get(_k) is not None:
             _panel[_k] = nfp_read[_k]
+            _panel['_src'][_k] = 'nfp_crop'
+    _PANEL_FIELDS = ('serving_size_g', 'serving_size_cups', 'servings_per_container',
+                     'serving_size_desc', 'declared_net_weight_g', 'unit_count')
+    _panel_provenance = {k: (_panel['_src'].get(k) if _panel.get(k) is not None else None)
+                         for k in _PANEL_FIELDS}
+    _panel_values = {k: _panel.get(k) for k in _PANEL_FIELDS}
+    print('[reader] ' + fname + ' ' + ' '.join(
+        f'{k}={_panel_values[k]!r}<{_panel_provenance[k] or "absent"}>' for k in _PANEL_FIELDS)
+        + (f' page_regex_only={_panel["_page_regex"]}' if _panel.get('_page_regex') else ''))
     # Feed the crop's NFP calories/protein into the front-vs-NFP comparison, and
     # keep its carb components for the net-carb recompute.
     if nfp_read:
@@ -1649,28 +1727,13 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
     review  = [i for i in all_issues if i.get('severity') == 'review']
     infos   = [i for i in all_issues if i.get('severity') == 'info']
 
-    # Severity precedence. SUSPECT READ ranks below WARNING and can never be
-    # critical — it means "the tool's read is doubtful," not "the label is wrong."
-    if crit:
-        severity = 'critical'
-    elif warns:
-        severity = 'warning'
-    elif suspect:
-        severity = 'suspect'
-    elif review:
-        severity = 'review'
-    elif infos:
-        severity = 'info'
-    else:
-        severity = 'clean'
-
-    # Verification completeness is ORTHOGONAL to severity: a check that could not
-    # be fully evaluated (net weight with no fill weight, prep type UNKNOWN) marks
-    # the file not-fully-verified so "not checked" can never read as "checked and
-    # fine." Tracked separately from severity, counted in the run summary.
-    unverified_checks = [k for k, c in checks.items()
-                         if isinstance(c, dict)
-                         and str(c.get('status', '')).upper() in _NOT_VERIFIED_STATUSES]
+    # A check that could not be evaluated (NOT_RUN without a crop-sourced
+    # serving read, net weight with no fill weight, prep type UNKNOWN, no
+    # approved panel) is skipped, and a file with any skipped check is
+    # INCOMPLETE rather than CLEAN — "not checked" must never read as
+    # "checked and fine."
+    checks_run, unverified_checks = _completeness(checks)
+    severity = _file_severity(crit, warns, suspect, review, infos, unverified_checks)
 
     # Locked-die metadata: recorded on the result so the job record and the
     # ReadyDoc ingest summary both carry which die a flavor was proofed against.
@@ -1717,6 +1780,14 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
         'info_count': len(infos),
         'fully_verified': not unverified_checks,
         'unverified_checks': unverified_checks,
+        'checks_run': checks_run,
+        'checks_skipped': unverified_checks,
+        # Which reader produced each panel field ('nfp_crop' / 'vision_struct' /
+        # 'page_regex' / None), plus the whole-page regex candidates that were
+        # deliberately NOT used — rendered on the Reader Provenance sheet.
+        'panel_values': _panel_values,
+        'panel_provenance': _panel_provenance,
+        'panel_page_regex': dict(_panel.get('_page_regex') or {}),
         'error': None,
         'matched_spec': matched_spec,
         'snapshot': _snapshot,
@@ -2144,8 +2215,11 @@ def _check_nfp(ocr_text: str, front_text: str = '', vision_nutrition: dict = Non
 # weight (the dangerous case). Any mismatch beyond tolerance is CRITICAL.
 
 _NETWT_TOL = 0.05          # 5% — separates real 50-100% errors from FDA serving rounding
-_CUP_G     = 130.0         # ProDough dry blends ≈ 130 g per cup
-_CUP_TOL   = 0.20          # 20% band on the cup→gram density sanity check
+# ProDough dry blends run 105–130 g per cup. The four real pancake panels are
+# 83, 88, 88 and 93g per 3/4 cup (111–124 g/cup); a single ~130 g/cup norm
+# flagged a correct panel at the low end once extraction was fixed.
+_CUP_G_MIN = 105.0
+_CUP_G_MAX = 130.0
 
 
 _VULGAR = {'¼': '1/4', '½': '1/2', '¾': '3/4', '⅓': '1/3', '⅔': '2/3',
@@ -2192,19 +2266,20 @@ def _parse_panel_from_text(text: str) -> dict:
     tl = _normalize_fractions((text or '').lower())
     out = {}
 
-    # Serving size grams — grams in parentheses on/near the "serving size" line.
-    m = re.search(r'serving\s+size[^\n]{0,50}?\(?\s*(\d{1,4})\s*g\b', tl)
+    # Serving size — anchored on the literal line, gram figure required inside
+    # the parentheses that follow the measure (see _SERVING_LINE_RE). These
+    # three fields are recorded for provenance only: _merge_panel never lets a
+    # whole-page regex carry serving_size_g / serving_size_cups /
+    # servings_per_container into a check.
+    m = _SERVING_LINE_RE.search(tl)
     if m:
-        out['serving_size_g'] = float(m.group(1))
-    # Cups on the serving-size line ("3/4 Cup", "1 1/2 cups").
-    mc = re.search(r'serving\s+size[^\n]{0,50}?(\d+\s+\d+\s*/\s*\d+|\d+\s*/\s*\d+|\d+(?:\.\d+)?)\s*cups?\b', tl)
-    if mc:
-        _c = _frac_to_float(mc.group(1))
-        if _c:
-            out['serving_size_cups'] = _c
+        out['serving_size_g'] = float(m.group(3))
+        if re.fullmatch(r'cups?', m.group(2)):
+            _c = _frac_to_float(re.match(r'\s*(\S+(?:\s+\d+\s*/\s*\d+)?)', m.group(1)).group(1))
+            if _c:
+                out['serving_size_cups'] = _c
     # Servings per container ("about 7 servings per container", either order).
-    ms = (re.search(r'(?:about\s+)?(\d+(?:\.\d+)?)\s+servings?\s+per\s+container', tl)
-          or re.search(r'servings?\s+per\s+container[:\s]+(?:about\s+)?(\d+(?:\.\d+)?)', tl))
+    ms = next((mm for rx in _SERVINGS_PER_RE for mm in [rx.search(tl)] if mm), None)
     if ms:
         out['servings_per_container'] = float(ms.group(1))
     # Net weight — prefer an explicit gram figure, else convert oz/lb.
@@ -2245,17 +2320,31 @@ def _merge_panel(text_panel: dict, vision_panel: dict) -> dict:
     per container". For those anchored fields the deterministic text parse of the
     same text (anchored to the literal phrase) is more trustworthy, so it wins;
     vision only fills a gap the text parse left empty."""
-    ANCHORED = {'serving_size_g', 'serving_size_cups', 'servings_per_container'}
-    out = dict(text_panel or {})
+    PANEL_ONLY = ('serving_size_g', 'serving_size_cups', 'servings_per_container')
+    out, src, page_regex = {}, {}, {}
+    for k, v in (text_panel or {}).items():
+        if v is None:
+            continue
+        if k in PANEL_ONLY:
+            # A whole-page regex is not good enough to carry the fields that
+            # feed net weight, prep-block classification and the approved-
+            # panel comparison (run 9ffb350f: 65g / 43g scraped from the wrong
+            # column). Quarantine them for the provenance sheet; never a value.
+            page_regex[k] = v
+            continue
+        out[k] = v
+        src[k] = 'page_regex'
     for k, v in (vision_panel or {}).items():
         if v is None:
             continue
-        if k in ANCHORED and out.get(k) is not None:
-            continue  # keep the anchored text-parse value
         out[k] = v
+        src[k] = 'vision_struct'
     # Normalize the key the check expects for declared net weight.
     if 'net_weight_g' in out and 'declared_net_weight_g' not in out:
         out['declared_net_weight_g'] = out['net_weight_g']
+        src['declared_net_weight_g'] = src.get('net_weight_g')
+    out['_src'] = src
+    out['_page_regex'] = page_regex
     return out
 
 
@@ -2498,7 +2587,7 @@ def _check_net_weight(panel: dict, fill_weight_g=None, fname: str = '',
     # nothing computed means "no check could run" — UNVERIFIED, never PASS. "Nothing
     # evaluated" must never read as "evaluated and fine."
     _reconciles_note = None  # set below if a confident PASS reconciliation note is written
-    _rank = {'CRITICAL': 4, 'SUSPECT': 3, 'UNVERIFIED': 2, 'REVIEW': 1.5, 'PASS': 1}
+    _rank = {'CRITICAL': 4, 'SUSPECT': 3, 'UNVERIFIED': 2, 'NOT_RUN': 2, 'REVIEW': 1.5, 'PASS': 1}
     if statuses:
         status = max(statuses, key=lambda s: _rank.get(s, 0))
     elif implied is not None and verified and not serving_vision_backed:
@@ -2525,18 +2614,19 @@ def _check_net_weight(panel: dict, fill_weight_g=None, fname: str = '',
                 f'Reconciles: {ss:g}g × {spc:g} = {implied:g}g ≈ fill {fill:g}g (within 5%).')
             notes.append(_reconciles_note)
     else:
-        # Could not compute serving × servings — reconciliation is incomplete even
-        # if the declared net weight happened to match fill.
-        status = 'UNVERIFIED'
-        if verified and dnw is not None and abs(dnw - fill) < 0.5:
-            notes.append(
-                f'NOT VERIFIED — declared net weight ({dnw:g}g) matches fill, but the serving '
-                'size or servings-per-container did not read, so the panel could not be '
-                'reconciled. Verify manually.')
-        else:
-            notes.append(
-                'NOT VERIFIED — could not read serving size, servings per container, or net '
-                'weight from this panel, so no reconciliation could run. Verify manually.')
+        # Could not compute serving × servings: the serving size and/or servings
+        # per container never arrived from an isolated panel crop (a whole-page
+        # regex is not allowed to supply them). The reconciliation did not run —
+        # say NOT RUN, naming the missing field, never a verdict either way.
+        status = 'NOT_RUN'
+        _missing = ', '.join(n for n, v in (('serving size', ss),
+                                            ('servings per container', spc)) if not v)
+        _tail = (f' Declared net weight ({dnw:g}g) matches fill, but that alone is not a '
+                 'reconciliation.' if (verified and dnw is not None and abs(dnw - fill) < 0.5) else '')
+        notes.append(
+            f'NOT RUN — no crop-sourced {_missing} read for this panel, so the '
+            f'panel-versus-net-weight reconciliation was not computed.{_tail} Re-check the '
+            'panel read (see Reader Provenance).')
 
     # ── Sub-check: grams of dry mix per declared unit ────────────────────────
     # Anchor on actual fill only — never derive g/unit from a front claim and use
@@ -2551,28 +2641,30 @@ def _check_net_weight(panel: dict, fill_weight_g=None, fname: str = '',
     implied_density = None
     if ss and cups:
         implied_density = round(ss / cups, 1)
-        _off = _pct_off(implied_density, _CUP_G)
-        if _off and _off > _CUP_TOL:
-            # A density that is a clean ~1.5×/2× off the norm almost always means
+        if not (_CUP_G_MIN <= implied_density <= _CUP_G_MAX):
+            # A density that is a clean ~1.5×/2× off the band almost always means
             # the cup FRACTION was misread (e.g. 3/4 read as 1/2), not that the
             # label is wrong. Report SUSPECT READ, not a WARNING asserting an error.
-            _dr = implied_density / _CUP_G
+            # Measure the multiple against the nearer band edge.
+            _edge = _CUP_G_MAX if implied_density > _CUP_G_MAX else _CUP_G_MIN
+            _dr = implied_density / _edge
             if any(abs(_dr - f) <= 0.15 for f in (0.5, 0.667, 1.5, 2.0)):
                 issues.append({'severity': 'suspect', 'message': (
                     f'SUSPECT READ — serving {desc or f"{cups:g} cup(s)"} = {ss:g}g implies '
-                    f'{implied_density:g} g/cup vs the ~{_CUP_G:g} g/cup ProDough norm (~{_dr:.2g}× off). '
-                    'A clean multiple like this usually means the cup fraction was misread '
-                    '(e.g. 3/4 read as 1/2). Re-check the serving-size cup value before treating '
-                    'it as a label error.')})
+                    f'{implied_density:g} g/cup vs the {_CUP_G_MIN:g}–{_CUP_G_MAX:g} g/cup ProDough '
+                    f'band (~{_dr:.2g}× off). A clean multiple like this usually means the cup '
+                    'fraction was misread (e.g. 3/4 read as 1/2). Re-check the serving-size cup '
+                    'value before treating it as a label error.')})
                 statuses.append('SUSPECT')
             else:
                 issues.append({'severity': 'warning', 'message': (
                     f'Serving declared as {desc or f"{cups:g} cup(s)"} = {ss:g}g implies '
-                    f'{implied_density:g}g per cup, but ProDough dry blends run ~{_CUP_G:g}g/cup. '
-                    'The grams can be right while the printed cup figure is wrong — and the cup '
-                    'figure is what goes into the back-panel prep instructions.')})
+                    f'{implied_density:g}g per cup, but ProDough dry blends run '
+                    f'{_CUP_G_MIN:g}–{_CUP_G_MAX:g}g/cup. The grams can be right while the printed '
+                    'cup figure is wrong — and the cup figure is what goes into the back-panel '
+                    'prep instructions.')})
             # Re-evaluate overall status if the density check raised the severity.
-            _rank2 = {'CRITICAL': 4, 'SUSPECT': 3, 'UNVERIFIED': 2, 'PASS': 1}
+            _rank2 = {'CRITICAL': 4, 'SUSPECT': 3, 'UNVERIFIED': 2, 'NOT_RUN': 2, 'PASS': 1}
             status = max([status] + statuses, key=lambda s: _rank2.get(s, 0))
             # A SUSPECT serving-size read means the "Reconciles" note already
             # written above (when status still looked like a confident PASS)
@@ -2680,6 +2772,7 @@ def _check_prep_block(text: str, panel: dict = None) -> dict:
     except (TypeError, ValueError):
         _single_serve = False
 
+    prep_status = None
     if yield_m or quantity_mismatch or unit_vs_cup_batch:
         classification = 'batch'
         if yield_m:
@@ -2715,12 +2808,22 @@ def _check_prep_block(text: str, panel: dict = None) -> dict:
             'carry no mix quantity and no yield statement. Nothing in this block scales with '
             'a serving-size change.')
     else:
-        # Neither signal available — never default to a value that looks like a verdict.
         classification = 'UNKNOWN'
-        notes.append(
-            'Prep block type UNKNOWN — could not read a yield statement or a comparable mix '
-            'quantity. Classify manually before assuming a serving-size change does or does not '
-            'require prep-copy edits.')
+        if not (serving_cups or _spc or panel.get('serving_size_desc')):
+            # The classification needed the panel's serving declaration and none
+            # arrived from a panel crop — the check did not run. Not UNKNOWN
+            # (which says "read it, couldn't classify"), NOT RUN.
+            prep_status = 'NOT_RUN'
+            notes.append(
+                'NOT RUN — no crop-sourced serving size / servings per container read for this '
+                'panel, so the prep block could not be classified against the serving '
+                'declaration. Re-check the panel read (see Reader Provenance).')
+        else:
+            # Neither signal available — never default to a value that looks like a verdict.
+            notes.append(
+                'Prep block type UNKNOWN — could not read a yield statement or a comparable mix '
+                'quantity. Classify manually before assuming a serving-size change does or does '
+                'not require prep-copy edits.')
 
     # Structural check on the numbered instruction list (repeated/out-of-sequence
     # steps, duplicated lines) — layout damage, independent of the classification.
@@ -2728,7 +2831,8 @@ def _check_prep_block(text: str, panel: dict = None) -> dict:
 
     return {
         'classification': classification,
-        'status': 'UNKNOWN' if classification == 'UNKNOWN' else 'OK',
+        'status': ('OK' if classification != 'UNKNOWN'
+                   else prep_status if prep_status else 'UNKNOWN'),
         'yield': (yield_m.group(0) if yield_m else None),
         'mix_cups': mix_cups,
         'serving_cups': serving_cups,
@@ -3529,12 +3633,10 @@ def _recount_result(res: dict) -> None:
     res['suspect_count'] = len(suspect)
     res['review_count'] = len(review)
     res['info_count'] = len(infos)
-    res['severity'] = ('critical' if crit else 'warning' if warns else 'suspect' if suspect
-                       else 'review' if review else 'info' if infos else 'clean')
-    res['unverified_checks'] = [k for k, c in checks.items()
-                                if isinstance(c, dict)
-                                and str(c.get('status', '')).upper() in _NOT_VERIFIED_STATUSES]
+    res['checks_run'], res['unverified_checks'] = _completeness(checks)
+    res['checks_skipped'] = res['unverified_checks']
     res['fully_verified'] = not res['unverified_checks']
+    res['severity'] = _file_severity(crit, warns, suspect, review, infos, res['unverified_checks'])
 
 
 def _flag_cross_sku_collisions(results: list) -> None:
@@ -6010,7 +6112,8 @@ def _check_print_specs(pdf_path: str, brand_config: dict = None,
 
 def _build_summary(results: list) -> dict:
     total = len(results)
-    counts = {'clean': 0, 'info': 0, 'review': 0, 'suspect': 0, 'warning': 0, 'critical': 0, 'error': 0}
+    counts = {'clean': 0, 'incomplete': 0, 'info': 0, 'review': 0, 'suspect': 0, 'warning': 0,
+              'critical': 0, 'error': 0}
     for r in results:
         sev = r.get('severity', 'error')
         counts[sev] = counts.get(sev, 0) + 1

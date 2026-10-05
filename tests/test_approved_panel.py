@@ -213,15 +213,20 @@ def _run():
                                       _approved(version=3), prior_panel_version=2)
     check('a real mismatch wins over PANEL_SUPERSEDED', r_both['status'] == 'CRITICAL')
 
-    # ── Vision gate: an approved panel on file forces a reliable read ─────────
+    # ── Vision gate: no longer keyed to whether an approved panel is on file.
+    # The approved-panel comparison is a CONSUMER of the panel read, not
+    # evidence about whether the panel is legible (run 9ffb350f). The gate now
+    # escalates whenever the whole-page text is not panel-scoped — which is
+    # what guarantees the comparison a crop-sourced read either way.
     _orig = pe._ocr_needs_vision
     pe._ocr_needs_vision = lambda *a, **k: False
     try:
-        _complete = 'nutrition facts calories 130 protein 25 contains: milk'
-        check('gate: no approved panel + complete OCR -> vision skipped',
-              pe._should_run_vision(_complete, '', 'x.pdf', None, has_approved_panel=False) is False)
-        check('gate: an approved panel on file forces vision',
-              pe._should_run_vision(_complete, '', 'x.pdf', None, has_approved_panel=True) is True)
+        _unscoped = 'nutrition facts calories 130 protein 25 contains: milk'
+        check('gate: no panel-scoped serving line -> vision runs (approved panel irrelevant)',
+              pe._should_run_vision(_unscoped, '', 'x.pdf') is True)
+        _scoped = (_unscoped + '\nserving size 3/4 cup (88g)\nabout 5 servings per container')
+        check('gate: panel-scoped text + complete OCR -> vision skipped',
+              pe._should_run_vision(_scoped, '', 'x.pdf') is False)
     finally:
         pe._ocr_needs_vision = _orig
 

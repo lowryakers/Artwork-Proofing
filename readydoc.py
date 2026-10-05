@@ -56,7 +56,7 @@ _SEVERITY = {'critical': 'fail', 'warning': 'warn', 'suspect': 'warn', 'review':
 # approved-nutrition-panel gate: none of them says the artwork is wrong, only
 # that nothing outside the artwork has confirmed it yet — that must never
 # read as a pass either.
-_UNVERIFIED_STATUSES = {'UNVERIFIED', 'UNKNOWN', 'SUSPECT',
+_UNVERIFIED_STATUSES = {'UNVERIFIED', 'UNKNOWN', 'NOT_RUN', 'SUSPECT',
                         'PANEL_MISSING', 'PANEL_NOT_APPROVED', 'PANEL_SUPERSEDED',
                         'PANEL_UNAVAILABLE'}
 

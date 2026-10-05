@@ -70,12 +70,20 @@ def _run():
            'WAFFLE INSTRUCTIONS\n1. Mix batter\n2. Set waffle maker\n3. Pour into waffle maker')
     check('two separate instruction lists → no false positive', not pe._check_instruction_steps(two))
 
-    # Anchored parse beats polluting numbers (Makes 24 / superseded 7).
+    # A whole-page regex may never carry serving fields into a check (run
+    # 9ffb350f) — even when it happens to be right. Its reads are quarantined
+    # for the provenance sheet; the crop read (which wins in the pipeline) is
+    # what guards against vision_struct's "Makes 24" pollution now.
     tp = pe._parse_panel_from_text(
         'Serving size 4 Cupcakes (63g)\nMakes 24 Cupcakes\nAbout 6 servings per container\nNet Wt 380g')
+    check('scoped page regex still reads the anchored line correctly',
+          tp.get('serving_size_g') == 63.0 and tp.get('servings_per_container') == 6.0)
     merged = pe._merge_panel(tp, {'servings_per_container': 24.0, 'serving_size_g': 32.0, 'unit_count': 24.0})
-    check('anchored text parse wins over vision structured servings',
-          merged['servings_per_container'] == 6.0 and merged['serving_size_g'] == 63.0)
+    check('page_regex serving fields are quarantined, not merged as values',
+          merged['_page_regex'] == {'serving_size_g': 63.0, 'servings_per_container': 6.0}
+          and merged['_src']['serving_size_g'] == 'vision_struct')
+    check('front-panel fields from the page regex are still carried (net weight)',
+          merged.get('declared_net_weight_g') == 380.0 and merged['_src']['net_weight_g'] == 'page_regex')
 
     # NFP-crop: bbox parse + validation, and graceful degrade with no bbox.
     import json as _json
