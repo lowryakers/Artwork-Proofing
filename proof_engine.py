@@ -2269,6 +2269,20 @@ def _pct_off(a, b):
 _OVERFILL_REVIEW_PCT = 5.0   # below this, an overfill is ordinary practice, not a finding
 
 
+def _fda_round_servings(n):
+    """Round a servings-per-container figure per 21 CFR 101.9(b)(8): nearest
+    0.5 for 2-5 servings, nearest whole number above 5 (ProDough's range never
+    reaches the nearest-10-above-100 band, so that case isn't needed here).
+    "About N" is the permitted declaration of a rounded figure — a panel
+    whose true serving count rounds this way is not understated, it is
+    correctly labeled."""
+    if n is None or n <= 0:
+        return None
+    if 2 <= n <= 5:
+        return round(n * 2) / 2.0
+    return float(round(n))
+
+
 def _check_net_weight(panel: dict, fill_weight_g=None, fname: str = '',
                       serving_vision_backed: bool = True, prior_snapshot: dict = None) -> dict:
     """Reconcile the nutrition panel against net weight and real fill weight.
@@ -2362,8 +2376,26 @@ def _check_net_weight(panel: dict, fill_weight_g=None, fname: str = '',
             # Under the threshold: ordinary overfill. Say nothing.
 
     # ── Check C — panel reconciles to fill (±5%, absorbs the rounding artifact)
+    _fda_rounding_handled = False
     if verified and implied is not None and not _within(implied, fill):
-        if declared_matches_fill:
+        # A declared servings-per-container figure is itself rounded per 21
+        # CFR 101.9(b)(8) ("About N servings") -- net ÷ serving routinely does
+        # not land on that rounded whole/half number even on a correctly
+        # filled, correctly labeled pack (e.g. net 454g / serving 83g = 5.47
+        # servings, which rounds to the declared "About 5"). That gap is
+        # expected and legal, not a misread or a label error -- check it
+        # before any of the misread/error branches below can fire on it.
+        _exact_servings = (fill / ss) if ss else None
+        _fda_rounded_servings = _fda_round_servings(_exact_servings)
+        if (_fda_rounded_servings is not None and spc is not None
+                and abs(_fda_rounded_servings - spc) < 0.01):
+            _fda_rounding_handled = True
+            notes.append(
+                f'Serving × servings ({_g(ss)} × {_g(spc)} = {_g(implied)}g) does not land within '
+                f'5% of fill ({_g(fill)}g), but this is expected: net ÷ serving = '
+                f'{_exact_servings:.2f} servings, which rounds to the declared {_g(spc)} under 21 '
+                'CFR 101.9(b)(8) servings-per-container rounding. Not a labeling defect.')
+        elif declared_matches_fill:
             # The measured net weight is right; serving × servings does not
             # reconcile — the serving-size or servings read is the suspect, not
             # the label. Never assert a CRITICAL on a likely misread.
@@ -2482,7 +2514,11 @@ def _check_net_weight(panel: dict, fill_weight_g=None, fname: str = '',
             'figures can reconcile to the fill by coincidence — re-check the serving line.')})
     elif implied is not None:
         status = 'PASS'
-        if verified:
+        # When the FDA-rounding exception above already explained the gap,
+        # the generic "(within 5%)" note would be false — it explicitly
+        # isn't within 5%, it's within the legal rounding of "About N
+        # servings." That note was already written where it belongs.
+        if verified and not _fda_rounding_handled:
             _reconciles_note = (
                 f'Reconciles: net {dnw:g}g = fill {fill:g}g; {ss:g}g × {spc:g} = {implied:g}g '
                 f'(within 5% of fill).' if dnw is not None else
@@ -3545,8 +3581,16 @@ def _check_instruction_steps(text: str) -> list:
     issues = []
     lines = [ln.strip() for ln in (text or '').splitlines() if ln.strip()]
 
-    # Segment into independent lists: a header line, or a step numbered 1 after a
-    # higher step, starts a new list.
+    # Segment into independent lists: a recognized header line, or a step
+    # numbered 1 after a higher step, starts a new list. An intervening line
+    # that is neither a step nor a recognized header (a header phrased in a
+    # way _INSTR_HEADER doesn't match, a blank description line, OCR noise)
+    # must NOT erase the "we were inside a numbered list" state the
+    # restart-at-1 split depends on -- it used to reset prev_n to None,
+    # which silently disabled the restart split whenever anything sat
+    # between two lists' headers and their first step, reading two
+    # correctly-numbered lists (pancake 1-3, waffle 1-3) as one damaged
+    # [1,2,3,1,2,3] list.
     lists, cur, prev_n = [], [], None
     for ln in lines:
         if _INSTR_HEADER.search(ln) and not re.match(r'^\d{1,2}[.)]', ln):
@@ -3561,8 +3605,7 @@ def _check_instruction_steps(text: str) -> list:
                 lists.append(cur); cur = []      # restart → new list
             cur.append((n, m.group(2).strip().lower()))
             prev_n = n
-        else:
-            prev_n = None
+        # else: leave prev_n unchanged -- see comment above.
     if cur:
         lists.append(cur)
 
@@ -5080,10 +5123,18 @@ _DIELINE_GUIDE_HEX = (0x00, 0xAD, 0xEF)
 
 
 def _hex_channels(h):
-    """'#rrggbb' / 'rrggbb' / 'rgb' -> (r, g, b) ints, or None if unparseable."""
+    """'#rrggbb' / 'rrggbb' / 'rgb' / 'HEX rrggbb' -> (r, g, b) ints, or None
+    if unparseable. The master list's hex_spot_colors column sometimes
+    carries a literal "HEX " word prefix (someone typed "HEX EE7623" into
+    the sheet) -- every comparison against that value silently failed to
+    parse at all, which looked identical to "the colors don't match" (job
+    b172bb64: 12 false CRITICALs where the real issue was this prefix, not
+    the tolerance)."""
     if not h:
         return None
-    h = str(h).strip().lstrip('#')
+    h = str(h).strip()
+    h = re.sub(r'^hex\s*', '', h, flags=re.I)
+    h = h.strip().lstrip('#')
     if len(h) == 3:
         h = ''.join(c * 2 for c in h)
     if len(h) != 6:
@@ -5104,6 +5155,17 @@ def _hex_close(a, b, tol: int = 6) -> bool:
     if not ca or not cb:
         return False
     return all(abs(x - y) <= tol for x, y in zip(ca, cb))
+
+
+def _hex_channel_delta(a, b):
+    """Max per-channel delta between two hex colors (0-255), or None if
+    either is unparseable. A Lab/CMYK -> sRGB conversion cannot round-trip
+    exactly, so the comparison against a computed color is a tiered
+    tolerance on this delta, not a binary match/no-match."""
+    ca, cb = _hex_channels(a), _hex_channels(b)
+    if not ca or not cb:
+        return None
+    return max(abs(x - y) for x, y in zip(ca, cb))
 
 
 def _lab_to_hex(L: float, a: float, b: float) -> str:
@@ -5735,14 +5797,36 @@ def _check_print_specs(pdf_path: str, brand_config: dict = None,
                     continue
 
                 computed_hex = computed.get('hex') if computed else None
-                if computed_hex and req_hex:
-                    # Any conversion between color models loses some precision —
-                    # a wider tolerance than the pixel-sampled comparison, which
-                    # accounts for conversion rounding rather than render noise.
-                    hex_ok = _hex_close(req_hex, computed_hex, tol=8)
-                else:
-                    hex_ok = (any(_hex_close(req_hex, s) for s in sampled_colors)
-                             if (req_hex and sampled_colors) else None)  # None = no evidence either way
+                color_delta = _hex_channel_delta(req_hex, computed_hex) if (computed_hex and req_hex) else None
+
+                if name_ok and color_delta is not None:
+                    # The computed hex (read directly from the separation's own
+                    # tint-transform function) is the authoritative comparison
+                    # when it resolves. A Lab/CMYK -> sRGB conversion cannot
+                    # round-trip exactly, so this is a tiered tolerance on the
+                    # delta, not a binary match/no-match — and the delta is
+                    # always stated, so the size of any disagreement is visible.
+                    if color_delta <= 8:
+                        continue  # within conversion tolerance — pass, no finding
+                    elif color_delta <= 20:
+                        issues.append({'severity': 'warning', 'message': (
+                            f'Spot color "{req}" — computed {computed_hex}, spec {req_hex}, max '
+                            f'channel delta {color_delta}. Larger than normal Lab/CMYK conversion '
+                            'rounding (±8) but not clearly a wrong ink — verify visually before '
+                            'treating this as an error.')})
+                    else:
+                        issues.append({'severity': 'critical', 'message': (
+                            f'Spot color "{req}" — computed {computed_hex}, spec {req_hex}, max '
+                            f'channel delta {color_delta}. The artwork may be built in the wrong '
+                            'color despite the correct label. Verify color setup with your designer '
+                            'before going to press.')})
+                    continue
+
+                # No resolved computed-hex evidence (unmatched separation, or
+                # the required/computed hex didn't parse) — degrade to the
+                # rendered-pixel-sample comparison, same as before this existed.
+                hex_ok = (any(_hex_close(req_hex, s) for s in sampled_colors)
+                         if (req_hex and sampled_colors) else None)  # None = no evidence either way
 
                 if name_ok and hex_ok is not False:
                     continue  # matches by name, and nothing contradicts it by color — silent pass
@@ -5750,12 +5834,11 @@ def _check_print_specs(pdf_path: str, brand_config: dict = None,
                 if name_ok and hex_ok is False:
                     # The expensive case: correctly labeled, wrong ink. A designer
                     # copying a swatch's name without re-picking its color lands here.
-                    _computed_note = f' (computed from the artwork: {computed_hex})' if computed_hex else ''
                     issues.append({'severity': 'critical', 'message': (
-                        f'Spot color "{req}" — the separation name matches, but the rendered color'
-                        f'{_computed_note} does not match the spec sheet\'s hex ({req_hex}). The '
-                        'artwork may be built in the wrong color despite the correct label. Verify '
-                        'color setup with your designer before going to press.')})
+                        f'Spot color "{req}" — the separation name matches, but the rendered color '
+                        f'does not match the spec sheet\'s hex ({req_hex}). The artwork may be built '
+                        'in the wrong color despite the correct label. Verify color setup with your '
+                        'designer before going to press.')})
                 elif not name_ok and hex_ok is True:
                     # The rendered color is right; only the NAME on the spec sheet is
                     # wrong. Say so plainly and point at the master list, not the designer —
