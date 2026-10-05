@@ -21,6 +21,14 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+# Tesseract's OpenMP build starts one thread per core per process. Files are
+# proofed concurrently (_BATCH_WORKERS), so two or more Tesseract processes at
+# once oversubscribe the CPU so badly that every OCR pass hits its 90s timeout
+# — measured on the real pancake layflats: 2-8s per pass alone, 90s timeouts on
+# every pass with just two files in parallel. One thread per process restores
+# 2-13s passes under the same concurrency. Inherited by every subprocess.
+os.environ.setdefault('OMP_THREAD_LIMIT', '1')
+
 try:
     from PIL import Image
     PIL_AVAILABLE = True
@@ -1323,6 +1331,17 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
     # Replaces the old PSM 3 full-page pass. PSM 3 interleaved columns and
     # cut off the bottom of the ingredient column ("Contains: Milk" was lost).
     # PSM 6 (uniform block) on each half reads each column independently.
+    # Every OCR pass that fails is recorded on the result, not swallowed: a
+    # Tesseract timeout used to leave that pass's text empty with no trace, so
+    # a file proofed on no OCR at all looked exactly like a file whose OCR
+    # simply found nothing.
+    ocr_failures = []
+
+    def _ocr_failed(label, exc):
+        msg = f'{label}: {type(exc).__name__}: {str(exc)[:120]}'
+        ocr_failures.append(msg)
+        print(f'[ocr] {fname} pass failed — {msg}')
+
     ocr_left = ocr_right = ''
     if PIL_AVAILABLE:
         try:
@@ -1344,8 +1363,8 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
                 capture_output=True, text=True, timeout=90,
             )
             ocr_right = _rr.stdout
-        except Exception:
-            pass
+        except Exception as _e:
+            _ocr_failed('psm6 halves', _e)
 
     # If the cheap reads (native text + PSM 6 columns) already show this is an
     # outlined press-ready file — no nutrition anchors — the 4 remaining Tesseract
@@ -1366,8 +1385,8 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
                 capture_output=True, text=True, timeout=90,
             )
             ocr_sparse = r2.stdout
-        except Exception:
-            pass
+        except Exception as _e:
+            _ocr_failed('psm11 sparse', _e)
 
     # ── OCR: inverted halves — catches white text on colored backgrounds ────────
     # ProDough badge callouts (e.g. "117 Calories", "25G Protein") use white
@@ -1385,8 +1404,8 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
                 capture_output=True, text=True, timeout=90,
             )
             ocr_inv_left = _ri.stdout
-        except Exception:
-            pass
+        except Exception as _e:
+            _ocr_failed('inverted left', _e)
         try:
             _inv_right = _ImageOps.invert(_right_img.convert('RGB'))
             _inv_right_path = img_prefix + '_ocr_inv_right.png'
@@ -1396,8 +1415,8 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
                 capture_output=True, text=True, timeout=90,
             )
             ocr_inv_right = _rr2.stdout
-        except Exception:
-            pass
+        except Exception as _e:
+            _ocr_failed('inverted right', _e)
 
     # ── OCR: binary threshold — gives Tesseract the cleanest possible input ───
     # Adaptive thresholding converts the image to pure B&W which Tesseract reads
@@ -1414,8 +1433,8 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
                 capture_output=True, text=True, timeout=90,
             )
             ocr_binary = _rb.stdout
-        except Exception:
-            pass
+        except Exception as _e:
+            _ocr_failed('binary', _e)
 
     # Barcode + spec match up front: the net-weight reconciliation is the flagship
     # check and must NOT ride on a flaky Tesseract-only serving read. When a fill
@@ -1788,6 +1807,7 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
         'panel_values': _panel_values,
         'panel_provenance': _panel_provenance,
         'panel_page_regex': dict(_panel.get('_page_regex') or {}),
+        'ocr_failures': ocr_failures,
         'error': None,
         'matched_spec': matched_spec,
         'snapshot': _snapshot,
