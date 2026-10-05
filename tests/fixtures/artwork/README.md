@@ -1,25 +1,38 @@
-# Artwork fixtures for `tests/test_end_to_end.py`
+# End-to-end artwork fixtures
 
-Real press PDFs, run through the real pipeline — no mocks, no pre-extracted
-values, no synthetic images. The harness scores every run: defects caught out
-of defects planted, and false positives on the clean files.
+Four real ProDough converter files, as sent by the printer, plus the reference data to
+proof them against. These are the exact files from run `9ffb350f`.
 
-**This folder ships without the PDFs** (they are not in the repo yet). Drop in:
+## Files
 
-| File | What it is |
-|---|---|
-| `pancake_buttermilk_clean.pdf` | verified-correct press file — serving 93g, about 5 servings |
-| `pancake_chocolate_clean.pdf` | verified-correct — 83g, about 5 |
-| `pancake_cinnamon_swirl_clean.pdf` | verified-correct — 88g, about 5 |
-| `pancake_pumpkin_clean.pdf` | verified-correct — 88g, about 5 |
-| `DEFECT_gtin_wrong.pdf` | a clean file with the barcode GTIN changed |
-| `DEFECT_netweight_overstated.pdf` | a clean file with the declared net weight raised above the fill |
-| `DEFECT_spot_color_off.pdf` | a clean file with one spot-color separation rebuilt in a visibly different color |
-| `DEFECT_allergen_missing.pdf` | a clean file with the `Contains:` line removed |
-| `DEFECT_serving_size_mismatch.pdf` | a clean file whose serving size disagrees with the approved panel |
+| File | SKU | GTIN |
+|---|---|---|
+| `86974_PD_pancake_buttermilk_26.10.02-ok.pdf` | PPM-BM | 850030869746 |
+| `72614_PD_pancake_chocolate_26.10.02-ok.pdf` | PPM-C | 850046726149 |
+| `72600_PD_pancake_cinnamon_swirl_26.10.02-ok.pdf` | PPM-CS | 850046726002 |
+| `72603_PD_pancake_pumpkin_26.10.02-ok.pdf` | PPM-PS | 850046726033 |
 
-Then fill every `FILL_ME` in `master_list.json` from the ReadyDoc `master.csv`
-rows for these four SKUs (GTIN, SKU, spot-color names and hexes). The harness
-refuses to score while any `FILL_ME` remains, and skips loudly (exit 0) when the
-PDFs or the PDF toolchain are absent. Set `ARTPROOF_E2E_REQUIRED=1` in CI to
-turn those skips into failures.
+- `master_rows.csv` — the real master-list rows for these four SKUs. Replaces the
+  `FILL_ME` template. Stub the master-list fetch from this file so a network failure
+  cannot turn the suite green.
+- `expected.json` — expected output per clean file. All four must come back `CLEAN`
+  with zero findings.
+- `defects.json` — seven scenarios, six of which must produce exactly one CRITICAL.
+
+## Why there are no `DEFECT_*.pdf` files
+
+**All label copy in these files is converted to outlines.** `pdftotext` returns ~12,000
+characters per file and not one of them is label copy — it is the die template layer
+("10\"", "254 mm", "Front"). There is no text to edit, and re-typesetting a press file
+would produce a fixture that no longer behaves like the real thing.
+
+So defects are planted in the **reference data** instead. A mutated master row or
+approved-panel record exercises the full pipeline — rasterize, locate the panel, read it,
+compare, report — and is exactly reproducible with no binary editing. The only defect
+class this cannot cover is one that lives purely inside the artwork with no external
+counterpart, and there is no such check in the suite.
+
+## One negative control
+
+`DEFECT_spot_color_within_tolerance` must produce **zero** findings. Without it, the suite
+can be satisfied by widening tolerances until nothing fails. Keep it.

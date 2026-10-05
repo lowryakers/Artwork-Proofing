@@ -1,0 +1,111 @@
+{
+  "note": "Defects are planted by MUTATING REFERENCE DATA, not by editing the PDFs. All ProDough label copy is converted to outlines \u2014 there is no live text to edit, and re-typesetting a press file would produce a fixture that is no longer representative. Mutating the master row or the approved-panel record exercises the full pipeline (rasterize -> locate panel -> read -> compare -> report) and is exactly reproducible.",
+  "base_artwork": "the four clean files in this directory, unmodified",
+  "defects": [
+    {
+      "id": "DEFECT_gtin_wrong",
+      "sku": "PPM-C",
+      "mutate": {
+        "master_row": {
+          "GTIN": "850046726150"
+        }
+      },
+      "expect": {
+        "critical_count": 1,
+        "check": "gtin",
+        "message_contains": "does not match"
+      },
+      "why": "Artwork barcode encodes 850046726149. One digit changed in the master row."
+    },
+    {
+      "id": "DEFECT_netweight_overstated",
+      "sku": "PPM-C",
+      "mutate": {
+        "master_row": {
+          "Fill weight (g)": "340"
+        }
+      },
+      "expect": {
+        "critical_count": 1,
+        "check": "net_weight",
+        "message_contains": "overstated"
+      },
+      "why": "Declared 454g against a 340g fill. Check A must fire. This is the class of miss that drove the net-weight work in the first place."
+    },
+    {
+      "id": "DEFECT_spot_color_off",
+      "sku": "PPM-PS",
+      "mutate": {
+        "master_row": {
+          "Hex spot colors": "HEX EE7623 | HEX C25131 | HEX 8A2BE2"
+        }
+      },
+      "expect": {
+        "critical_count": 1,
+        "check": "spot_color",
+        "message_contains": "PMS 7506 C"
+      },
+      "why": "PMS 7506 C spec replaced with a violet far outside any tolerance. Guards against the tolerance being widened until nothing can fail."
+    },
+    {
+      "id": "DEFECT_spot_color_within_tolerance",
+      "sku": "PPM-PS",
+      "mutate": {
+        "master_row": {
+          "Hex spot colors": "HEX EE7624 | HEX C25132 | HEX F2DAB4"
+        }
+      },
+      "expect": {
+        "critical_count": 0,
+        "warning_count": 0
+      },
+      "why": "NEGATIVE CONTROL. Every channel within 2 of spec. Must pass silently. This is the false-CRITICAL regression from run 66dc8e69."
+    },
+    {
+      "id": "DEFECT_approved_panel_serving_mismatch",
+      "sku": "PPM-CS",
+      "mutate": {
+        "approved_panel": {
+          "serving_size_g": 75,
+          "servings_per_container": 6
+        }
+      },
+      "expect": {
+        "critical_count": 1,
+        "check": "approved_panel",
+        "message_contains": "serving"
+      },
+      "why": "Artwork reads 88g / about 5. The approved panel of record says otherwise. Exercises the comparison against a source of truth outside the artwork."
+    },
+    {
+      "id": "DEFECT_allergen_missing",
+      "sku": "PPM-BM",
+      "mutate": {
+        "approved_panel": {
+          "allergens": [
+            "Milk",
+            "Wheat"
+          ]
+        }
+      },
+      "expect": {
+        "critical_count": 1,
+        "check": "fda_falcpa",
+        "message_contains": "wheat"
+      },
+      "why": "Approved record declares Wheat; the artwork's Contains: line does not. A missing FALCPA allergen is the highest-consequence defect this tool exists to catch, so it needs a test that can actually fail."
+    },
+    {
+      "id": "DEFECT_master_list_unavailable",
+      "sku": "ALL",
+      "mutate": {
+        "master_list": "simulate HTTP 502 after all retries"
+      },
+      "expect": {
+        "overall_status": "INCOMPLETE",
+        "must_not_contain_status": "CLEAN"
+      },
+      "why": "Reproduces run 9ffb350f. No file may be reported CLEAN, and the serving sizes must still read correctly \u2014 the reader must not depend on the master list. This is the regression test for the whole reader-provenance change."
+    }
+  ]
+}

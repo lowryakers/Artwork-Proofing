@@ -278,11 +278,17 @@ def _fetch_sheet_rows(csv_url: str) -> list:
     """Download and parse the Master SKU Google Sheet CSV.
     Returns unified rows used for both GTIN checking and spec validation.
     """
-    import csv as _csv
     req = urllib.request.Request(csv_url, headers={'User-Agent': 'Mozilla/5.0'})
     with urllib.request.urlopen(req, timeout=15) as resp:
         content = resp.read().decode('utf-8-sig')
+    return _parse_master_csv(content)
 
+
+def _parse_master_csv(content: str) -> list:
+    """Validate and parse a master-list CSV body into unified rows. Split from
+    the download so a test can stub the fetch with a local file and still run
+    the exact parser production uses."""
+    import csv as _csv
     # A 200 response is not proof of a good feed. The master feed has answered
     # "Not authenticated" (a plain-text 200, no HTTP error) and served login HTML;
     # parsing either yields zero rows with no exception, so a broken feed looked
@@ -1105,7 +1111,9 @@ def _generate_report(job: dict, brand_name: str = 'ProDough') -> io.BytesIO:
     wsp['A2'].alignment = wrap
     wsp.merge_cells('A2:H2')
     wsp.row_dimensions[2].height = 45
-    _hdrs = ['File'] + [f'{k}' for k in _PROV_FIELDS] + ['page_regex candidates (unused)']
+    _FRONT_FIELDS = ('declared_net_weight_g', 'unit_count')
+    _hdrs = (['File'] + [f'{k} (front panel)' if k in _FRONT_FIELDS else k for k in _PROV_FIELDS]
+             + ['page_regex candidates (unused)'])
     for col, hdr in enumerate(_hdrs, 1):
         c = wsp.cell(row=4, column=col, value=hdr)
         c.font = hdr_font

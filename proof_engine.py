@@ -621,37 +621,38 @@ _SERVINGS_PER_RE = (
 )
 
 
-def _text_parse_is_panel_scoped(pre_claude_text: str) -> bool:
-    """Can the whole-page text parse stand in for a panel-scoped read? Only when
-    the anchored serving-size line and the servings-per-container line each
-    match exactly once — one panel, one answer, no second column to be read
-    from. Anything else (no match, or competing matches from a superseded
-    panel or a neighbouring column) means the panel fields must come from the
-    isolated, geometrically-located crop, so the caller escalates to vision.
-    Pure function so the gate is unit-testable."""
-    tl = _normalize_fractions((pre_claude_text or '').lower())
-    servings = [m for rx in _SERVINGS_PER_RE for m in rx.finditer(tl)]
-    serving_lines = _SERVING_LINE_RE.findall(tl)
-    return len(serving_lines) == 1 and len({m.group(1) for m in servings}) == 1
+def _expects_nutrition_panel(brand_config: dict) -> bool:
+    """Does this file carry a Nutrition or Supplement Facts panel? Every
+    ProDough SKU does, and so does every food/supplement label a Brand Proof
+    run handles, so the answer is yes unless a caller explicitly says the file
+    has no panel (brand_config['has_nutrition_panel'] = False — e.g. a shipper
+    or a die template)."""
+    return (brand_config or {}).get('has_nutrition_panel', True) is not False
 
 
-def _should_run_vision(pre_claude_text: str, front_ocr: str, fname: str) -> bool:
-    """Decide whether to escalate to Claude Vision. Run it when ANY compliance
-    read is incomplete from Tesseract, OR when the panel fields did not come
-    from a panel-scoped read — regardless of what the master list returned.
+def _should_run_vision(pre_claude_text: str, front_ocr: str, fname: str,
+                       expects_panel: bool = True) -> bool:
+    """Decide whether to escalate to Claude Vision. A panel-bearing file always
+    goes to vision: the isolated, geometrically-located panel crop is the ONLY
+    reader allowed to supply panel fields, so there is exactly one reader path.
 
     This gate used to escalate on "a fill weight is on file" / "an approved
     panel is on file". Both are CONSUMERS of the panel read, not evidence about
     whether the panel is legible — so a master-list 502 (fill weight None,
-    panels not yet filed) switched the geometric panel reader off, and the
-    whole-page regex silently supplied wrong serving sizes to every check
-    (run 9ffb350f). A failed dependency must never downgrade the reader.
+    panels not yet filed) switched the panel reader off and a whole-page regex
+    silently supplied 65g / 43g / 7 servings to every check (run 9ffb350f). On
+    the real ProDough corpus the panel is outlined, small on a 254mm layflat
+    and reverse-printed on clear film: neither pdftotext nor full-page
+    Tesseract finds the words "serving size" at all, so there is no working
+    page read to preserve. A file with no panel still escalates when a
+    non-panel compliance read (allergens, eyemark) is incomplete.
     Pure function so the gate is unit-testable."""
+    if expects_panel:
+        return True
     return bool(
-        _ocr_needs_vision(pre_claude_text, front_text=front_ocr)          # nutrition missing
+        _ocr_needs_vision(pre_claude_text, front_text=front_ocr)          # front callouts missing
         or _is_film_rollstock(fname, pre_claude_text)                     # eyemark read
         or not re.search(r'\bcontains?\s*:', pre_claude_text.lower())     # FALCPA line missing
-        or not _text_parse_is_panel_scoped(pre_claude_text)               # panel fields need the crop
     )
 
 
@@ -1457,22 +1458,14 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
         ocr_inv_left + '\n' + ocr_inv_right + '\n' + ocr_binary
     )
     _front_ocr = ocr_left + '\n' + ocr_inv_left + '\n' + ocr_inv_right
-    # Decide whether to escalate to Claude Vision. Run it when ANY of the three
-    # compliance reads is incomplete from Tesseract — not just nutrition:
-    #   • nutrition values missing (front callout / NFP)               → Check 2
-    #   • the FALCPA "Contains:" allergen line didn't OCR              → Check 5
-    #   • film/stick art (eyemark square unreadable by pixel scan)     → Check 3
-    # Using _is_film_rollstock (not a narrower regex) keeps the eyemark trigger in
-    # lockstep with the check that actually consumes it, so legitimate film files
-    # (flowwrap, sleeve, OCR-identified) always get the vision eyemark read.
-    #   • a fill weight is on file (net-weight reconciliation will run and needs a
-    #     RELIABLE serving/servings read — never trust Tesseract alone for a verdict)
-    #   • an approved nutrition panel is on file (exact-match diff, same reasoning)
-    _run_vision = _should_run_vision(_pre_claude_text, _front_ocr, fname)
+    # Every panel-bearing file goes to vision — the isolated panel crop is the
+    # only reader allowed to supply panel fields (see _should_run_vision).
+    _run_vision = _should_run_vision(_pre_claude_text, _front_ocr, fname,
+                                     expects_panel=_expects_nutrition_panel(brand_config))
     if not ANTHROPIC_AVAILABLE:
         _vision_diag = 'vision: skipped — ANTHROPIC_API_KEY not set / anthropic not installed'
     elif not _run_vision:
-        _vision_diag = 'vision: not needed — Tesseract read nutrition, allergens, and (n/a) eyemark'
+        _vision_diag = 'vision: not needed — no nutrition panel expected; Tesseract read allergens and (n/a) eyemark'
     else:
         _vision = _claude_vision_ocr(img_path)
         ocr_claude = _vision.get('raw_text', '')
@@ -1714,6 +1707,13 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
     # Inject spec GTIN so the UI can show detected-vs-spec comparison
     if matched_spec:
         checks['gtin']['spec_gtin'] = str(matched_spec.get('gtin', '')).strip()
+        _check_gtin_vs_spec_row(checks['gtin'], matched_spec)
+
+    # FALCPA vs the approved record: an allergen the approved panel of record
+    # declares must appear in the artwork's own "Contains:" line.
+    if 'fda' in checks and isinstance(checks['fda'], dict):
+        checks['fda'].setdefault('issues', []).extend(_check_contains_vs_approved(
+            (vision_allergens or {}).get('contains_statement'), _approved_panel, label_text))
 
     # A SUSPECT READ anywhere on this file means its extraction is doubted —
     # a confident CRITICAL from a different value-comparison check on the same
@@ -1935,7 +1935,34 @@ def _check_gtin(ocr_text: str, fname: str, gtin_rows: list,
                     'message': f'GTIN {gtin} was not found in the uploaded master list. Verify it belongs to this SKU.',
                 })
 
+    if found and not gtin_rows:
+        # A decoded barcode with nothing to verify it against is a read, not a
+        # check. Run 9ffb350f lost its master list to a 502 and every file
+        # still "passed" GTIN; with no master list the check did not run.
+        notes.append('NOT RUN — no master list rows were available, so the decoded GTIN '
+                     'could not be verified against the SKU it belongs to.')
+        return {'found_gtins': found, 'issues': issues, 'notes': notes, 'status': 'NOT_RUN'}
     return {'found_gtins': found, 'issues': issues, 'notes': notes}
+
+
+def _check_gtin_vs_spec_row(gtin_check: dict, matched_spec: dict) -> None:
+    """The artwork was matched to its master row by FILENAME (the barcode did
+    not match any row's GTIN) — so the row's GTIN is the one this artwork is
+    supposed to carry. A decoded barcode that differs from it is the wrong
+    barcode on the right artwork: the most expensive GTIN failure there is, and
+    it used to read as a mild "not found in the master list" warning. Upgrades
+    that warning to a CRITICAL naming both numbers, in place."""
+    spec_gtin = str((matched_spec or {}).get('gtin', '')).strip()
+    found = [str(g).strip() for g in (gtin_check or {}).get('found_gtins') or []]
+    if not spec_gtin or not found or spec_gtin in found:
+        return
+    sku = (matched_spec or {}).get('sku') or (matched_spec or {}).get('flavor') or 'this SKU'
+    kept = [i for i in gtin_check.get('issues', [])
+            if 'was not found in the uploaded master list' not in i.get('message', '')]
+    kept.append({'severity': 'critical', 'message': (
+        f'Barcode GTIN {", ".join(found)} does not match the master list GTIN {spec_gtin} for '
+        f'{sku}. The artwork carries the wrong barcode — correct it before printing.')})
+    gtin_check['issues'] = kept
 
 
 # ── Check 2: Front call-outs vs NFP ──────────────────────────────────────────
@@ -2198,7 +2225,13 @@ def _check_nfp(ocr_text: str, front_text: str = '', vision_nutrition: dict = Non
             'zero_sugar': nfp_zero_sugar,
         },
         'issues': issues,
-        'notes': notes,
+        'notes': notes + ([
+            'NOT RUN — no calorie or protein value was read from either the front call-outs or '
+            'the Nutrition Facts panel, so there was nothing to compare.']
+            if not (front_calories or front_proteins or nfp_calories or nfp_proteins) else []),
+        # Zero findings from a comparison that compared nothing is not a pass.
+        'status': ('NOT_RUN' if not (front_calories or front_proteins or nfp_calories or nfp_proteins)
+                   else 'OK'),
     }
 
 
@@ -2466,7 +2499,24 @@ def _check_net_weight(panel: dict, fill_weight_g=None, fname: str = '',
 
     # ── Check C — panel reconciles to fill (±5%, absorbs the rounding artifact)
     _fda_rounding_handled = False
-    if verified and implied is not None and not _within(implied, fill):
+    # When Check A already reported the declared net weight as OVERSTATED and
+    # the panel reconciles to that declared weight (within 5%, or within the
+    # FDA servings-per-container rounding of it), the panel is consistent with
+    # the label — the one error is the declared weight vs the fill, already
+    # reported. A second CRITICAL for the same fact would double-count it.
+    _overstated = verified and dnw is not None and dnw - fill >= 0.5
+    _panel_matches_declared = bool(
+        _overstated and implied is not None and ss
+        and (_within(implied, dnw)
+             or (spc is not None and _fda_round_servings(dnw / ss) is not None
+                 and abs(_fda_round_servings(dnw / ss) - spc) < 0.01)))
+    if _panel_matches_declared and not _within(implied, fill):
+        notes.append(
+            f'Serving × servings ({_g(ss)} × {_g(spc)} = {_g(implied)}g) is consistent with the '
+            f'declared {_g(dnw)}g, so the panel itself is not the error — the overstated declared net '
+            f'weight vs the {_g(fill)}g fill (reported above) is. Correcting the net weight will also '
+            'require re-checking servings per container.')
+    elif verified and implied is not None and not _within(implied, fill):
         # A declared servings-per-container figure is itself rounded per 21
         # CFR 101.9(b)(8) ("About N servings") -- net ÷ serving routinely does
         # not land on that rounded whole/half number even on a correctly
@@ -3255,6 +3305,7 @@ def _diff_panel_fields(artwork: dict, approved_panel: dict, version) -> tuple:
     artwork = artwork or {}
     approved_panel = approved_panel or {}
 
+    serving_diff = {}
     for a_key, p_key, label, unit in _PANEL_AMOUNT_FIELDS:
         p_val = approved_panel.get(p_key)
         if p_val is None:
@@ -3264,9 +3315,28 @@ def _diff_panel_fields(artwork: dict, approved_panel: dict, version) -> tuple:
             gaps.append((label, p_val))
             continue
         if not _amounts_equal(a_val, p_val):
+            if a_key in ('serving_size_g', 'servings_per_container'):
+                serving_diff[a_key] = (a_val, p_val)
+                continue
             issues.append({'severity': 'critical', 'message': (
                 f'{label}: artwork reads {_fmt_amt(a_val)}{unit}, '
                 f'approved panel v{version} says {_fmt_amt(p_val)}{unit}')})
+    # Serving size and servings per container are one declaration: when both
+    # disagree they are the same error (the panel was built for a different
+    # serving), so report it once, both figures side by side.
+    if len(serving_diff) == 2:
+        (a_ss, p_ss), (a_spc, p_spc) = serving_diff['serving_size_g'], serving_diff['servings_per_container']
+        issues.insert(0, {'severity': 'critical', 'message': (
+            f'Serving declaration: artwork reads {_fmt_amt(a_ss)}g, {_fmt_amt(a_spc)} servings per '
+            f'container; approved panel v{version} says {_fmt_amt(p_ss)}g, {_fmt_amt(p_spc)} servings '
+            'per container')})
+    elif serving_diff:
+        (key, (a_val, p_val)), = serving_diff.items()
+        label, unit = (('Serving size', 'g') if key == 'serving_size_g'
+                       else ('Servings per container', ''))
+        issues.insert(0, {'severity': 'critical', 'message': (
+            f'{label}: artwork reads {_fmt_amt(a_val)}{unit}, '
+            f'approved panel v{version} says {_fmt_amt(p_val)}{unit}')})
 
     for a_amt_key, p_amt_key, a_dv_key, p_dv_key, label, unit in _PANEL_DV_GROUPS:
         p_amt, p_dv = approved_panel.get(p_amt_key), approved_panel.get(p_dv_key)
@@ -4375,6 +4445,79 @@ def _ocr_needs_vision(combined_text: str, front_text: str = '') -> bool:
     front_cal  = re.search(r'\b\d{2,3}\b[^a-z0-9]{0,12}cal(?:ories?)?', fl)
     front_prot = re.search(r'\b\d{1,2}\s*g?\b[^a-z0-9]{0,12}protein', fl)
     return not (nfp_cal and nfp_prot and front_cal and front_prot)
+
+
+# FALCPA major allergens (incl. sesame, FASTER Act) -> the words that declare
+# each one in a "Contains:" line.
+_FALCPA_SYNONYMS = {
+    'milk': ('milk', 'dairy', 'whey', 'casein'),
+    'egg': ('egg',),
+    'wheat': ('wheat',),
+    'soy': ('soy',),
+    'peanut': ('peanut',),
+    'tree nut': ('tree nut', 'almond', 'cashew', 'walnut', 'pecan', 'hazelnut', 'pistachio',
+                 'macadamia', 'coconut'),
+    'fish': ('fish',),
+    'shellfish': ('shellfish', 'crustacean', 'shrimp', 'crab', 'lobster'),
+    'sesame': ('sesame',),
+}
+
+
+def _canonical_allergen(name: str):
+    n = (name or '').strip().lower()
+    for canon, words in _FALCPA_SYNONYMS.items():
+        if any(w in n for w in words):
+            return canon
+    return None
+
+
+def _approved_allergens(approved: dict) -> list:
+    """The FALCPA allergens the approved panel of record declares, canonical
+    names, in order. Accepts a list (panel['allergens']) or the record's
+    allergen_statement text."""
+    if not approved:
+        return []
+    panel = approved.get('panel') or {}
+    raw = panel.get('allergens') or approved.get('allergens')
+    if isinstance(raw, str):
+        raw = re.split(r'[,;/&]|\band\b', re.sub(r'(?i)^\s*contains\s*:?', '', raw))
+    if not raw:
+        stmt = panel.get('allergen_statement') or ''
+        raw = re.split(r'[,;/&]|\band\b', re.sub(r'(?i)^\s*contains\s*:?', '', stmt)) if stmt else []
+    out = []
+    for item in raw or []:
+        c = _canonical_allergen(str(item))
+        if c and c not in out:
+            out.append(c)
+    return out
+
+
+def _check_contains_vs_approved(contains_statement, approved: dict, label_text: str = '') -> list:
+    """Every allergen the APPROVED record declares must be declared in the
+    artwork's own "Contains:" line. A missing FALCPA allergen is the
+    highest-consequence defect this tool exists to catch, and the artwork can
+    be internally consistent (no wheat in its Contains line, no wheat it can
+    see in its ingredients) while the formula of record says otherwise — only
+    a source of truth outside the artwork catches that. Read the artwork side
+    from vision's structured Contains line, falling back to the label text."""
+    declared = _approved_allergens(approved)
+    if not declared:
+        return []
+    stmt = (contains_statement or '').strip()
+    if not stmt:
+        m = re.search(r'\bcontains\s*[:\-]?\s*([^\n.]{2,120})', (label_text or ''), re.I)
+        stmt = m.group(1).strip() if m else ''
+    if not stmt:
+        return [{'severity': 'review', 'message': (
+            'The approved record declares ' + ', '.join(a.title() for a in declared) + ', but no '
+            '"Contains:" line could be read from the artwork to verify it — check the allergen '
+            'declaration manually.')}]
+    on_artwork = {_canonical_allergen(p) for p in re.split(r'[,;/&]|\band\b', stmt)} - {None}
+    missing = [a for a in declared if a not in on_artwork]
+    return [{'severity': 'critical', 'message': (
+        f'Allergen missing from the "Contains:" line — the approved record declares {a.title()}, '
+        f'but the artwork reads "Contains: {stmt}". Every FALCPA allergen in the formula must be '
+        'declared on the label (21 U.S.C. 343(w)).')} for a in missing]
 
 
 def _check_fda(ocr_text: str, fname: str, vision_allergens: dict = None) -> dict:
@@ -5690,6 +5833,30 @@ def _extract_layer_rects(pdf_path: str, layer_name: str, page_number: int = 0) -
         return []
 
 
+# Laminate ply polymers, most specific first so "metpet" never reads as "pet".
+_PLY_POLYMERS = ('metpet', 'metbopp', 'bopp', 'opp', 'lldpe', 'ldpe', 'hdpe', 'cpp',
+                 'pet', 'pe', 'pp', 'foil', 'kraft', 'paper', 'nylon')
+
+
+def _substrate_layers(material: str) -> list:
+    """The ordered ply structure of a laminate description, e.g.
+    'Karess Soft Touch Matte PET / White 48ga METPET / 3.0mil Clear LLDPE' and
+    'PET / MET-PET / LLDPE - 4.5 mil' both -> ['pet', 'metpet', 'lldpe'].
+    Plies are split on '/', finishes, colors and gauges are dropped, 'MET-PET'
+    and 'metallized PET' normalize to 'metpet'. [] when any ply can't be read
+    — never guess a structure."""
+    s = (material or '').lower()
+    s = re.sub(r'met(?:alli[sz]ed)?[\s\-]*(pet|bopp)', r'met\1', s)
+    layers = []
+    for ply in s.split('/'):
+        words = re.findall(r'[a-z]+', ply)
+        poly = next((p for p in _PLY_POLYMERS if p in words), None)
+        if poly is None:
+            return []
+        layers.append(poly)
+    return layers
+
+
 def _check_print_specs(pdf_path: str, brand_config: dict = None,
                        matched_spec: dict = None, template: dict = None,
                        img_path: str = None) -> dict:
@@ -6049,10 +6216,19 @@ def _check_print_specs(pdf_path: str, brand_config: dict = None,
             # a material string split across two PDF text lines still matches the spec value.
             _norm = lambda s: re.sub(r'\s+', ' ', s).strip()
             if req_mat and _norm(req_mat).lower() not in _norm(material_found).lower():
-                issues.append({'severity': 'warning',
-                               'message': f'Material mismatch — file specifies "{material_found}", '
-                                          f'but spec requires "{req_mat}". '
-                                          'Confirm substrate with your print supplier before going to press.'})
+                _req_layers, _file_layers = _substrate_layers(req_mat), _substrate_layers(material_found)
+                if _req_layers and _req_layers == _file_layers:
+                    # Same laminate structure, described two ways — the master list
+                    # names each ply with its grade/finish ("Karess Soft Touch Matte
+                    # PET / White 48ga METPET / 3.0mil Clear LLDPE"), a converter
+                    # sidebar abbreviates it ("PET / MET-PET / LLDPE - 4.5 mil").
+                    notes.append(f'Material structure matches the spec ({" / ".join(_req_layers)}); '
+                                 'the file abbreviates ply grades and finishes.')
+                else:
+                    issues.append({'severity': 'warning',
+                                   'message': f'Material mismatch — file specifies "{material_found}", '
+                                              f'but spec requires "{req_mat}". '
+                                              'Confirm substrate with your print supplier before going to press.'})
         else:
             if proof_type == 'art':
                 notes.append('Material type: not detected (art proof — no finishing panel expected).')
