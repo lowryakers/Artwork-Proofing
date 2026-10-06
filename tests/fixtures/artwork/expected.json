@@ -1,0 +1,93 @@
+{
+  "note": "Expected output per clean artwork file. Verified against the Nutrition Facts panel PDFs issued by the formulator (F-00060/F-00010/F-00061/F-00002, No-Erythritol generation) and against the artwork itself.",
+  "files": [
+    {
+      "file": "86974_PD_pancake_buttermilk_26.10.02-ok.pdf",
+      "sku": "PPM-BM",
+      "gtin": "850030869746",
+      "expect": {
+        "serving_size_g": 93.0,
+        "serving_size_cups": 0.75,
+        "servings_per_container": 5.0,
+        "declared_net_weight_g": 454.0,
+        "fill_weight_g": 454.0,
+        "serving_size_desc": "3/4 Cup (93g)",
+        "spot_colors": [
+          "PMS 638 C",
+          "PMS 304 C",
+          "PMS 9224 U"
+        ],
+        "overall_status": "CLEAN",
+        "critical_count": 0,
+        "warning_count": 0,
+        "panel_field_source": "nfp_crop"
+      }
+    },
+    {
+      "file": "72614_PD_pancake_chocolate_26.10.02-ok.pdf",
+      "sku": "PPM-C",
+      "gtin": "850046726149",
+      "expect": {
+        "serving_size_g": 83.0,
+        "serving_size_cups": 0.75,
+        "servings_per_container": 5.0,
+        "declared_net_weight_g": 454.0,
+        "fill_weight_g": 454.0,
+        "serving_size_desc": "3/4 Cup (83g)",
+        "spot_colors": [
+          "PMS 4625 C",
+          "PMS 470 C",
+          "PMS 475 C"
+        ],
+        "overall_status": "CLEAN",
+        "critical_count": 0,
+        "warning_count": 0,
+        "panel_field_source": "nfp_crop"
+      }
+    },
+    {
+      "file": "72600_PD_pancake_cinnamon_swirl_26.10.02-ok.pdf",
+      "sku": "PPM-CS",
+      "gtin": "850046726002",
+      "expect": {
+        "serving_size_g": 88.0,
+        "serving_size_cups": 0.75,
+        "servings_per_container": 5.0,
+        "declared_net_weight_g": 454.0,
+        "fill_weight_g": 454.0,
+        "serving_size_desc": "3/4 Cup (88g)",
+        "spot_colors": [
+          "PMS 7608 C",
+          "PMS 1565 C",
+          "PMS 9184 C"
+        ],
+        "overall_status": "CLEAN",
+        "critical_count": 0,
+        "warning_count": 0,
+        "panel_field_source": "nfp_crop"
+      }
+    },
+    {
+      "file": "72603_PD_pancake_pumpkin_26.10.02-ok.pdf",
+      "sku": "PPM-PS",
+      "gtin": "850046726033",
+      "expect": {
+        "serving_size_g": 88.0,
+        "serving_size_cups": 0.75,
+        "servings_per_container": 5.0,
+        "declared_net_weight_g": 454.0,
+        "fill_weight_g": 454.0,
+        "serving_size_desc": "3/4 Cup (88g)",
+        "spot_colors": [
+          "PMS 158 C",
+          "PMS 7580 C",
+          "PMS 7506 C"
+        ],
+        "overall_status": "CLEAN",
+        "critical_count": 0,
+        "warning_count": 0,
+        "panel_field_source": "nfp_crop"
+      }
+    }
+  ]
+}

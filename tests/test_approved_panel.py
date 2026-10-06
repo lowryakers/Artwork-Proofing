@@ -215,20 +215,48 @@ def _run():
 
     # ── Vision gate: no longer keyed to whether an approved panel is on file.
     # The approved-panel comparison is a CONSUMER of the panel read, not
-    # evidence about whether the panel is legible (run 9ffb350f). The gate now
-    # escalates whenever the whole-page text is not panel-scoped — which is
-    # what guarantees the comparison a crop-sourced read either way.
+    # evidence about whether the panel is legible (run 9ffb350f): every
+    # panel-bearing file goes to vision.
     _orig = pe._ocr_needs_vision
     pe._ocr_needs_vision = lambda *a, **k: False
     try:
-        _unscoped = 'nutrition facts calories 130 protein 25 contains: milk'
-        check('gate: no panel-scoped serving line -> vision runs (approved panel irrelevant)',
-              pe._should_run_vision(_unscoped, '', 'x.pdf') is True)
-        _scoped = (_unscoped + '\nserving size 3/4 cup (88g)\nabout 5 servings per container')
-        check('gate: panel-scoped text + complete OCR -> vision skipped',
-              pe._should_run_vision(_scoped, '', 'x.pdf') is False)
+        _complete = ('nutrition facts calories 130 protein 25 contains: milk\n'
+                     'serving size 3/4 cup (88g)\nabout 5 servings per container')
+        check('gate: panel-bearing file -> vision runs (approved panel irrelevant)',
+              pe._should_run_vision(_complete, '', 'x.pdf') is True)
     finally:
         pe._ocr_needs_vision = _orig
+
+    # ── Serving size + servings per container are ONE declaration ───────────
+    r_sd = pe._check_approved_panel(
+        {'serving_size_g': 88, 'servings_per_container': 5}, {}, None, None,
+        {'version': 2, 'status': 'approved', 'panel': {'serving_size_g': 75, 'servings_per_container': 6}})
+    _c = [i for i in r_sd['issues'] if i['severity'] == 'critical']
+    check('both serving fields differ -> ONE CRITICAL naming both figures',
+          len(_c) == 1 and '88g' in _c[0]['message'] and '75g' in _c[0]['message']
+          and '6 servings' in _c[0]['message'])
+    r_sd1 = pe._check_approved_panel(
+        {'serving_size_g': 88, 'servings_per_container': 5}, {}, None, None,
+        {'version': 2, 'status': 'approved', 'panel': {'serving_size_g': 75, 'servings_per_container': 5}})
+    check('only serving size differs -> one CRITICAL for that field',
+          [i['message'] for i in r_sd1['issues'] if i['severity'] == 'critical']
+          == ['Serving size: artwork reads 88g, approved panel v2 says 75g'])
+
+    # ── FALCPA vs the approved record ────────────────────────────────────────
+    _rec = {'panel': {'allergens': ['Milk', 'Wheat']}}
+    _miss = pe._check_contains_vs_approved('Milk', _rec)
+    check('an approved allergen missing from Contains: -> CRITICAL naming it',
+          len(_miss) == 1 and _miss[0]['severity'] == 'critical' and 'Wheat' in _miss[0]['message'])
+    check('every approved allergen declared -> nothing',
+          pe._check_contains_vs_approved('Milk, Wheat, Egg', _rec) == [])
+    check('synonyms count (whey declares milk)',
+          pe._check_contains_vs_approved('Whey, Wheat', _rec) == [])
+    check('no approved allergens on record -> nothing to compare',
+          pe._check_contains_vs_approved('Milk', {'panel': {}}) == [])
+    check('unreadable Contains: line -> REVIEW, never a silent pass or a guessed CRITICAL',
+          [i['severity'] for i in pe._check_contains_vs_approved('', _rec, 'no declaration here')] == ['review'])
+    check('allergen_statement text on the record is understood too',
+          pe._approved_allergens({'panel': {'allergen_statement': 'Contains: Milk, Wheat'}}) == ['milk', 'wheat'])
 
     # ── unverified-status set includes the new panel statuses ─────────────────
     check('PANEL_MISSING counts as not-fully-verified', 'PANEL_MISSING' in pe._NOT_VERIFIED_STATUSES)

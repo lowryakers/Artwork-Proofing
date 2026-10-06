@@ -88,20 +88,30 @@ def _run():
     check('reconciling fill-weight PASS on vision-backed serving → PASS', r_vis['status'] == 'PASS')
 
     # The vision gate is no longer keyed to the fill weight (a consumer of the
-    # panel read, not evidence about it — run 9ffb350f). It escalates whenever
-    # the whole-page text is not panel-scoped, which is what guarantees the
-    # net-weight verdict a crop-sourced serving read regardless of the master list.
+    # panel read, not evidence about it — run 9ffb350f): every panel-bearing
+    # file goes to vision, master list or not.
     _orig = pe._ocr_needs_vision
     pe._ocr_needs_vision = lambda *a, **k: False   # pretend Tesseract read the nutrition
     try:
-        _unscoped = 'nutrition facts calories 130 protein 25 contains: milk'
-        check('gate: no panel-scoped serving line → vision runs',
-              pe._should_run_vision(_unscoped, '', 'PD_cupcake.pdf') is True)
-        _scoped = _unscoped + '\nserving size 4 cupcakes (63g)\nabout 6 servings per container'
-        check('gate: panel-scoped text + complete OCR → vision skipped',
-              pe._should_run_vision(_scoped, '', 'PD_cupcake.pdf') is False)
+        _complete = ('nutrition facts calories 130 protein 25 contains: milk\n'
+                     'serving size 4 cupcakes (63g)\nabout 6 servings per container')
+        check('gate: panel-bearing file → vision runs, no fill weight involved',
+              pe._should_run_vision(_complete, '', 'PD_cupcake.pdf') is True)
     finally:
         pe._ocr_needs_vision = _orig
+
+    # Check A already reported OVERSTATED and the panel reconciles to the
+    # declared weight → Check C does not double-count the same fact.
+    r_os = pe._check_net_weight({'serving_size_g': 83, 'servings_per_container': 5,
+                                 'declared_net_weight_g': 454}, fill_weight_g=340)
+    _crit = [i for i in r_os['issues'] if i['severity'] == 'critical']
+    check('overstated net weight with a self-consistent panel → exactly one CRITICAL',
+          len(_crit) == 1 and 'OVERSTATED' in _crit[0]['message'])
+    # …but a panel that does NOT reconcile to the declared weight still reports.
+    r_os2 = pe._check_net_weight({'serving_size_g': 98, 'servings_per_container': 7,
+                                  'declared_net_weight_g': 454}, fill_weight_g=340)
+    check('overstated net weight AND an inconsistent panel → both still reported',
+          sum(1 for i in r_os2['issues'] if i['severity'] == 'critical') == 2)
 
     # Single-serving stick pack: net weight == serving × 1 is correct by
     # definition, NOT a back-calculation — must not fire Check B.

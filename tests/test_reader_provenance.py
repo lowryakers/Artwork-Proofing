@@ -44,28 +44,29 @@ def _run():
     check('mixed-number cups parse ("1 1/2 cups (120g)")',
           pe._parse_panel_from_text('serving size 1 1/2 cups (120g)').get('serving_size_cups') == 1.5)
 
-    # ── 1a. The gate no longer depends on the master list ───────────────────
+    # ── 1a. Rule 2: every panel-bearing file goes to vision ────────────────
     _orig = pe._ocr_needs_vision
     pe._ocr_needs_vision = lambda *a, **k: False
     try:
-        unscoped = 'nutrition facts calories 130 protein 25 contains: milk serving size 65g'
-        check('_text_parse_is_panel_scoped is False with no anchored serving line',
-              pe._text_parse_is_panel_scoped(unscoped) is False)
-        check('gate escalates on an unscoped page even with NO fill weight and NO approved panel',
-              pe._should_run_vision(unscoped, '', 'PD_pancake.pdf') is True)
-        scoped = unscoped + '\nserving size 3/4 cup (88g)\nabout 5 servings per container'
-        check('_text_parse_is_panel_scoped is True with exactly one anchored line each',
-              pe._text_parse_is_panel_scoped(scoped) is True)
-        two_panels = scoped + '\nserving size 1/2 cup (65g)\nabout 7 servings per container'
-        check('two competing serving lines (a superseded panel) -> not scoped -> escalate',
-              pe._text_parse_is_panel_scoped(two_panels) is False
-              and pe._should_run_vision(two_panels, '', 'x.pdf') is True)
+        complete = ('nutrition facts calories 130 protein 25 contains: milk\n'
+                    'serving size 3/4 cup (88g)\nabout 5 servings per container')
+        check('a panel-bearing file goes to vision even when the page text looks complete',
+              pe._should_run_vision(complete, '', 'PD_pancake.pdf', expects_panel=True) is True)
+        check('a file with no panel and complete OCR skips vision',
+              pe._should_run_vision(complete, '', 'shipper.pdf', expects_panel=False) is False)
+        check('a file with no panel still escalates when the Contains: line is missing',
+              pe._should_run_vision('calories 130 protein 25', '', 'shipper.pdf',
+                                    expects_panel=False) is True)
     finally:
         pe._ocr_needs_vision = _orig
+    check('ProDough files expect a panel by default', pe._expects_nutrition_panel({'brand_mode': 'prodough'}))
+    check('an explicit has_nutrition_panel=False opts out',
+          not pe._expects_nutrition_panel({'has_nutrition_panel': False}))
     import inspect
-    check('_should_run_vision no longer takes fill_weight / has_approved_panel',
+    _src = inspect.getsource(pe._should_run_vision)
+    check('_should_run_vision no longer references fill_weight or has_approved_panel',
           'fill_weight' not in inspect.signature(pe._should_run_vision).parameters
-          and 'has_approved_panel' not in inspect.signature(pe._should_run_vision).parameters)
+          and 'has_approved_panel' not in _src)
 
     # ── 1b / 2. page_regex never supplies the three panel fields; provenance ──
     merged = pe._merge_panel(tp, {})
@@ -132,6 +133,38 @@ def _run():
                               'servings_per_container': 2.29, 'declared_net_weight_g': 454}, fill_weight_g=454)
     check('a clean 2x density misread (264 g/cup) is still SUSPECT',
           r['status'] == 'SUSPECT' and any('105–130' in i['message'] for i in r['issues']))
+
+    # ── GTIN: no master list = NOT RUN; wrong barcode on the right artwork = CRITICAL ──
+    g = pe._check_gtin('', 'PD_pancake_chocolate.pdf', [], scanned_gtins=['850046726149'])
+    check('a decoded GTIN with no master rows -> NOT_RUN, not a silent pass', g.get('status') == 'NOT_RUN')
+    rows = [{'gtin': '850046726150', 'flavor': 'chocolate protein pancake mix', 'sku': 'PPM-C'}]
+    g = pe._check_gtin('', 'PD_pancake_chocolate.pdf', rows, scanned_gtins=['850046726149'])
+    pe._check_gtin_vs_spec_row(g, rows[0])
+    crit = [i for i in g['issues'] if i['severity'] == 'critical']
+    check('barcode differs from the filename-matched row\'s GTIN -> one CRITICAL naming both',
+          len(crit) == 1 and 'does not match' in crit[0]['message']
+          and '850046726149' in crit[0]['message'] and '850046726150' in crit[0]['message'])
+    check('...and it replaces the vague "not found in the master list" warning',
+          not any('not found in the uploaded master list' in i['message'] for i in g['issues']))
+    g2 = pe._check_gtin('', 'PD_pancake_chocolate.pdf', [dict(rows[0], gtin='850046726149')],
+                        scanned_gtins=['850046726149'])
+    pe._check_gtin_vs_spec_row(g2, dict(rows[0], gtin='850046726149'))
+    check('barcode equals the row GTIN -> nothing', not g2['issues'])
+
+    # ── Material: same laminate structure described two ways is not a mismatch ──
+    check('master-list ply names and a converter abbreviation reduce to the same structure',
+          pe._substrate_layers('Karess Soft Touch Matte PET / White 48ga METPET / 3.0mil Clear LLDPE')
+          == pe._substrate_layers('PET / MET-PET / LLDPE - 4.5 mil') == ['pet', 'metpet', 'lldpe'])
+    check('a genuinely different structure differs',
+          pe._substrate_layers('PET / LLDPE') != pe._substrate_layers('PET / MET-PET / LLDPE'))
+    check('an unreadable ply never guesses a structure', pe._substrate_layers('Soft Touch / ???') == [])
+
+    # ── Front vs NFP: comparing nothing is NOT RUN ──────────────────────────
+    check('_check_nfp with no calorie/protein read on either side -> NOT_RUN',
+          pe._check_nfp('', '', None)['status'] == 'NOT_RUN')
+    check('_check_nfp with values read -> OK',
+          pe._check_nfp('', '', {'front_callout': {'calories': 230, 'protein_g': 19},
+                                 'nfp': {'calories': 230, 'protein_g': 19}})['status'] == 'OK')
 
     # ── 3c. Master-list fetch retries transient failures with backoff ───────
     _orig_fetch, _orig_sleep = A._fetch_sheet_rows, A.time.sleep
