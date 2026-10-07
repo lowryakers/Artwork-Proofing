@@ -75,8 +75,18 @@ def _run():
 
     # ── _check_print_specs end-to-end: the die box overrides the artboard ─────
     tpl = dt.get('prodough_bottle_shrink_sleeve')
-    result = pe._check_print_specs(_FIXTURE, brand_config={'proof_type': 'press'},
-                                   matched_spec={}, template=tpl)
+    # The trim-dimension comparison is disabled by default (CHECK_TRIM_DIMENSION);
+    # this exercises the die-box path it uses when switched back on.
+    _prev_trim = pe.CHECK_TRIM_DIMENSION
+    pe.CHECK_TRIM_DIMENSION = True
+    try:
+        result = pe._check_print_specs(_FIXTURE, brand_config={'proof_type': 'press'},
+                                       matched_spec={}, template=tpl)
+    finally:
+        pe.CHECK_TRIM_DIMENSION = _prev_trim
+    check('trim check disabled by default -> a note says so, no comparison is made',
+          any('DISABLED' in n for n in pe._check_print_specs(
+              _FIXTURE, brand_config={'proof_type': 'press'}, matched_spec={}, template=tpl)['notes']))
     check('no dimension-mismatch CRITICAL on the oversized converter-layout artboard',
           not any(i['severity'] == 'critical' and 'dimension' in i['message'].lower()
                  for i in result['issues']))

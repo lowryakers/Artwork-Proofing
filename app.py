@@ -51,6 +51,7 @@ CHECK_LABELS = {
     'claims':   'Claims Review',
     'wind':     'Wind Direction',
     'specs':    'Print Specs',
+    'item_reference': 'Converter Item Reference vs SKU',
 }
 
 
@@ -327,7 +328,13 @@ def _parse_master_csv(content: str) -> list:
         zipper   = _get('zipper')
         print_p  = _get('print', 'print process')
 
-        def _to_float(v):
+        # A spec value that is present but cannot be parsed must never vanish
+        # into None — downstream that reads exactly like "not on file", and a
+        # check that silently doesn't compare is a false pass. Record the raw
+        # value per field so the engine can say "could not evaluate".
+        unparseable = {}
+
+        def _to_float(v, field=None):
             if not v:
                 return None
             # Strip common unit suffixes before converting (e.g. "254mm" → 254.0)
@@ -336,12 +343,18 @@ def _parse_master_csv(content: str) -> list:
             try:
                 return float(v_clean) if v_clean else None
             except (ValueError, TypeError):
+                if field and str(v).strip() not in ('—', '-', '–', 'n/a', 'N/A', 'tbd', 'TBD'):
+                    unparseable[field] = str(v).strip()
                 return None
 
-        trim_length = _to_float(_get('trim length', 'length mm', 'trim l', 'height mm', 'trim h'))
-        trim_width  = _to_float(_get('trim width',  'width mm',  'trim w', 'w mm'))
-        gusset      = _to_float(_get('gusset dimension', 'gusset'))
-        front_panel = _to_float(_get('front panel dimension', 'front panel'))
+        # The live master list heads these "Trim length (mm)" / "Trim width (mm)";
+        # without those spellings the trim columns were never read at all.
+        trim_length = _to_float(_get('trim length (mm)', 'trim length', 'length mm', 'trim l',
+                                     'height mm', 'trim h'), 'trim_length_mm')
+        trim_width  = _to_float(_get('trim width (mm)', 'trim width', 'width mm', 'trim w', 'w mm'),
+                                'trim_width_mm')
+        gusset      = _to_float(_get('gusset dimension', 'gusset'), 'gusset_mm')
+        front_panel = _to_float(_get('front panel dimension', 'front panel'), 'front_panel_mm')
 
         wind_raw    = _get('wind direction', 'wind', 'winding')
         wind        = re.sub(r'[^\d]', '', wind_raw)[:1]
@@ -352,13 +365,14 @@ def _parse_master_csv(content: str) -> list:
         # data. Absent for a SKU → that check degrades to UNVERIFIED.
         fill_weight = _to_float(_get('fill weight (g)', 'fill weight', 'fill weight g',
                                      'fill wt (g)', 'fill wt', 'fill_weight_g',
-                                     'net fill weight', 'net fill (g)'))
+                                     'net fill weight', 'net fill (g)'), 'fill_weight_g')
 
         # Approved servings-per-container from the current, approved NFP — lets the
         # superseded-NFP check catch artwork embedding an old panel. Optional.
         approved_servings = _to_float(_get('approved servings per container',
                                            'approved servings', 'nfp servings per container',
-                                           'servings per container (approved)'))
+                                           'servings per container (approved)'),
+                                      'approved_servings_per_container')
 
         pms_colors  = _get('pms spot colors', 'pms colors', 'spot colors', 'pantone')
         hex_colors  = _get('hex spot colors', 'hex colors')
@@ -406,6 +420,7 @@ def _parse_master_csv(content: str) -> list:
             'hex_spot_colors':   hex_colors,
             'eye_mark_color':    eye_mark,
             'die_line_required': die_required,
+            '_unparseable':      unparseable,
         })
     return rows
 
@@ -1061,7 +1076,7 @@ def _generate_report(job: dict, brand_name: str = 'ProDough') -> io.BytesIO:
     else:
         ws1.append([])
     for col, hdr in enumerate(['File', 'Overall Status', 'Critical', 'Warnings', 'Notes',
-                               'Checks run', 'Checks skipped'], 1):
+                               'Checks run', 'Checks skipped', 'Checks disabled'], 1):
         c = ws1.cell(row=4, column=col, value=hdr)
         c.font = hdr_font
         c.fill = hdr_blue
@@ -1071,15 +1086,17 @@ def _generate_report(job: dict, brand_name: str = 'ProDough') -> io.BytesIO:
     for r in job['results']:
         _run = r.get('checks_run') or []
         _skipped = r.get('checks_skipped') or r.get('unverified_checks') or []
+        _disabled = r.get('checks_disabled') or []
         ws1.append([r['filename'], r.get('severity', 'error').upper(),
                     r.get('critical_count', 0), r.get('warning_count', 0), r.get('info_count', 0),
                     f'{len(_run)}: ' + ', '.join(_run) if _run else '0',
-                    f'{len(_skipped)}: ' + ', '.join(_skipped) if _skipped else '0'])
+                    f'{len(_skipped)}: ' + ', '.join(_skipped) if _skipped else '0',
+                    ', '.join(_disabled) + ' (by configuration)' if _disabled else ''])
         sev = r.get('severity', 'error')
         f = (fill_crit if sev == 'critical' else fill_warn if sev == 'warning'
              else fill_ok if sev == 'clean' else fill_incomplete if sev == 'incomplete' else None)
         if f:
-            for col in range(1, 8):
+            for col in range(1, 9):
                 ws1.cell(row=ws1.max_row, column=col).fill = f
         if _skipped:
             ws1.cell(row=ws1.max_row, column=7).font = Font(bold=True, color='9C4200')
@@ -1089,6 +1106,7 @@ def _generate_report(job: dict, brand_name: str = 'ProDough') -> io.BytesIO:
         ws1.column_dimensions[col].width = 14
     ws1.column_dimensions['F'].width = 40
     ws1.column_dimensions['G'].width = 40
+    ws1.column_dimensions['H'].width = 40
 
     # ── Reader Provenance — which reader produced each panel field ────────────
     # Run 9ffb350f could not tell a value read cleanly from the panel crop from

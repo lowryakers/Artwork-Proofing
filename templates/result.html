@@ -319,6 +319,9 @@
     {{ _check_card('11','Wind Direction',        'bi-arrow-repeat',       r.checks.wind,     idx, r.filename, 'wind',     dismissals, confirmations) }}
     {% endif %}
     {{ _check_card('12','Print Specifications', 'bi-rulers',             r.checks.specs,    idx, r.filename, 'specs',    dismissals, confirmations) }}
+    {% if r.checks.get('item_reference') is not none %}
+    {{ _check_card('13','Converter Item Reference vs SKU', 'bi-tag', r.checks.item_reference, idx, r.filename, 'item_reference', dismissals, confirmations, always_open=true) }}
+    {% endif %}
     </div>
 
     <!-- Manual verify items -->
@@ -1257,6 +1260,7 @@ function fileResult(r, jobId, idx) {
   if (checks.claims != null) checksHtml += checkCard('10','Claims Review','bi-patch-question', checks.claims, uid, r.filename, 'claims', false);
   if (checks.wind != null) checksHtml += checkCard('11','Wind Direction','bi-arrow-repeat', checks.wind, uid, r.filename, 'wind', false);
   checksHtml += checkCard('12','Print Specifications',  'bi-rulers',             checks.specs,    uid, r.filename, 'specs',    false);
+  if (checks.item_reference != null) checksHtml += checkCard('13','Converter Item Reference vs SKU','bi-tag', checks.item_reference, uid, r.filename, 'item_reference', true);
 
   const content = r.error
     ? `<div class="alert alert-danger"><strong>Error:</strong> ${esc(r.error)}</div>`

@@ -63,10 +63,6 @@ def _run():
         check(f'Lab({L},{a},{b}) converts within tolerance 8 of spec {spec_hex}',
               pe._hex_close(got, '#' + spec_hex, tol=8))
 
-    # ── CMYK -> sRGB sanity ─────────────────────────────────────────────────────
-    check('CMYK(0,0,0,0) -> white', pe._cmyk_to_hex(0, 0, 0, 0) == '#FFFFFF')
-    check('CMYK(0,0,0,100) -> black', pe._cmyk_to_hex(0, 0, 0, 100) == '#000000')
-
     # ── _extract_spot_color_hexes: Lab-defined separation (the exact PDF shape
     #    from the bug report) resolves to the correct hex ────────────────────
     lab_obj = (
@@ -84,16 +80,20 @@ def _run():
     check('Lab separation computed hex matches spec within tolerance 8',
           pe._hex_close(hexes['PANTONE#20158#20C']['hex'], '#EE7623', tol=8))
 
-    # ── A CMYK-defined separation still resolves (not everything is Lab) ──────
+    # ── A DeviceCMYK separation (the exact shape from runs 73096882 / 7f8ce432)
+    #    is name-match only — never converted to a hex that could be compared ──
     cmyk_obj = (
-        '[ /Separation /PANTONE#20Red#20032#20C 70 0 R <<\n'
+        '[ /Separation /PANTONE#20171#20C /DeviceCMYK <<\n'
         '    /C0 [ 0 0 0 0 ]\n'
-        '    /C1 [ 0 90 95 0 ]\n'
-        '    /FunctionType 2 /N 1 /Domain [ 0 1 ] >> ]'
+        '    /C1 [ 0 .857627 .99548 0 ]\n'
+        '    /FunctionType 2 /N 1 /Domain [ 0 1 ] /Range [ 0 1 0 1 0 1 0 1 ] >> ]'
     )
     doc2 = _StubDoc([cmyk_obj])
-    hexes2 = pe._extract_spot_color_hexes(doc2)
-    check('CMYK separation resolves to a hex', hexes2.get('PANTONE#20Red#20032#20C', {}).get('hex'))
+    hexes2 = pe._extract_spot_color_hexes(doc2).get('PANTONE#20171#20C', {})
+    check('DeviceCMYK separation is name-match only, carries no comparable hex',
+          hexes2.get('name_only') is True and 'hex' not in hexes2)
+    check('...and records /C1 (the full-tint end), not /C0',
+          hexes2.get('cmyk') == [0.0, 0.857627, 0.99548, 0.0])
 
     # ── An uninterpretable colorspace reports unresolved, never silently
     #    treated as CMYK or Lab ─────────────────────────────────────────────────

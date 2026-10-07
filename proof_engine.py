@@ -67,7 +67,26 @@ _UPLOAD_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'uploads'
 # none of them says the artwork is wrong, only that nothing outside the artwork
 # has confirmed it yet, which must never read as "checked and fine" either.
 _NOT_VERIFIED_STATUSES = ('UNVERIFIED', 'UNKNOWN', 'NOT_RUN', 'PANEL_MISSING',
-                          'PANEL_NOT_APPROVED', 'PANEL_SUPERSEDED', 'PANEL_UNAVAILABLE')
+                          'PANEL_NOT_APPROVED', 'PANEL_SUPERSEDED', 'PANEL_UNAVAILABLE',
+                          'PANEL_NO_VALUES')
+
+# Checks switched off by configuration. Disabled is not the same as failed: a
+# disabled check is listed in the report as such and does NOT block CLEAN;
+# a check that was attempted and could not complete (NOT_RUN etc.) does.
+# Both default off after runs 73096882 / 7f8ce432 — 76 CRITICALs between them,
+# every one false (see _check_print_specs). Set to "true" to re-enable.
+def _env_flag(name: str, default: bool) -> bool:
+    v = os.environ.get(name)
+    return default if v is None else v.strip().lower() in ('1', 'true', 'yes', 'on')
+
+
+CHECK_SPOT_COLOR = _env_flag('CHECK_SPOT_COLOR', False)
+CHECK_TRIM_DIMENSION = _env_flag('CHECK_TRIM_DIMENSION', False)
+
+
+def _disabled_checks() -> list:
+    return ([] if CHECK_SPOT_COLOR else ['spot_color']) + \
+           ([] if CHECK_TRIM_DIMENSION else ['trim_dimension'])
 
 
 def _completeness(checks: dict) -> tuple:
@@ -1727,6 +1746,13 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
     if matched_spec:
         checks['gtin']['spec_gtin'] = str(matched_spec.get('gtin', '')).strip()
         _check_gtin_vs_spec_row(checks['gtin'], matched_spec)
+        _apply_unparseable_spec(checks, matched_spec)
+
+    # Converter's item reference vs the SKU the artwork's own barcode resolves to.
+    _item_ref_check = _check_item_reference(pdfplumber_text + '\n' + native_text,
+                                            barcode_gtins, gtin_rows)
+    if _item_ref_check is not None:
+        checks['item_reference'] = _item_ref_check
 
     # FALCPA vs the approved record: an allergen the approved panel of record
     # declares must appear in the artwork's own "Contains:" line.
@@ -1801,6 +1827,10 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
         'unverified_checks': unverified_checks,
         'checks_run': checks_run,
         'checks_skipped': unverified_checks,
+        # Switched off by configuration — listed, never counted as skipped, and
+        # never a reason to withhold CLEAN. Only meaningful where the print-
+        # spec check (which owns both sub-checks) actually ran.
+        'checks_disabled': _disabled_checks() if 'specs' in checks else [],
         # Which reader produced each panel field ('nfp_crop' / 'vision_struct' /
         # 'page_regex' / None), plus the whole-page regex candidates that were
         # deliberately NOT used — rendered on the Reader Provenance sheet.
@@ -1983,6 +2013,78 @@ def _check_gtin_vs_spec_row(gtin_check: dict, matched_spec: dict) -> None:
         f'Barcode GTIN {", ".join(found)} does not match the master list GTIN {spec_gtin} for '
         f'{sku}. The artwork carries the wrong barcode — correct it before printing.')})
     gtin_check['issues'] = kept
+
+
+# Master-list fields -> (check that consumes it, human label). A spec value that
+# was present but unparseable is reported on the check that needed it.
+_SPEC_FIELD_CONSUMER = {
+    'fill_weight_g': ('netwt', 'fill weight (g)'),
+    'approved_servings_per_container': ('nfp', 'approved servings per container'),
+    'trim_length_mm': ('specs', 'trim length (mm)'),
+    'trim_width_mm': ('specs', 'trim width (mm)'),
+    'gusset_mm': ('specs', 'gusset (mm)'),
+    'front_panel_mm': ('specs', 'front panel (mm)'),
+}
+
+
+def _apply_unparseable_spec(checks: dict, matched_spec: dict) -> None:
+    """A master-list value that is present but can't be parsed (app records it
+    in the row's _unparseable) must surface as "could not evaluate", never
+    quietly drop out of the comparison — which reads as a pass, or as "not on
+    file", which is a different problem with a different fix. The net-weight
+    check becomes NOT_RUN (its fill weight is unusable). Trim fields are
+    reported only while the trim check is enabled; a disabled check reads
+    nothing."""
+    for field, raw in ((matched_spec or {}).get('_unparseable') or {}).items():
+        key, label = _SPEC_FIELD_CONSUMER.get(field, ('specs', field))
+        if key == 'specs' and not CHECK_TRIM_DIMENSION:
+            continue
+        chk = checks.get(key)
+        if not isinstance(chk, dict):
+            continue
+        chk.setdefault('issues', []).append({'severity': 'review', 'message': (
+            f'Could not evaluate — spec value "{raw}" for {label} is not a valid number. Correct it '
+            'in the master list.')})
+        if key == 'netwt':
+            chk['status'] = 'NOT_RUN'
+            chk['notes'] = [n for n in chk.get('notes', []) if not str(n).startswith('NOT VERIFIED')]
+
+
+_ITEM_REF_RE = re.compile(r'cust(?:omer)?\.?\s*item\s*ref(?:erence)?\.?\s*[:#]?\s*([A-Z0-9][A-Z0-9_\-]{2,})',
+                          re.I)
+
+
+def _check_item_reference(pdf_text: str, barcode_gtins: list, gtin_rows: list):
+    """The converter's "Cust. Item Ref" (live text in the proof sheet's
+    technical block) vs the SKU the artwork's OWN barcode resolves to in the
+    master list. Catches the one failure class nothing else can see — right
+    artwork, wrong product association: the 7 Oct whey Double Chocolate proof
+    was internally perfect (whey barcode, whey panel, Contains: Milk) but filed
+    as BEF-BTL-DCH, so a future beef order could pull whey artwork.
+
+    Returns None when the sheet carries no item reference (nothing to check —
+    not every converter prints one), NOT_RUN when there is one but the barcode
+    doesn't resolve to a master row, else OK / a CRITICAL on mismatch."""
+    m = _ITEM_REF_RE.search(pdf_text or '')
+    if not m:
+        return None
+    ref = m.group(1).upper()
+    by_gtin = {str(r.get('gtin', '')).strip(): str(r.get('sku', '')).strip()
+               for r in (gtin_rows or []) if r.get('gtin') and r.get('sku')}
+    hits = [(g, by_gtin[str(g).strip()]) for g in (barcode_gtins or []) if str(g).strip() in by_gtin]
+    if not hits:
+        return {'status': 'NOT_RUN', 'issues': [], 'item_ref': ref, 'notes': [
+            f'NOT RUN — the proof sheet is filed as "{ref}", but the artwork\'s barcode did not '
+            'resolve to a master-list SKU to compare it against.']}
+    gtin, sku = hits[0]
+    if ref == sku.upper():
+        return {'status': 'OK', 'issues': [], 'item_ref': ref, 'notes': [
+            f'Item reference "{ref}" matches the SKU the artwork\'s barcode ({gtin}) resolves to.']}
+    return {'status': 'CRITICAL', 'item_ref': ref, 'notes': [], 'issues': [{
+        'severity': 'critical', 'message': (
+            f'Item-reference mismatch — the proof sheet is filed as "{ref}" but the artwork\'s '
+            f'barcode ({gtin}) is {sku}. The converter may file or reorder this artwork against '
+            'the wrong product.')}]}
 
 
 # ── Check 2: Front call-outs vs NFP ──────────────────────────────────────────
@@ -3100,6 +3202,11 @@ def _check_net_carbs(text: str, serving_g=None, nfp_vals: dict = None) -> list:
 _AS_PREPARED_RE = re.compile(
     r'replace\s+water\s+with|add\s+an?\s+egg|with\s+milk|as\s+prepared', re.I)
 _PROTEIN_ANCHOR_RE = re.compile(r'\bprotein\b', re.I)
+# A value whose own caption names another nutrient is that nutrient's value,
+# never a protein claim, however close it sits to a "protein" mention.
+_OTHER_NUTRIENT_RE = re.compile(
+    r'\b(?:added\s+sugars?|sugars?|calories?|cal\b|carb(?:ohydrate)?s?|net\s+carbs?|fat|fiber|'
+    r'fibre|sodium|cholesterol|grass[\s-]*fed|whey|collagen|creatine|caffeine)', re.I)
 _PROTEIN_VALUE_RE = re.compile(r'(\d{1,3})\s*[Gg]\b\s*([^/\n]{0,80})')
 
 
@@ -3212,6 +3319,14 @@ def _check_protein_claims(text: str, nfp_protein_g) -> list:
             seen.add(key)
             if _AS_PREPARED_RE.search(desc):
                 continue  # describes a prepared food, not the food in the package
+            if _OTHER_NUTRIENT_RE.search(desc):
+                # Bound to a different caption — "1G Added Sugar" sits next to
+                # "25G Protein Per Serving" on the front rings (Apple Pie, run
+                # 7f8ce432: two false CRITICALs comparing added sugar to NFP
+                # protein while naming "Added Sugar" in the message). Each
+                # call-out is compared like-to-like by _check_nfp; here it is
+                # simply not a protein value.
+                continue
             if val == nfp_protein_g:
                 continue  # agrees with the NFP — nothing to report
             issues.append({'severity': 'critical', 'message': (
@@ -3503,11 +3618,25 @@ def _check_approved_panel(artwork_panel: dict, front_artwork: dict, ingredients_
                            that permits release.
     """
     if approved is None:
+        # The three different 404s each point at a different fix (run
+        # 7f8ce432: every SKU reported "no panel records found" when every one
+        # actually had an approved, file-only panel with no typed values).
+        if fetch_reason == 'no_panel_values':
+            return {'status': 'PANEL_NO_VALUES', 'issues': [], 'panel_version': None, 'notes': [
+                'Panel on file but it carries no typed values (file-only approval) — nutrition '
+                'cannot be verified against it. Values need loading in ReadyDoc.']}
+        if fetch_reason == 'product_not_found':
+            return {'status': 'PANEL_MISSING', 'issues': [], 'panel_version': None, 'notes': [
+                'No product in ReadyDoc for this GTIN/SKU.']}
+        if fetch_reason == 'no_panel':
+            return {'status': 'PANEL_MISSING', 'issues': [], 'panel_version': None, 'notes': [
+                'Product found; no nutrition panel on file. File the panel in ReadyDoc '
+                '(Products → Nutrition panels).']}
         if fetch_reason == 'not_found':
             return {'status': 'PANEL_MISSING', 'issues': [], 'panel_version': None, 'notes': [
-                'PANEL MISSING — no approved nutrition panel found in ReadyDoc for this product. '
-                'Nutrition cannot be verified against a source of truth outside the artwork. '
-                'File the panel in ReadyDoc (Products → Nutrition panels).']}
+                'PANEL MISSING — ReadyDoc returned 404 for this GTIN/SKU without saying whether the '
+                'product, the panel, or the panel\'s values are missing. Nutrition cannot be '
+                'verified against a source of truth outside the artwork.']}
         # disabled / unauthorized / server_error / network: the lookup itself
         # failed. This is not evidence the panel is missing — it means nothing
         # was learned either way — so it gets its own status and points at ops.
@@ -5467,17 +5596,6 @@ def _lab_to_hex(L: float, a: float, b: float) -> str:
         max(0, min(255, round(bl * 255))))
 
 
-def _cmyk_to_hex(c: float, m: float, y: float, k: float) -> str:
-    """DeviceCMYK (0-100 each, as PDF tint-transform /C1 values are written)
-    -> sRGB hex via the standard naive subtractive conversion."""
-    c, m, y, k = (max(0.0, min(100.0, v)) / 100.0 for v in (c, m, y, k))
-    r = 255 * (1 - c) * (1 - k)
-    g = 255 * (1 - m) * (1 - k)
-    bl = 255 * (1 - y) * (1 - k)
-    return '#{:02X}{:02X}{:02X}'.format(
-        max(0, min(255, round(r))), max(0, min(255, round(g))), max(0, min(255, round(bl))))
-
-
 def _extract_spot_color_hexes(doc) -> dict:
     """For each /Separation spot color, compute the color it actually defines
     at full tint, directly from its tint-transform function (/C1) — NOT from
@@ -5488,10 +5606,19 @@ def _extract_spot_color_hexes(doc) -> dict:
     sample (or assuming CMYK) produced 12 false "does not match" CRITICALs
     on artwork that was, in every case, correct.
 
-    Returns {name: {'hex': '#rrggbb'}} for a resolved CMYK or Lab separation,
-    or {name: {'unresolved': '<why>'}} for a /C1 whose colorspace this can't
+    Returns {name: {'hex': '#rrggbb'}} for a Lab separation,
+    {name: {'name_only': True, 'cmyk': [...]}} for a DeviceCMYK one, or
+    {name: {'unresolved': '<why>'}} for a /C1 whose colorspace this can't
     interpret — kept distinct so the caller can say "could not evaluate"
     rather than silently falling back to a comparison that might be wrong.
+
+    DeviceCMYK separations are deliberately NOT converted. The old naive
+    conversion assumed /C1 was 0-100 and divided by 100; DeviceCMYK tints are
+    0-1 (`/C1 [ 0 .857627 .99548 0 ]`), so every CMYK spot came out near-white
+    (#FFFEFD) — 46 false CRITICALs across runs 73096882 / 7f8ce432. Even with
+    the scale right, a profile-less CMYK->RGB conversion is too far off to
+    compare against a spec hex (PANTONE 638 C at [.82 0 .16 0] -> ~#2DFFD7 vs
+    00ACD8), so the caller treats these as name-match only.
     """
     out = {}
     for xref in range(1, doc.xref_length()):
@@ -5517,7 +5644,8 @@ def _extract_spot_color_hexes(doc) -> dict:
             range_m = re.search(r'/Range\s*\[\s*([^\]]+?)\s*\]', window)
             hex_val, reason = None, None
             if len(c1) == 4:
-                hex_val = _cmyk_to_hex(*c1)
+                out[name] = {'name_only': True, 'cmyk': c1}
+                continue
             elif len(c1) == 3:
                 is_lab = False
                 if range_m:
@@ -5993,7 +6121,16 @@ def _check_print_specs(pdf_path: str, brand_config: dict = None,
         if spec_w and spec_h and [spec_w, spec_h] not in accepted:
             accepted.insert(0, [spec_w, spec_h])
 
-        if dim_ref[0] and accepted:
+        if not CHECK_TRIM_DIMENSION:
+            # Disabled by configuration (runs 73096882 / 7f8ce432: 30 false
+            # CRITICALs). On a converter's proof sheet every page box —
+            # MediaBox, CropBox, TrimBox, BleedBox — is the full sheet (artwork
+            # plus the approval block), not the artwork trim; until a proof
+            # layout can be told from a press-ready file, this comparison
+            # cannot be right. The measured size is still recorded as a note.
+            notes.append('Trim-dimension check DISABLED by configuration (CHECK_TRIM_DIMENSION) — '
+                         'a proof sheet\'s page box is not the artwork trim.')
+        elif dim_ref[0] and accepted:
             tol = 2.0  # mm
 
             def _fits(pair):
@@ -6044,7 +6181,13 @@ def _check_print_specs(pdf_path: str, brand_config: dict = None,
             or matched_spec.get('pms colors')
             or ''
         )
-        if req_spots_raw:
+        if req_spots_raw and not CHECK_SPOT_COLOR:
+            # Disabled by configuration (runs 73096882 / 7f8ce432: 46 false
+            # CRITICALs — DeviceCMYK separations read as near-white). Recorded
+            # on the result as a disabled check, which does not block CLEAN.
+            notes.append('Spot-colour check DISABLED by configuration (CHECK_SPOT_COLOR) — '
+                         'required separations were not compared.')
+        elif req_spots_raw:
             # Filter out blank/placeholder values like "PMS --", "--", "-", "N/A", "TBD"
             _PLACEHOLDER = re.compile(r'^[-–—]+$|^n/?a$|^tbd$|^none$|^pms\s*[-–—]+$', re.I)
             # ReadyDoc delimits pms_spot_colors with " | ", not ",". Splitting only
@@ -6083,6 +6226,29 @@ def _check_print_specs(pdf_path: str, brand_config: dict = None,
                         f'Spot color "{req}" — could not evaluate this separation\'s color '
                         f'({computed["unresolved"]}). Verify the color manually against the spec '
                         f'sheet\'s hex ({req_hex}).')})
+                    continue
+
+                if req_hex and _hex_channels(req_hex) is None:
+                    # A malformed spec value ("HEX F43BF", "HEX 4E2CID", "HX FF9015")
+                    # must never quietly drop out of the comparison — that reads
+                    # as a pass. Say it could not be evaluated, then fall back to
+                    # the name match alone.
+                    issues.append({'severity': 'review', 'message': (
+                        f'Spot color "{req}" — could not evaluate — spec value "{req_hex}" is not a '
+                        'valid hex colour. Correct it in the master list.')})
+                    req_hex = None
+
+                if computed and computed.get('name_only'):
+                    # A DeviceCMYK-defined separation: a naive CMYK->RGB
+                    # conversion is not good enough to compare against a spec hex
+                    # (PANTONE 638 C at [.82 0 .16 0] converts to ~#2DFFD7 against
+                    # 00ACD8), and no CMYK profile is wired in. Name-match only —
+                    # an honest check; a bad conversion against a tight tolerance
+                    # is not. Never falls back to the rendered-pixel sample either.
+                    if not name_ok:
+                        issues.append({'severity': 'warning', 'message': (
+                            f'Required spot color "{req}" (from spec sheet) not found in the PDF. '
+                            'Verify color setup with your designer before sending to print.')})
                     continue
 
                 computed_hex = computed.get('hex') if computed else None
@@ -6397,7 +6563,12 @@ def _build_summary(results: list) -> dict:
     else:
         _attempted = _n_lookups - _n_disabled
         _reason_label = {
-            'not_found': '404 — no panel records found for these GTINs',
+            'no_panel_values': ('a panel on file that carries no typed values (file-only '
+                                'approval) — nutrition cannot be verified against it. Values need '
+                                'loading in ReadyDoc'),
+            'no_panel': 'a product with no nutrition panel on file',
+            'product_not_found': 'no product in ReadyDoc for that GTIN/SKU',
+            'not_found': '404 without saying whether the product, the panel or its values are missing',
             'unauthorized': 'HTTP 401 (token rejected)',
             'server_error': 'a server error',
             'network': 'a network/timeout failure',
@@ -6413,15 +6584,17 @@ def _build_summary(results: list) -> dict:
             _tail = (' This is a configuration problem, not missing panel data — check '
                     'READYDOC_TOKEN on this service.' if _is_config else '')
             panel_feed_status = {
-                'ok': _reason == 'not_found', 'level': _reason,
+                'ok': _reason in ('not_found', 'no_panel', 'product_not_found'), 'level': _reason,
                 'message': (f'ReadyDoc panel integration: {_attempted} lookups attempted, '
                            f'{_count} returned {_label}.{_tail}'),
             }
         else:
             _n_ok = _reason_counts.get('ok', 0)
+            _breakdown = '; '.join(f'{v} {_reason_label.get(k, k).split(" — ")[0]}'
+                                   for k, v in sorted(_non_ok.items()))
             panel_feed_status = {'ok': True, 'level': 'mixed', 'message': (
                 f'ReadyDoc panel integration: {_attempted} lookups attempted, '
-                f'{_n_ok} returned a panel record.')}
+                f'{_n_ok} returned a panel record' + (f'; {_breakdown}' if _breakdown else '') + '.')}
 
     return {
         'total_files': total,
