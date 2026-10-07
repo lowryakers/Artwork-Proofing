@@ -1749,8 +1749,7 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
         _apply_unparseable_spec(checks, matched_spec)
 
     # Converter's item reference vs the SKU the artwork's own barcode resolves to.
-    _item_ref_check = _check_item_reference(pdfplumber_text + '\n' + native_text,
-                                            barcode_gtins, gtin_rows)
+    _item_ref_check = _check_item_reference(combined_text, barcode_gtins, gtin_rows)
     if _item_ref_check is not None:
         checks['item_reference'] = _item_ref_check
 
@@ -2054,21 +2053,33 @@ _ITEM_REF_RE = re.compile(r'cust(?:omer)?\.?\s*item\s*ref(?:erence)?\.?\s*[:#]?\
                           re.I)
 
 
-def _check_item_reference(pdf_text: str, barcode_gtins: list, gtin_rows: list):
-    """The converter's "Cust. Item Ref" (live text in the proof sheet's
-    technical block) vs the SKU the artwork's OWN barcode resolves to in the
-    master list. Catches the one failure class nothing else can see — right
-    artwork, wrong product association: the 7 Oct whey Double Chocolate proof
-    was internally perfect (whey barcode, whey panel, Contains: Milk) but filed
-    as BEF-BTL-DCH, so a future beef order could pull whey artwork.
+# Characters OCR swaps for each other on the converter's technical block
+# (measured on the 30 whey bottle proofs: "WHY-BTL-OC" read as "WHY-BTL-0C").
+_OCR_FOLD = str.maketrans({'0': 'O', '1': 'I', '5': 'S', '8': 'B'})
 
-    Returns None when the sheet carries no item reference (nothing to check —
-    not every converter prints one), NOT_RUN when there is one but the barcode
-    doesn't resolve to a master row, else OK / a CRITICAL on mismatch."""
-    m = _ITEM_REF_RE.search(pdf_text or '')
-    if not m:
+
+def _check_item_reference(text: str, barcode_gtins: list, gtin_rows: list):
+    """The converter's "Cust. Item Ref" (in the proof sheet's technical block)
+    vs the SKU the artwork's OWN barcode resolves to in the master list.
+    Catches the one failure class nothing else can see — right artwork, wrong
+    product association: the 7 Oct whey Double Chocolate proof was internally
+    perfect (whey barcode, whey panel, Contains: Milk) but filed as
+    BEF-BTL-DCH, so a future beef order could pull whey artwork.
+
+    `text` is every text source for the file: on the whey bottle proofs the
+    whole sheet, technical block included, is outlined (no text layer at all),
+    so the reference only exists in the OCR passes. Every reading is
+    collected, and a single OCR character confusion (O/0, I/1, S/5, B/8) is
+    folded before comparing — a misread must never become a CRITICAL. A real
+    swap (BEF vs WHY) differs after folding and still does.
+
+    Returns None when no item reference is found (nothing to check — not every
+    converter prints one), NOT_RUN when there is one but the barcode doesn't
+    resolve to a master row, else OK / a CRITICAL on mismatch."""
+    refs = [m.group(1).upper() for m in _ITEM_REF_RE.finditer(text or '')]
+    if not refs:
         return None
-    ref = m.group(1).upper()
+    ref = max(set(refs), key=refs.count)
     by_gtin = {str(r.get('gtin', '')).strip(): str(r.get('sku', '')).strip()
                for r in (gtin_rows or []) if r.get('gtin') and r.get('sku')}
     hits = [(g, by_gtin[str(g).strip()]) for g in (barcode_gtins or []) if str(g).strip() in by_gtin]
@@ -2077,7 +2088,9 @@ def _check_item_reference(pdf_text: str, barcode_gtins: list, gtin_rows: list):
             f'NOT RUN — the proof sheet is filed as "{ref}", but the artwork\'s barcode did not '
             'resolve to a master-list SKU to compare it against.']}
     gtin, sku = hits[0]
-    if ref == sku.upper():
+    want = sku.upper().translate(_OCR_FOLD)
+    if any(r.translate(_OCR_FOLD) == want for r in refs):
+        ref = sku.upper()
         return {'status': 'OK', 'issues': [], 'item_ref': ref, 'notes': [
             f'Item reference "{ref}" matches the SKU the artwork\'s barcode ({gtin}) resolves to.']}
     return {'status': 'CRITICAL', 'item_ref': ref, 'notes': [], 'issues': [{

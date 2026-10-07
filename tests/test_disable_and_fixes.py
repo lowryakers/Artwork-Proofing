@@ -138,6 +138,14 @@ def _run():
     check('5 Oct proof (WHY-BTL-DCH) -> OK, no findings', r5['status'] == 'OK' and not r5['issues'])
     check('no item reference on the sheet -> check does not apply (None)',
           pe._check_item_reference('no reference here', ['850079939387'], rows) is None)
+    oc = [{'gtin': '850079939486', 'sku': 'WHY-BTL-OC'}]
+    check('an OCR O/0 confusion (real: Orange Cream read as "WHY-BTL-0C") is never a mismatch',
+          pe._check_item_reference('Cust. Item Ref: WHY-BTL-0C ORANGE', ['850079939486'], oc)['status'] == 'OK')
+    check('one pass reads 0C, another OC -> OK',
+          pe._check_item_reference('Cust. Item Ref: WHY-BTL-0C\nCust. Item Ref: WHY-BTL-OC',
+                                   ['850079939486'], oc)['status'] == 'OK')
+    check('a real swap survives folding: BEF vs WHY is still a CRITICAL',
+          pe._check_item_reference('Cust. Item Ref: BEF-BTL-DCH', ['850079939387'], rows)['status'] == 'CRITICAL')
     check('item reference present but barcode unresolved -> NOT_RUN',
           pe._check_item_reference('Cust. Item Ref: BEF-BTL-DCH', ['000000000000'], rows)['status'] == 'NOT_RUN')
 
