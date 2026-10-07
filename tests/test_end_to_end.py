@@ -180,6 +180,12 @@ def _run():
     import app as A
     import proof_engine as pe
     A.GTIN_SHEET_CFG_PATH = os.path.join(tempfile.mkdtemp(), 'gtin_sheet_config.json')
+    # The spot-colour check is off by default (DeviceCMYK separations on the
+    # whey bottles cannot be compared honestly yet). These pancake files define
+    # their separations in Lab, which IS comparable, so it is switched on here
+    # — otherwise DEFECT_spot_color_off and the within-tolerance negative
+    # control would test nothing. Trim stays at its default (disabled).
+    pe.CHECK_SPOT_COLOR = True
 
     vision = bool(pe.ANTHROPIC_AVAILABLE)
     S = Scorer(vision)
@@ -278,6 +284,10 @@ def _run():
                 needs_vision=True)
         S.check(f'{fname}: declared net weight {exp["declared_net_weight_g"]:g}g',
                 vals.get('declared_net_weight_g') == exp['declared_net_weight_g'])
+        S.check(f'{fname}: trim listed as disabled by configuration, not skipped '
+                f'(disabled={res.get("checks_disabled")}, skipped={res.get("checks_skipped")})',
+                res.get('checks_disabled') == ['trim_dimension']
+                and 'trim_dimension' not in (res.get('checks_skipped') or []))
         S.check(f'{fname}: every nutrition-panel field sourced from nfp_crop (got {[prov.get(k) for k in NFP_FIELDS]})',
                 all(prov.get(k) == 'nfp_crop' for k in NFP_FIELDS), needs_vision=True)
         S.check(f'{fname}: CLEAN, with every check run (got {res.get("severity")}, '

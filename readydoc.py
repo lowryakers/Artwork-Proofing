@@ -20,6 +20,7 @@ Env:
 import json
 import mimetypes
 import os
+import re
 import threading
 import urllib.error
 import urllib.parse
@@ -41,6 +42,7 @@ _CHECK_LABEL = {
     'claims': 'Claims review',
     'specs': 'Print specs & dimensions',
     'wind': 'Wind direction',
+    'item_reference': 'Converter item reference vs SKU',
 }
 
 # The engine grades issues critical / warning / suspect / review / info;
@@ -56,7 +58,7 @@ _SEVERITY = {'critical': 'fail', 'warning': 'warn', 'suspect': 'warn', 'review':
 # approved-nutrition-panel gate: none of them says the artwork is wrong, only
 # that nothing outside the artwork has confirmed it yet — that must never
 # read as a pass either.
-_UNVERIFIED_STATUSES = {'UNVERIFIED', 'UNKNOWN', 'NOT_RUN', 'SUSPECT',
+_UNVERIFIED_STATUSES = {'UNVERIFIED', 'UNKNOWN', 'NOT_RUN', 'SUSPECT', 'PANEL_NO_VALUES',
                         'PANEL_MISSING', 'PANEL_NOT_APPROVED', 'PANEL_SUPERSEDED',
                         'PANEL_UNAVAILABLE'}
 
@@ -196,7 +198,11 @@ def fetch_approved_panel(gtin=None, sku=None):
     reason is one of:
       'ok'            panel record returned (draft or approved)
       'disabled'      READYDOC_URL / READYDOC_TOKEN not set
-      'not_found'     HTTP 404 — no panel record filed for this product
+      'product_not_found'  HTTP 404 — no product in ReadyDoc for this GTIN/SKU
+      'no_panel'           HTTP 404 — product found, no nutrition panel on file
+      'no_panel_values'    HTTP 404 — a panel is on file but carries no typed
+                           values (file-only approval)
+      'not_found'     HTTP 404 whose body doesn't say which of the above
       'unauthorized'  HTTP 401/403 — the token was rejected
       'server_error'  HTTP 5xx (or any other unexpected HTTP status)
       'network'       timeout, DNS, connection reset, or any other failure
@@ -225,11 +231,9 @@ def fetch_approved_panel(gtin=None, sku=None):
         data = _get('/api/products/nutrition-panel', {'gtin': gtin, 'sku': sku})
     except urllib.error.HTTPError as exc:
         if exc.code == 404:
-            # Debug-level: this is the expected, unremarkable shape of "no
-            # panel filed yet" — logged so it stays distinguishable from a
-            # 401/route-not-deployed, never surfaced as a problem on its own.
-            print(f'[readydoc] nutrition-panel: 404 (no record) gtin={gtin} sku={sku}')
-            return None, 'not_found'
+            reason = _classify_panel_404(exc)
+            print(f'[readydoc] nutrition-panel: 404 ({reason}) gtin={gtin} sku={sku}')
+            return None, reason
         if exc.code in (401, 403):
             print(f'[readydoc] nutrition-panel fetch: HTTP {exc.code} — token rejected')
             return None, 'unauthorized'
@@ -242,6 +246,28 @@ def fetch_approved_panel(gtin=None, sku=None):
         return data, 'ok'
     # A 200 with an empty/non-dict body is functionally "nothing filed."
     return None, 'not_found'
+
+
+def _classify_panel_404(exc) -> str:
+    """Tell the three different 404s apart by their body. ReadyDoc answers 404
+    for "no such product", "product but no panel", and — the case that
+    matters right now — "approved panel whose panel_json is empty" (a
+    file-only approval, `no_panel_values`; every ProDough SKU was in that
+    state on 7 Oct). All three used to read as "no panel records found",
+    which sent the reader looking for a problem that did not exist.
+    Returns 'no_panel_values' | 'no_panel' | 'product_not_found', or
+    'not_found' when the body doesn't say which."""
+    try:
+        body = exc.read().decode('utf-8', 'replace').lower()
+    except Exception:
+        body = ''
+    if 'no_panel_values' in body or 'no panel values' in body:
+        return 'no_panel_values'
+    if 'product_not_found' in body or re.search(r'product[^"]{0,20}not\s*found', body):
+        return 'product_not_found'
+    if 'no_panel' in body or 'no nutrition panel' in body or 'panel_not_found' in body:
+        return 'no_panel'
+    return 'not_found'
 
 
 def fetch_prior_panel_version(gtin=None, sku=None):

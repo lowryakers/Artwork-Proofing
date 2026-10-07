@@ -146,10 +146,11 @@ def _run():
               and s2['panel_feed_status']['ok'] is False)
 
         s3 = pe._build_summary(_mk('not_found'))
-        check('uniform 404s -> "no panel records found", marked ok (a data fact, not a config failure)',
+        check('uniform unexplained 404s -> says the body did not say why (never "no panel records '
+              'found"), marked ok (a data fact, not a config failure)',
               s3['panel_feed_status']['message'] ==
-              'ReadyDoc panel integration: 38 lookups attempted, 38 returned 404 — no panel '
-              'records found for these GTINs.'
+              'ReadyDoc panel integration: 38 lookups attempted, 38 returned 404 without saying '
+              'whether the product, the panel or its values are missing.'
               and s3['panel_feed_status']['ok'] is True)
 
         s4 = pe._build_summary(_mk('ok'))
