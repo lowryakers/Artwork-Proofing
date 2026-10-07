@@ -3,13 +3,9 @@
 30 whey protein bottle press proofs, as sent by the converter (runs `73096882` /
 `7f8ce432`), plus the master rows to proof them against.
 
-**The PDFs (147 MB) are not committed yet.** They are meant to live in Git LFS,
-but `lfs.github.com` is blocked by the cloud environment's network policy, so the
-upload was refused. Until they're here, `tests/test_end_to_end.py` skips this set
-on its own (loudly) and still runs the pancake set. Once LFS is reachable: the
-`.gitattributes` rule is `tests/fixtures/artwork/whey/*.pdf filter=lfs`; after
-cloning, `git lfs install && git lfs pull`, or the harness reports each file as an
-un-pulled pointer.
+**The PDFs live in Git LFS** (`.gitattributes`: `tests/fixtures/artwork/whey/*.pdf
+filter=lfs`). After cloning, `git lfs install && git lfs pull`, or the harness
+reports each file as an un-pulled pointer and skips this set (loudly).
 
 - `master_rows.csv` — the 30 `WHY-BTL-*` rows from the master export of
   2026-10-07, unmodified. The harness combines it with the pancake set's rows into
