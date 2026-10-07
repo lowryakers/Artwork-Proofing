@@ -1,0 +1,335 @@
+{
+  "note": "30 whey protein bottle press proofs (converter proof sheets, runs 73096882 / 7f8ce432), verified against the master list: decoded barcode GTIN == master GTIN and the sheet's Cust. Item Ref == the SKU that GTIN resolves to, for all 30. Every file is fully outlined (no text layer). Expected: zero CRITICAL and zero WARNING with spot colour and trim disabled. Add serving_size_g / servings_per_container / declared_net_weight_g per file (hand-verified) to also assert the panel read and a CLEAN verdict \u2014 the harness builds the approved-panel record from them.",
+  "files": [
+    {
+      "file": "Apple_Pie_.pdf",
+      "sku": "WHY-BTL-AP",
+      "gtin": "850079939295",
+      "expect": {
+        "fill_weight_g": 34.86812,
+        "item_reference": "WHY-BTL-AP",
+        "critical_count": 0,
+        "warning_count": 0
+      }
+    },
+    {
+      "file": "Banans_Foster.pdf",
+      "sku": "WHY-BTL-BF",
+      "gtin": "850079939318",
+      "expect": {
+        "fill_weight_g": 34.13623,
+        "item_reference": "WHY-BTL-BF",
+        "critical_count": 0,
+        "warning_count": 0
+      }
+    },
+    {
+      "file": "Birthday_Cake_.pdf",
+      "sku": "WHY-BTL-BDC",
+      "gtin": "850079939301",
+      "expect": {
+        "fill_weight_g": 34.20123,
+        "item_reference": "WHY-BTL-BDC",
+        "critical_count": 0,
+        "warning_count": 0
+      }
+    },
+    {
+      "file": "Blueberry_Muffin.pdf",
+      "sku": "WHY-BTL-BLM",
+      "gtin": "850079939325",
+      "expect": {
+        "fill_weight_g": 34.03623,
+        "item_reference": "WHY-BTL-BLM",
+        "critical_count": 0,
+        "warning_count": 0
+      }
+    },
+    {
+      "file": "Chocolate_Mousse_.pdf",
+      "sku": "WHY-BTL-CM",
+      "gtin": "850079939349",
+      "expect": {
+        "fill_weight_g": 36.7,
+        "item_reference": "WHY-BTL-CM",
+        "critical_count": 0,
+        "warning_count": 0
+      }
+    },
+    {
+      "file": "Chocolate_Peanut_Butter_.pdf",
+      "sku": "WHY-BTL-CPB",
+      "gtin": "850079939363",
+      "expect": {
+        "fill_weight_g": 36.73114,
+        "item_reference": "WHY-BTL-CPB",
+        "critical_count": 0,
+        "warning_count": 0
+      }
+    },
+    {
+      "file": "Cinnamon_Roll_.pdf",
+      "sku": "WHY-BTL-CRL",
+      "gtin": "850079939370",
+      "expect": {
+        "fill_weight_g": 34.55623,
+        "item_reference": "WHY-BTL-CRL",
+        "critical_count": 0,
+        "warning_count": 0
+      }
+    },
+    {
+      "file": "Coconut_Cream_.pdf",
+      "sku": "WHY-BTL-CNC",
+      "gtin": "850079939356",
+      "expect": {
+        "fill_weight_g": 35.13471,
+        "item_reference": "WHY-BTL-CNC",
+        "critical_count": 0,
+        "warning_count": 0
+      }
+    },
+    {
+      "file": "Cookie_Crumble_.pdf",
+      "sku": "WHY-BTL-CCR",
+      "gtin": "850079939332",
+      "expect": {
+        "fill_weight_g": 34.58712,
+        "item_reference": "WHY-BTL-CCR",
+        "critical_count": 0,
+        "warning_count": 0
+      }
+    },
+    {
+      "file": "Double_Chocolate_.pdf",
+      "sku": "WHY-BTL-DCH",
+      "gtin": "850079939387",
+      "expect": {
+        "fill_weight_g": 37.24623,
+        "item_reference": "WHY-BTL-DCH",
+        "critical_count": 0,
+        "warning_count": 0
+      }
+    },
+    {
+      "file": "Fruity_Cereal_.pdf",
+      "sku": "WHY-BTL-FC",
+      "gtin": "850079939394",
+      "expect": {
+        "fill_weight_g": 34.40624,
+        "item_reference": "WHY-BTL-FC",
+        "critical_count": 0,
+        "warning_count": 0
+      }
+    },
+    {
+      "file": "Glazed_Donut_.pdf",
+      "sku": "WHY-BTL-GD",
+      "gtin": "850079939400",
+      "expect": {
+        "fill_weight_g": 34.275,
+        "item_reference": "WHY-BTL-GD",
+        "critical_count": 0,
+        "warning_count": 0
+      }
+    },
+    {
+      "file": "Horchata_.pdf",
+      "sku": "WHY-BTL-HO",
+      "gtin": "850079939417",
+      "expect": {
+        "fill_weight_g": 34.91293,
+        "item_reference": "WHY-BTL-HO",
+        "critical_count": 0,
+        "warning_count": 0
+      }
+    },
+    {
+      "file": "Iced_Mocha_.pdf",
+      "sku": "WHY-BTL-IM",
+      "gtin": "850079939424",
+      "expect": {
+        "fill_weight_g": 34.48257,
+        "item_reference": "WHY-BTL-IM",
+        "critical_count": 0,
+        "warning_count": 0
+      }
+    },
+    {
+      "file": "Key_Lime_Pie_.pdf",
+      "sku": "WHY-BTL-KLP",
+      "gtin": "850079939431",
+      "expect": {
+        "fill_weight_g": 34.31123,
+        "item_reference": "WHY-BTL-KLP",
+        "critical_count": 0,
+        "warning_count": 0
+      }
+    },
+    {
+      "file": "Lemon_Cake_.pdf",
+      "sku": "WHY-BTL-LCK",
+      "gtin": "850079939448",
+      "expect": {
+        "fill_weight_g": 34.14123,
+        "item_reference": "WHY-BTL-LCK",
+        "critical_count": 0,
+        "warning_count": 0
+      }
+    },
+    {
+      "file": "Maple_Donut_.pdf",
+      "sku": "WHY-BTL-MD",
+      "gtin": "850079939462",
+      "expect": {
+        "fill_weight_g": 34.7,
+        "item_reference": "WHY-BTL-MD",
+        "critical_count": 0,
+        "warning_count": 0
+      }
+    },
+    {
+      "file": "Mint_Chocolate_.pdf",
+      "sku": "WHY-BTL-MC",
+      "gtin": "850079939455",
+      "expect": {
+        "fill_weight_g": 35.63766,
+        "item_reference": "WHY-BTL-MC",
+        "critical_count": 0,
+        "warning_count": 0
+      }
+    },
+    {
+      "file": "Neapolitan_.pdf",
+      "sku": "WHY-BTL-NE",
+      "gtin": "850079939479",
+      "expect": {
+        "fill_weight_g": 34.65987,
+        "item_reference": "WHY-BTL-NE",
+        "critical_count": 0,
+        "warning_count": 0
+      }
+    },
+    {
+      "file": "Orange_Cream_.pdf",
+      "sku": "WHY-BTL-OC",
+      "gtin": "850079939486",
+      "expect": {
+        "fill_weight_g": 34.48257,
+        "item_reference": "WHY-BTL-OC",
+        "critical_count": 0,
+        "warning_count": 0
+      }
+    },
+    {
+      "file": "Peach_Cobbler_.pdf",
+      "sku": "WHY-BTL-PC",
+      "gtin": "850079939509",
+      "expect": {
+        "fill_weight_g": 34.75,
+        "item_reference": "WHY-BTL-PC",
+        "critical_count": 0,
+        "warning_count": 0
+      }
+    },
+    {
+      "file": "Pomegranate_Acai_.pdf",
+      "sku": "WHY-BTL-PA",
+      "gtin": "850079939493",
+      "expect": {
+        "fill_weight_g": 37.13109,
+        "item_reference": "WHY-BTL-PA",
+        "critical_count": 0,
+        "warning_count": 0
+      }
+    },
+    {
+      "file": "Pumpkin_Spice_.pdf",
+      "sku": "WHY-BTL-PS",
+      "gtin": "850079939516",
+      "expect": {
+        "fill_weight_g": 34.35689,
+        "item_reference": "WHY-BTL-PS",
+        "critical_count": 0,
+        "warning_count": 0
+      }
+    },
+    {
+      "file": "Raspberry_Cheesecake_.pdf",
+      "sku": "WHY-BTL-RC",
+      "gtin": "850079939523",
+      "expect": {
+        "fill_weight_g": 35.374,
+        "item_reference": "WHY-BTL-RC",
+        "critical_count": 0,
+        "warning_count": 0
+      }
+    },
+    {
+      "file": "Red_Velvet_.pdf",
+      "sku": "WHY-BTL-RDV",
+      "gtin": "850079939530",
+      "expect": {
+        "fill_weight_g": 34.92623,
+        "item_reference": "WHY-BTL-RDV",
+        "critical_count": 0,
+        "warning_count": 0
+      }
+    },
+    {
+      "file": "Salted_Caramel_.pdf",
+      "sku": "WHY-BTL-SLC",
+      "gtin": "850079939561",
+      "expect": {
+        "fill_weight_g": 34.92623,
+        "item_reference": "WHY-BTL-SLC",
+        "critical_count": 0,
+        "warning_count": 0
+      }
+    },
+    {
+      "file": "Snickerdoodle.pdf",
+      "sku": "WHY-BTL-SD",
+      "gtin": "850079939554",
+      "expect": {
+        "fill_weight_g": 34.64694,
+        "item_reference": "WHY-BTL-SD",
+        "critical_count": 0,
+        "warning_count": 0
+      }
+    },
+    {
+      "file": "Strawberry_Shortcake_.pdf",
+      "sku": "WHY-BTL-SS",
+      "gtin": "850079939578",
+      "expect": {
+        "fill_weight_g": 35.207,
+        "item_reference": "WHY-BTL-SS",
+        "critical_count": 0,
+        "warning_count": 0
+      }
+    },
+    {
+      "file": "Sugar_Cookie_.pdf",
+      "sku": "WHY-BTL-SC",
+      "gtin": "850079939547",
+      "expect": {
+        "fill_weight_g": 34.86117,
+        "item_reference": "WHY-BTL-SC",
+        "critical_count": 0,
+        "warning_count": 0
+      }
+    },
+    {
+      "file": "Vaniila_Bean.pdf",
+      "sku": "WHY-BTL-VB",
+      "gtin": "850079939585",
+      "expect": {
+        "fill_weight_g": 34.97043,
+        "item_reference": "WHY-BTL-VB",
+        "critical_count": 0,
+        "warning_count": 0
+      }
+    }
+  ]
+}

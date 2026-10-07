@@ -1,0 +1,20 @@
+{
+  "note": "Planted in reference data, not the PDFs \u2014 see ../README.md.",
+  "defects": [
+    {
+      "id": "DEFECT_item_ref_mismatch",
+      "sku": "WHY-BTL-DCH",
+      "mutate": {
+        "master_row": {
+          "SKU": "BEF-BTL-DCH"
+        }
+      },
+      "expect": {
+        "critical_count": 1,
+        "check": "item_reference",
+        "message_contains": "BEF-BTL-DCH"
+      },
+      "why": "Master row SKU changed so the artwork's barcode (850079939387) resolves to BEF-BTL-DCH while the proof sheet's Cust. Item Ref reads WHY-BTL-DCH \u2014 right artwork, wrong product association, the class the 7 Oct proof exposed."
+    }
+  ]
+}
