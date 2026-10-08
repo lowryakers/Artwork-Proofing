@@ -2218,6 +2218,11 @@ def _check_nfp(ocr_text: str, front_text: str = '', vision_nutrition: dict = Non
 
     # Strategy 3: reverse window — "calories" keyword with a number in the 120
     # chars BEFORE it; protein keyword with number in 60 chars before it.
+    # This window is not bound to the keyword: on the whey bottles it took the
+    # dieline's "95.00 mm Layflat" as a 95-calorie call-out and filed a false
+    # CRITICAL on 22 of 30 correct labels. Its values are kept apart and can
+    # only mark the comparison NOT EVALUATED, never decide it.
+    _fc_cals_loose, _fc_prots_loose = set(), set()
     for _km in re.finditer(r'\bcal(?:ories?)?\b', fl):
         _before = fl[max(0, _km.start() - 120): _km.start()]
         for _vm in re.finditer(r'\b(\d{2,3})\b', _before):
@@ -2227,7 +2232,7 @@ def _check_nfp(ocr_text: str, front_text: str = '', vision_nutrition: dict = Non
                 _trail = _before[_vm.end(): _vm.end() + 4].lstrip()
                 if _trail.startswith('%'):
                     continue
-                _fc_cals.add(_vi)
+                _fc_cals_loose.add(_vi)
     for _km in re.finditer(r'\bprotein\b', fl):
         _before = fl[max(0, _km.start() - 60): _km.start()]
         for _vm in re.finditer(r'\b(\d{1,2})\b', _before):
@@ -2239,7 +2244,7 @@ def _check_nfp(ocr_text: str, front_text: str = '', vision_nutrition: dict = Non
                 _trail = _before[_vm.end(): _vm.end() + 4].lstrip()
                 if _trail.startswith('%'):
                     continue
-                _fc_prots.add(_vi)
+                _fc_prots_loose.add(_vi)
 
     front_calories  = sorted(_fc_cals)
     front_proteins  = sorted(_fc_prots)
@@ -2289,6 +2294,25 @@ def _check_nfp(ocr_text: str, front_text: str = '', vision_nutrition: dict = Non
         r'per\s+serving\s+prepared',
         tl
     ))
+
+    # A front value found only by the loose window cannot decide the front-vs-NFP
+    # comparison. When it is all there is and it doesn't simply repeat the NFP
+    # value, say the comparison was not evaluated and send it to a person.
+    _unconfirmed_front = {}
+    if not has_dual_column and not front_calories and _fc_cals_loose and nfp_calories and _fc_cals_loose != set(nfp_calories):
+        _unconfirmed_front['calories'] = sorted(_fc_cals_loose)
+        issues.append({'severity': 'review', 'message': (
+            f'NOT EVALUATED — front calorie call-out: the only front value read '
+            f'({", ".join(str(v) for v in sorted(_fc_cals_loose))}) was a number near the word '
+            f'"calories", not a call-out bound to it, so it was not compared with the NFP '
+            f'({", ".join(str(v) for v in nfp_calories)} cal). Check the front call-out by eye.')})
+    if not has_dual_column and not front_proteins and _fc_prots_loose and nfp_proteins and _fc_prots_loose != set(nfp_proteins):
+        _unconfirmed_front['protein_g'] = sorted(_fc_prots_loose)
+        issues.append({'severity': 'review', 'message': (
+            f'NOT EVALUATED — front protein call-out: the only front value read '
+            f'({", ".join(str(v) for v in sorted(_fc_prots_loose))}g) was a number near the word '
+            f'"protein", not a call-out bound to it, so it was not compared with the NFP '
+            f'({", ".join(str(v) for v in nfp_proteins)}g). Check the front call-out by eye.')})
 
     # Calorie mismatch — prefer a direct front-callout vs NFP comparison (most
     # accurate). Fall back to a pooled range check when only one source read.
@@ -2374,6 +2398,8 @@ def _check_nfp(ocr_text: str, front_text: str = '', vision_nutrition: dict = Non
             'calories': front_calories,
             'proteins': front_proteins,
             'zero_sugar': front_zero_sugar,
+            # Loose-window values set aside, not compared (see NOT EVALUATED).
+            'unconfirmed': _unconfirmed_front,
         },
         'nfp_data': {
             'calories': nfp_calories,
