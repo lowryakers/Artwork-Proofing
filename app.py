@@ -1125,13 +1125,14 @@ def _generate_report(job: dict, brand_name: str = 'ProDough') -> io.BytesIO:
     wsp['A2'] = ('nfp_crop = read from the isolated, geometrically-located Nutrition Facts crop '
                  '(authoritative). vision_struct = full-page vision structured read. '
                  'PAGE_REGEX = scraped from the whole-page OCR and NOT used by any check. '
+                 'A full-page vision serving read the crop did not confirm is likewise NOT used. '
                  'absent = never read; dependent checks report NOT RUN.')
     wsp['A2'].alignment = wrap
     wsp.merge_cells('A2:H2')
     wsp.row_dimensions[2].height = 45
     _FRONT_FIELDS = ('declared_net_weight_g', 'unit_count')
     _hdrs = (['File'] + [f'{k} (front panel)' if k in _FRONT_FIELDS else k for k in _PROV_FIELDS]
-             + ['page_regex candidates (unused)'])
+             + ['Unused candidates (page regex; vision without crop)'])
     for col, hdr in enumerate(_hdrs, 1):
         c = wsp.cell(row=4, column=col, value=hdr)
         c.font = hdr_font
@@ -1156,8 +1157,13 @@ def _generate_report(job: dict, brand_name: str = 'ProDough') -> io.BytesIO:
             elif v in (None, ''):
                 c.fill = fill_prov_absent
         pr = r.get('panel_page_regex') or {}
+        vu = r.get('panel_vision_unconfirmed') or {}
         c = wsp.cell(row=ridx, column=len(_PROV_FIELDS) + 2,
-                     value=', '.join(f'{k}={v}' for k, v in pr.items()) if pr else '')
+                     value='; '.join(x for x in (
+                         ', '.join(f'{k}={v}' for k, v in pr.items()),
+                         ', '.join(f'{k}={v} (full-page vision, crop unconfirmed)' for k, v in vu.items()),
+                     ) if x))
+        pr = pr or vu
         c.alignment = wrap
         if pr:
             c.fill = fill_prov_warn

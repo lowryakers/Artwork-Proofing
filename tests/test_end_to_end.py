@@ -331,6 +331,19 @@ def _run():
                     print(f'      {i["severity"].upper():<8} [{k}] {i["message"][:150]}', flush=True)
     print(f'\n{len(results)} pipeline runs in {time.time() - t0:.0f}s\n')
 
+    # A key the API rejects leaves ANTHROPIC_AVAILABLE true while every vision
+    # call errors and the pipeline falls back to OCR (run 37844252128, attempt
+    # 1). Those numbers look like a vision run but are not one — fail loudly.
+    if vision:
+        _attempted = [r for _, _, r, _ in results if str(r.get('ocr_preview', '')).startswith('[vision: ')
+                      and not str(r.get('ocr_preview', '')).startswith('[vision: not needed')]
+        _errored = [r for r in _attempted if str(r.get('ocr_preview', '')).startswith('[vision: error')]
+        if _errored:
+            print(f'[vision] {len(_errored)} of {len(_attempted)} vision reads errored; first: '
+                  + str(_errored[0].get('ocr_preview', ''))[:200])
+        S.check(f'vision reads succeed (errored on {len(_errored)} of {len(_attempted)} runs)',
+                len(_errored) * 2 < max(1, len(_attempted)))
+
     # ── Score: clean files ──────────────────────────────────────────────────
     clean_fp = {}
     clean_results = []

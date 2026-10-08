@@ -135,6 +135,15 @@ def _run():
         _res2 = pe._read_nfp_panel(_tmp, None)
         check('bbox=None falls back to whole-image read',
               _res2.get('serving_size_g') == 98.0)
+        # A reply cut off at max_tokens is a failed read, not a partial one —
+        # even if the truncated text happens to hold parseable fields.
+        _cut = _Resp('{"serving_size_g":98,"servings_per_container":4.5,"calories":300,'
+                     '"protein_g":19,"total_carbohydrate_g":24}')
+        _cut.stop_reason = 'max_tokens'
+        pe._anthropic = _types.SimpleNamespace(Anthropic=lambda api_key=None: _types.SimpleNamespace(
+            messages=_types.SimpleNamespace(create=lambda **k: _cut)))
+        check('NFP-crop reply cut off at max_tokens is treated as a failed read',
+              pe._read_nfp_panel(_tmp, None) == {})
         os.remove(_tmp)
         pe.PIL_AVAILABLE, pe.ANTHROPIC_AVAILABLE = _prev_pil, _prev_avail
         pe.Image, pe._anthropic = _prev_img, _prev_anth
