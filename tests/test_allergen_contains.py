@@ -75,6 +75,31 @@ def _run():
     check('...while still downgrading a value-comparison CRITICAL on the same file',
           nfp_crit['severity'] == 'suspect')
 
+    # Orientation: an upside-down panel crop is turned upright before vision
+    # reads it (Tesseract orientation detection — local, repeatable). A
+    # synthetic panel of real text; skipped where tesseract is absent.
+    import shutil
+    if shutil.which('tesseract'):
+        from PIL import Image as _I, ImageDraw as _D, ImageFont as _F
+        try:
+            font = _F.truetype('DejaVuSans.ttf', 34)
+        except OSError:
+            font = _F.load_default()
+        page = _I.new('RGB', (900, 1200), 'white')
+        d = _D.Draw(page)
+        for k, line in enumerate(['Nutrition Facts', 'About 5 servings per container',
+                                  'Serving size 3/4 Cup (88g)', 'Calories 300', 'Total Fat 2.5g',
+                                  'Total Carbohydrate 56g', 'Total Sugars 10g',
+                                  'Includes 0g Added Sugars', 'Protein 19g', 'Contains: Milk',
+                                  'Ingredients: Oat Flour, Buttermilk Powder, Rice Flour']):
+            d.text((40, 40 + k * 95), line, fill='black', font=font)
+        flipped = page.rotate(180)
+        fixed = pe._upright(flipped)
+        check('orientation: an upside-down panel crop is turned upright',
+              fixed.tobytes() == page.tobytes())
+        check('orientation: an upright panel crop is left as it is',
+              pe._upright(page).tobytes() == page.tobytes())
+
     # Contains-line crop reader: orientation retries, and it only accepts a
     # statement that names an allergen. Mocked API, no network.
     import types

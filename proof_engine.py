@@ -1147,6 +1147,32 @@ def _largest_white_region_bbox_frac(im, white_threshold: int = 238, min_frac: fl
         return None
 
 
+def _upright(im):
+    """Rotate a panel crop upright before vision reads it. The pancake pouches
+    print the back panel upside down; sent as it lies, vision still recovered
+    enough fields to skip the orientation retries and misread the small rows
+    (Cinnamon Swirl's "Includes 0g Added Sugars" as 9g, then 6g; Buttermilk's
+    Contains line not at all). Tesseract's orientation detection is local,
+    free and repeatable; it cannot see mirroring, so the flip retries stay.
+    Returns the image unchanged when detection fails or is unsure."""
+    try:
+        import tempfile as _tf
+        with _tf.NamedTemporaryFile(suffix='.png', delete=False) as fh:
+            tmp = fh.name
+        im.save(tmp)
+        out = subprocess.run(['tesseract', tmp, 'stdout', '--psm', '0'],
+                             capture_output=True, text=True, timeout=60).stdout
+        os.remove(tmp)
+        rot = re.search(r'Rotate:\s*(\d+)', out)
+        conf = re.search(r'Orientation confidence:\s*([\d.]+)', out)
+        if rot and conf and float(conf.group(1)) >= 2.0 and int(rot.group(1)) in (90, 180, 270):
+            # "Rotate: N" = turn N degrees clockwise to read; PIL rotates counter-clockwise.
+            return im.rotate(-int(rot.group(1)), expand=True)
+    except Exception as _e:
+        print(f'[vision] orientation detection skipped: {_e}')
+    return im
+
+
 def _read_nfp_panel(img_path: str, bbox) -> dict:
     """Durable NFP read: crop the Nutrition/Supplement Facts panel to its own image
     (using the bbox from the first vision pass) and read that rectangle in isolation.
@@ -1189,6 +1215,7 @@ def _read_nfp_panel(img_path: str, bbox) -> dict:
             # image with the focused prompt + orientation flips; better than leaving
             # the panel unread, and still degrades to {} if nothing legible comes back.
             crop = im
+        crop = _upright(crop)
         # Upscale small crops so digits are large; then cap to the API's ~1.1MP.
         _long = max(crop.width, crop.height)
         if _long < 1600:
@@ -1289,7 +1316,7 @@ def _read_contains_crop(img_path: str, bbox):
                min(W, int((x1 + pw) * W)), min(H, int((y1 + ph) * H)))
         if box[2] - box[0] < 8 or box[3] - box[1] < 8:
             return None
-        crop = im.crop(box)
+        crop = _upright(im.crop(box))
         _cap = 1_140_000
         if crop.width * crop.height > _cap:
             sc = (_cap / float(crop.width * crop.height)) ** 0.5
