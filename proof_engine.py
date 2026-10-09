@@ -1857,6 +1857,9 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
         # Full-page vision serving reads set aside because the panel crop did
         # not confirm them — likewise deliberately NOT used.
         'panel_vision_unconfirmed': _vision_unconfirmed,
+        # Vision's structured allergen read (Contains line + detected), so a
+        # missed or misread declaration can be traced from the result.
+        'vision_allergens': dict(vision_allergens or {}),
         'ocr_failures': ocr_failures,
         'error': None,
         'matched_spec': matched_spec,
@@ -4714,8 +4717,18 @@ def _check_contains_vs_approved(contains_statement, approved: dict, label_text: 
         return []
     stmt = (contains_statement or '').strip()
     if not stmt:
-        m = re.search(r'\bcontains\s*[:\-]?\s*([^\n.]{2,120})', (label_text or ''), re.I)
-        stmt = m.group(1).strip() if m else ''
+        # The declaration, not the first "contains" in the text: ingredient
+        # lists say "contains less than 2% of: ...", which read as a Contains
+        # line declaring no allergens and flagged every approved one missing.
+        # Take the first "Contains" that names an allergen; failing that, the
+        # first one written as a declaration ("Contains:").
+        _cands = [(m.group(2).strip(), m.group(1) is not None)
+                  for m in re.finditer(r'\bcontains\s*([:\-])?\s*([^\n.]{2,120})', label_text or '', re.I)
+                  if not re.match(r'(?i)less\s+than\b', m.group(2).strip())]
+        _named = [t for t, _ in _cands
+                  if any(_canonical_allergen(p) for p in re.split(r'[,;/&]|\band\b', t))]
+        _declared = [t for t, colon in _cands if colon]
+        stmt = (_named or _declared or [''])[0]
     if not stmt:
         return [{'severity': 'review', 'message': (
             'The approved record declares ' + ', '.join(a.title() for a in declared) + ', but no '
