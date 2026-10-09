@@ -55,6 +55,26 @@ def _run():
     out = pe._check_contains_vs_approved('Milk, Wheat', APPROVED)
     check('a complete Contains line raises nothing', out == [])
 
+    # SUSPECT downgrade: a doubted number elsewhere on the file softens
+    # value-comparison criticals, never an allergen finding — pinned by issue
+    # kind, so it holds even under a downgradable check key ('panel').
+    allergen = pe._check_contains_vs_approved('Milk', APPROVED)[0]
+    allergen['kind'] = pe._FALCPA_ISSUE_KIND
+    stmt_diff = {'severity': 'critical', 'kind': pe._FALCPA_ISSUE_KIND,
+                 'message': 'Allergen statement differs from the approved panel v1.'}
+    nfp_crit = {'severity': 'critical', 'message': 'Calorie mismatch: front call-out shows 110 cal'}
+    checks = {'netwt': {'issues': [{'severity': 'suspect', 'message': 'SUSPECT READ — serving size'}]},
+              'fda': {'issues': [allergen]},
+              'panel': {'issues': [stmt_diff]},
+              'nfp': {'issues': [nfp_crit]}}
+    pe._downgrade_criticals_on_suspect_file(checks)
+    check('suspect downgrade leaves the FALCPA Contains-line CRITICAL a CRITICAL',
+          allergen['severity'] == 'critical')
+    check('...and the approved-panel allergen statement CRITICAL, under a downgradable key',
+          stmt_diff['severity'] == 'critical')
+    check('...while still downgrading a value-comparison CRITICAL on the same file',
+          nfp_crit['severity'] == 'suspect')
+
     # Contains-line crop reader: orientation retries, and it only accepts a
     # statement that names an allergen. Mocked API, no network.
     import types

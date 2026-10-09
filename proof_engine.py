@@ -1844,9 +1844,22 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
 
     # FALCPA vs the approved record: an allergen the approved panel of record
     # declares must appear in the artwork's own "Contains:" line.
+    _allergen_declared = _approved_allergens(_approved_panel)
     if 'fda' in checks and isinstance(checks['fda'], dict):
-        checks['fda'].setdefault('issues', []).extend(_check_contains_vs_approved(
-            (vision_allergens or {}).get('contains_statement'), _approved_panel, label_text))
+        _allergen_issues = _check_contains_vs_approved(
+            (vision_allergens or {}).get('contains_statement'), _approved_panel, label_text)
+        for _ai in _allergen_issues:
+            _ai['kind'] = _FALCPA_ISSUE_KIND
+        checks['fda'].setdefault('issues', []).extend(_allergen_issues)
+    else:
+        _allergen_issues = None
+    # A check this consequential never returns nothing without saying why.
+    print(f'[allergen] {fname} record={"yes" if _approved_panel else "none"} '
+          f'({_panel_fetch_reason}) declared={_allergen_declared} '
+          f'artwork_contains={(vision_allergens or {}).get("contains_statement")!r} '
+          f'source={(vision_allergens or {}).get("contains_source", "vision" if (vision_allergens or {}).get("contains_statement") else "text")} '
+          + ('fda check absent — allergen comparison NOT RUN' if _allergen_issues is None else
+             f'findings={[(i["severity"], i["message"][:60]) for i in _allergen_issues]}'))
 
     # A SUSPECT READ anywhere on this file means its extraction is doubted —
     # a confident CRITICAL from a different value-comparison check on the same
@@ -3023,6 +3036,10 @@ _PREP_HEADERS = (r'what\s+you(?:\'ll)?\s+need|directions?|to\s+prepare|preparati
 
 
 def _check_prep_block(text: str, panel: dict = None) -> dict:
+    """Classify the prep block (batch / per-serving / single-serve). Advisory:
+    it tells a person whether a serving-size change needs prep-copy edits, so
+    a block it reads but cannot classify completes as UNCLASSIFIED (a note)
+    rather than blocking CLEAN. Only a genuine NOT RUN still does."""
     issues, notes = [], []
     panel = panel or {}
     tl = _normalize_fractions((text or '').lower())
@@ -3125,9 +3142,13 @@ def _check_prep_block(text: str, panel: dict = None) -> dict:
                 'panel, so the prep block could not be classified against the serving '
                 'declaration. Re-check the panel read (see Reader Provenance).')
         else:
-            # Neither signal available — never default to a value that looks like a verdict.
+            # Read, but neither signal is there. Never default to a value that looks
+            # like a verdict — and never let this advisory read block CLEAN either:
+            # the check ran and its honest result is "unclassified", reported as a
+            # note for a person. (A genuine NOT RUN, above, still blocks CLEAN.)
+            prep_status = 'UNCLASSIFIED'
             notes.append(
-                'Prep block type UNKNOWN — could not read a yield statement or a comparable mix '
+                'Prep block UNCLASSIFIED — could not read a yield statement or a comparable mix '
                 'quantity. Classify manually before assuming a serving-size change does or does '
                 'not require prep-copy edits.')
 
@@ -3800,8 +3821,11 @@ def _check_approved_panel(artwork_panel: dict, front_artwork: dict, ingredients_
     issues += _diff_text_statement('Ingredient statement', ingredients_raw,
                                    approved_panel.get('ingredients'), version)
     _artwork_allergen = f'Contains: {allergen_contains}' if allergen_contains else ''
-    issues += _diff_text_statement('Allergen statement', _artwork_allergen,
-                                   approved_panel.get('allergen_statement'), version)
+    _allergen_diff = _diff_text_statement('Allergen statement', _artwork_allergen,
+                                          approved_panel.get('allergen_statement'), version)
+    for _ad in _allergen_diff:
+        _ad['kind'] = _FALCPA_ISSUE_KIND   # never softened by the suspect downgrade
+    issues += _allergen_diff
     issues += [{'severity': 'review', 'message': (
         f'{label} could not be read from the artwork to cross-check against the approved '
         f'panel v{version} ({_fmt_amt(p_val)}) — verify manually.')} for label, p_val in gaps]
@@ -3932,6 +3956,9 @@ def _fetch_prior_panel_version(gtin=None, sku=None):
 # SUSPECT READ in _check_net_weight is doubting. A spelling, eyemark, or
 # allergen-text finding doesn't share that failure mode, so it's left alone.
 _VALUE_COMPARISON_CHECKS = {'netwt', 'nfp', 'panel'}
+# Tag on FALCPA allergen findings: exempt from the suspect downgrade by issue,
+# whatever check key carries them.
+_FALCPA_ISSUE_KIND = 'falcpa_allergen'
 _SUSPECT_FIELD_LABEL = {'netwt': 'serving size', 'nfp': 'an NFP value', 'panel': 'a panel value'}
 
 
@@ -3962,6 +3989,11 @@ def _downgrade_criticals_on_suspect_file(checks: dict) -> None:
             continue
         for issue in c.get('issues', []):
             if issue.get('severity') != 'critical':
+                continue
+            # A missing allergen is a set-membership test against the record
+            # of truth; it rests on no extracted number, so a doubted number
+            # elsewhere on the file can never soften it.
+            if issue.get('kind') == _FALCPA_ISSUE_KIND:
                 continue
             issue['severity'] = 'suspect'
             issue['message'] = (
