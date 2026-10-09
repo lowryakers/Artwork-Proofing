@@ -55,6 +55,33 @@ def _run():
     out = pe._check_contains_vs_approved('Milk, Wheat', APPROVED)
     check('a complete Contains line raises nothing', out == [])
 
+    # Contains-line crop reader: orientation retries, and it only accepts a
+    # statement that names an allergen. Mocked API, no network.
+    import types
+    from PIL import Image
+    tmp = os.path.join(os.path.dirname(__file__), '_contains_tmp.png')
+    Image.new('RGB', (1200, 900), 'white').save(tmp)
+    replies = iter(['{"contains_statement": null}', '{"contains_statement": "Contains: Milk"}'])
+
+    class _R:
+        def __init__(s, t):
+            s.content, s.stop_reason = [types.SimpleNamespace(text=t)], 'end_turn'
+    prev = (pe.ANTHROPIC_AVAILABLE, pe.PIL_AVAILABLE, getattr(pe, '_anthropic', None), getattr(pe, 'Image', None))
+    os.environ.setdefault('ANTHROPIC_API_KEY', 'test')
+    pe.ANTHROPIC_AVAILABLE, pe.PIL_AVAILABLE, pe.Image = True, True, Image
+    pe._anthropic = types.SimpleNamespace(Anthropic=lambda api_key=None: types.SimpleNamespace(
+        messages=types.SimpleNamespace(create=lambda **k: _R(next(replies)))))
+    try:
+        got = pe._read_contains_crop(tmp, [0.4, 0.4, 0.6, 0.6])
+        check('Contains crop: unreadable straight, read rotated -> "Milk"', got == 'Milk')
+        replies = iter(['{"contains_statement": "less than 2% of: salt"}'] * 3)
+        check('Contains crop: a statement naming no allergen is not accepted',
+              pe._read_contains_crop(tmp, [0.4, 0.4, 0.6, 0.6]) is None)
+        check('Contains crop: no panel box -> None, no call', pe._read_contains_crop(tmp, None) is None)
+    finally:
+        pe.ANTHROPIC_AVAILABLE, pe.PIL_AVAILABLE, pe._anthropic, pe.Image = prev
+        os.remove(tmp)
+
     print()
     if fails:
         print('FAILURES:', *fails, sep='\n  - ')

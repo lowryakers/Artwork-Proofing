@@ -196,6 +196,7 @@ def _install_engine_stubs(pe):
         return wrapped
     pe._claude_vision_ocr = _memo(pe._claude_vision_ocr, 'vision')
     pe._read_nfp_panel = _memo(pe._read_nfp_panel, 'nfp_crop')
+    pe._read_contains_crop = _memo(pe._read_contains_crop, 'contains_crop')
     return local
 
 

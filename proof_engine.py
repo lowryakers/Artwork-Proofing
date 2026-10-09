@@ -1251,6 +1251,71 @@ def _read_nfp_panel(img_path: str, bbox) -> dict:
 
 # ── Single-file proofing ──────────────────────────────────────────────────────
 
+_CONTAINS_CROP_PROMPT = (
+    'This image is a crop of a food package back panel around its Nutrition Facts table. It '
+    'may be upside down, rotated or MIRROR-REVERSED; read it correctly oriented. Find the '
+    'FALCPA allergen declaration, the line that begins with the word "Contains" followed by '
+    'allergen names (e.g. "Contains: Milk, Wheat"). Ignore "contains less than 2% of" in the '
+    'ingredient list; that is not the declaration. Return ONLY this JSON object:\n'
+    '{"contains_statement": "<the text after Contains, exactly as printed, e.g. \\"Milk, '
+    'Wheat\\", or null if no such line is visible in this image>"}\n'
+    'Do NOT infer allergens from the ingredients: return only what the Contains line prints, '
+    'and null if you cannot clearly read one.')
+
+
+def _read_contains_crop(img_path: str, bbox):
+    """The FALCPA "Contains:" line, re-read from a crop around the Nutrition
+    Facts panel. The full-page vision pass misses it on small, upside-down back
+    panels (run 37975487968: the buttermilk pouch read no Contains line, so a
+    record declaring Wheat could not be checked). The declaration sits beside
+    the panel with the ingredients, so a padded crop of the panel's box holds
+    it. Tries the crop as is, rotated 180 and mirrored. Returns the statement
+    text, or None. Never raises."""
+    if not (ANTHROPIC_AVAILABLE and PIL_AVAILABLE and bbox):
+        return None
+    try:
+        import base64, io
+        im = Image.open(img_path).convert('RGB')
+        W, H = im.size
+        x0, y0, x1, y1 = bbox
+        pw, ph = (x1 - x0) * 0.6, (y1 - y0) * 0.6
+        box = (max(0, int((x0 - pw) * W)), max(0, int((y0 - ph) * H)),
+               min(W, int((x1 + pw) * W)), min(H, int((y1 + ph) * H)))
+        if box[2] - box[0] < 8 or box[3] - box[1] < 8:
+            return None
+        crop = im.crop(box)
+        _cap = 1_140_000
+        if crop.width * crop.height > _cap:
+            sc = (_cap / float(crop.width * crop.height)) ** 0.5
+            crop = crop.resize((max(1, int(crop.width * sc)), max(1, int(crop.height * sc))))
+        _client = _anthropic.Anthropic(api_key=os.environ['ANTHROPIC_API_KEY'])
+        for _t in (None, Image.ROTATE_180, Image.FLIP_LEFT_RIGHT):
+            pim = crop if _t is None else crop.transpose(_t)
+            _b = io.BytesIO()
+            pim.save(_b, format='JPEG', quality=95)
+            _msg = _client.messages.create(
+                model='claude-sonnet-4-6', max_tokens=300,
+                messages=[{'role': 'user', 'content': [
+                    {'type': 'image', 'source': {'type': 'base64', 'media_type': 'image/jpeg',
+                                                 'data': base64.standard_b64encode(_b.getvalue()).decode('utf-8')}},
+                    {'type': 'text', 'text': _CONTAINS_CROP_PROMPT}]}])
+            if getattr(_msg, 'stop_reason', None) == 'max_tokens':
+                continue
+            _txt = next((b.text for b in (_msg.content or []) if getattr(b, 'text', None)), '')
+            _start = _txt.find('{')
+            if _start < 0:
+                continue
+            data, _ = json.JSONDecoder().raw_decode(_txt[_start:])
+            cs = data.get('contains_statement')
+            if isinstance(cs, str) and cs.strip() and cs.strip().lower() not in ('null', 'none', 'n/a') \
+                    and any(_canonical_allergen(p) for p in re.split(r'[,;/&]|\band\b', cs)):
+                return re.sub(r'(?i)^\s*contains\s*:?\s*', '', cs.strip())
+        return None
+    except Exception as _e:
+        print(f'[vision] contains-crop read failed: {_e}')
+        return None
+
+
 def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
                   brand_config: dict = None, spec_rows: list = None) -> dict:
     brand_config = brand_config or {}
@@ -1524,6 +1589,12 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
         # Durable read: re-read the Nutrition Facts panel from an isolated crop so
         # its small digits are legible instead of squashed in the full-page pass.
         nfp_read = _read_nfp_panel(img_path, vision_nfp_bbox)
+        # No Contains line from the full-page pass, and an approved record that
+        # declares allergens to check it against: re-read it from a crop.
+        if not (vision_allergens or {}).get('contains_statement') and _approved_allergens(_approved_panel):
+            _cs = _read_contains_crop(img_path, vision_nfp_bbox)
+            if _cs:
+                vision_allergens = dict(vision_allergens or {}, contains_statement=_cs, contains_source='crop')
         _vision_diag = 'vision: {} | front={} nfp={} allergens={} eyemark={} panel={} bbox={} nfp_crop={}'.format(
             _vision.get('status', '?'),
             _vision.get('front_callout', {}),
