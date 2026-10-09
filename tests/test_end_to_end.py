@@ -196,6 +196,7 @@ def _install_engine_stubs(pe):
         return wrapped
     pe._claude_vision_ocr = _memo(pe._claude_vision_ocr, 'vision')
     pe._read_nfp_panel = _memo(pe._read_nfp_panel, 'nfp_crop')
+    pe._read_contains_crop = _memo(pe._read_contains_crop, 'contains_crop')
     return local
 
 
@@ -214,6 +215,13 @@ def _approved(expect, mutate=None):
 def _graded(res):
     return [(k, i) for k, c in (res.get('checks') or {}).items() if isinstance(c, dict)
             for i in c.get('issues', []) if i.get('severity') in ('critical', 'warning', 'suspect')]
+
+
+def _reviews(res):
+    # Not graded (a review asks a person to look; it is not a finding), but
+    # printed: a file that lands on REVIEW must say why in the log.
+    return [(k, i) for k, c in (res.get('checks') or {}).items() if isinstance(c, dict)
+            for i in c.get('issues', []) if i.get('severity') == 'review']
 
 
 def _criticals(res):
@@ -327,8 +335,10 @@ def _run():
                       f'{res.get("severity", "?").upper():<10} crit={res.get("critical_count")} '
                       f'warn={res.get("warning_count")} skipped={res.get("checks_skipped")} {secs:.0f}s',
                       flush=True)
-                for k, i in _graded(res):
+                for k, i in _graded(res) + _reviews(res):
                     print(f'      {i["severity"].upper():<8} [{k}] {i["message"][:150]}', flush=True)
+                if res.get('vision_allergens'):
+                    print(f'      vision allergens: {res["vision_allergens"]}', flush=True)
     print(f'\n{len(results)} pipeline runs in {time.time() - t0:.0f}s\n')
 
     # A key the API rejects leaves ANTHROPIC_AVAILABLE true while every vision

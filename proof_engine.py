@@ -850,6 +850,12 @@ def _claude_vision_ocr(img_path: str) -> dict:
         _msg = _client.messages.create(
             model='claude-sonnet-4-6',
             max_tokens=1500,
+            # Extraction, not generation: the same label must read the same way
+            # every run. Unset, sampling ran at 1.0 and the same Contains line,
+            # Added Sugars row and prep block read differently between runs.
+            # extra_body: anthropic 1.x dropped the keyword (a TypeError), the
+            # API still honours it on claude-sonnet-4-6.
+            extra_body={'temperature': 0},
             messages=[{'role': 'user', 'content': _content}],
         )
         # Pick the first content block that actually carries text (a future model
@@ -1141,6 +1147,32 @@ def _largest_white_region_bbox_frac(im, white_threshold: int = 238, min_frac: fl
         return None
 
 
+def _upright(im):
+    """Rotate a panel crop upright before vision reads it. The pancake pouches
+    print the back panel upside down; sent as it lies, vision still recovered
+    enough fields to skip the orientation retries and misread the small rows
+    (Cinnamon Swirl's "Includes 0g Added Sugars" as 9g, then 6g; Buttermilk's
+    Contains line not at all). Tesseract's orientation detection is local,
+    free and repeatable; it cannot see mirroring, so the flip retries stay.
+    Returns the image unchanged when detection fails or is unsure."""
+    try:
+        import tempfile as _tf
+        with _tf.NamedTemporaryFile(suffix='.png', delete=False) as fh:
+            tmp = fh.name
+        im.save(tmp)
+        out = subprocess.run(['tesseract', tmp, 'stdout', '--psm', '0'],
+                             capture_output=True, text=True, timeout=60).stdout
+        os.remove(tmp)
+        rot = re.search(r'Rotate:\s*(\d+)', out)
+        conf = re.search(r'Orientation confidence:\s*([\d.]+)', out)
+        if rot and conf and float(conf.group(1)) >= 2.0 and int(rot.group(1)) in (90, 180, 270):
+            # "Rotate: N" = turn N degrees clockwise to read; PIL rotates counter-clockwise.
+            return im.rotate(-int(rot.group(1)), expand=True)
+    except Exception as _e:
+        print(f'[vision] orientation detection skipped: {_e}')
+    return im
+
+
 def _read_nfp_panel(img_path: str, bbox) -> dict:
     """Durable NFP read: crop the Nutrition/Supplement Facts panel to its own image
     (using the bbox from the first vision pass) and read that rectangle in isolation.
@@ -1183,6 +1215,7 @@ def _read_nfp_panel(img_path: str, bbox) -> dict:
             # image with the focused prompt + orientation flips; better than leaving
             # the panel unread, and still degrades to {} if nothing legible comes back.
             crop = im
+        crop = _upright(crop)
         # Upscale small crops so digits are large; then cap to the API's ~1.1MP.
         _long = max(crop.width, crop.height)
         if _long < 1600:
@@ -1203,7 +1236,7 @@ def _read_nfp_panel(img_path: str, bbox) -> dict:
             # tokens, and a cut-off reply fails to parse (run 37844252128: every
             # pancake panel). 1200 leaves room for a pretty-printed object.
             _msg = _client.messages.create(
-                model='claude-sonnet-4-6', max_tokens=1200,
+                model='claude-sonnet-4-6', max_tokens=1200, extra_body={'temperature': 0},
                 messages=[{'role': 'user', 'content': [
                     {'type': 'image', 'source': {'type': 'base64', 'media_type': 'image/jpeg', 'data': b64}},
                     {'type': 'text', 'text': _NFP_CROP_PROMPT}]}])
@@ -1250,6 +1283,71 @@ def _read_nfp_panel(img_path: str, bbox) -> dict:
 
 
 # ── Single-file proofing ──────────────────────────────────────────────────────
+
+_CONTAINS_CROP_PROMPT = (
+    'This image is a crop of a food package back panel around its Nutrition Facts table. It '
+    'may be upside down, rotated or MIRROR-REVERSED; read it correctly oriented. Find the '
+    'FALCPA allergen declaration, the line that begins with the word "Contains" followed by '
+    'allergen names (e.g. "Contains: Milk, Wheat"). Ignore "contains less than 2% of" in the '
+    'ingredient list; that is not the declaration. Return ONLY this JSON object:\n'
+    '{"contains_statement": "<the text after Contains, exactly as printed, e.g. \\"Milk, '
+    'Wheat\\", or null if no such line is visible in this image>"}\n'
+    'Do NOT infer allergens from the ingredients: return only what the Contains line prints, '
+    'and null if you cannot clearly read one.')
+
+
+def _read_contains_crop(img_path: str, bbox):
+    """The FALCPA "Contains:" line, re-read from a crop around the Nutrition
+    Facts panel. The full-page vision pass misses it on small, upside-down back
+    panels (run 37975487968: the buttermilk pouch read no Contains line, so a
+    record declaring Wheat could not be checked). The declaration sits beside
+    the panel with the ingredients, so a padded crop of the panel's box holds
+    it. Tries the crop as is, rotated 180 and mirrored. Returns the statement
+    text, or None. Never raises."""
+    if not (ANTHROPIC_AVAILABLE and PIL_AVAILABLE and bbox):
+        return None
+    try:
+        import base64, io
+        im = Image.open(img_path).convert('RGB')
+        W, H = im.size
+        x0, y0, x1, y1 = bbox
+        pw, ph = (x1 - x0) * 0.6, (y1 - y0) * 0.6
+        box = (max(0, int((x0 - pw) * W)), max(0, int((y0 - ph) * H)),
+               min(W, int((x1 + pw) * W)), min(H, int((y1 + ph) * H)))
+        if box[2] - box[0] < 8 or box[3] - box[1] < 8:
+            return None
+        crop = _upright(im.crop(box))
+        _cap = 1_140_000
+        if crop.width * crop.height > _cap:
+            sc = (_cap / float(crop.width * crop.height)) ** 0.5
+            crop = crop.resize((max(1, int(crop.width * sc)), max(1, int(crop.height * sc))))
+        _client = _anthropic.Anthropic(api_key=os.environ['ANTHROPIC_API_KEY'])
+        for _t in (None, Image.ROTATE_180, Image.FLIP_LEFT_RIGHT):
+            pim = crop if _t is None else crop.transpose(_t)
+            _b = io.BytesIO()
+            pim.save(_b, format='JPEG', quality=95)
+            _msg = _client.messages.create(
+                model='claude-sonnet-4-6', max_tokens=300, extra_body={'temperature': 0},
+                messages=[{'role': 'user', 'content': [
+                    {'type': 'image', 'source': {'type': 'base64', 'media_type': 'image/jpeg',
+                                                 'data': base64.standard_b64encode(_b.getvalue()).decode('utf-8')}},
+                    {'type': 'text', 'text': _CONTAINS_CROP_PROMPT}]}])
+            if getattr(_msg, 'stop_reason', None) == 'max_tokens':
+                continue
+            _txt = next((b.text for b in (_msg.content or []) if getattr(b, 'text', None)), '')
+            _start = _txt.find('{')
+            if _start < 0:
+                continue
+            data, _ = json.JSONDecoder().raw_decode(_txt[_start:])
+            cs = data.get('contains_statement')
+            if isinstance(cs, str) and cs.strip() and cs.strip().lower() not in ('null', 'none', 'n/a') \
+                    and any(_canonical_allergen(p) for p in re.split(r'[,;/&]|\band\b', cs)):
+                return re.sub(r'(?i)^\s*contains\s*:?\s*', '', cs.strip())
+        return None
+    except Exception as _e:
+        print(f'[vision] contains-crop read failed: {_e}')
+        return None
+
 
 def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
                   brand_config: dict = None, spec_rows: list = None) -> dict:
@@ -1524,6 +1622,12 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
         # Durable read: re-read the Nutrition Facts panel from an isolated crop so
         # its small digits are legible instead of squashed in the full-page pass.
         nfp_read = _read_nfp_panel(img_path, vision_nfp_bbox)
+        # No Contains line from the full-page pass, and an approved record that
+        # declares allergens to check it against: re-read it from a crop.
+        if not (vision_allergens or {}).get('contains_statement') and _approved_allergens(_approved_panel):
+            _cs = _read_contains_crop(img_path, vision_nfp_bbox)
+            if _cs:
+                vision_allergens = dict(vision_allergens or {}, contains_statement=_cs, contains_source='crop')
         _vision_diag = 'vision: {} | front={} nfp={} allergens={} eyemark={} panel={} bbox={} nfp_crop={}'.format(
             _vision.get('status', '?'),
             _vision.get('front_callout', {}),
@@ -1773,9 +1877,22 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
 
     # FALCPA vs the approved record: an allergen the approved panel of record
     # declares must appear in the artwork's own "Contains:" line.
+    _allergen_declared = _approved_allergens(_approved_panel)
     if 'fda' in checks and isinstance(checks['fda'], dict):
-        checks['fda'].setdefault('issues', []).extend(_check_contains_vs_approved(
-            (vision_allergens or {}).get('contains_statement'), _approved_panel, label_text))
+        _allergen_issues = _check_contains_vs_approved(
+            (vision_allergens or {}).get('contains_statement'), _approved_panel, label_text)
+        for _ai in _allergen_issues:
+            _ai['kind'] = _FALCPA_ISSUE_KIND
+        checks['fda'].setdefault('issues', []).extend(_allergen_issues)
+    else:
+        _allergen_issues = None
+    # A check this consequential never returns nothing without saying why.
+    print(f'[allergen] {fname} record={"yes" if _approved_panel else "none"} '
+          f'({_panel_fetch_reason}) declared={_allergen_declared} '
+          f'artwork_contains={(vision_allergens or {}).get("contains_statement")!r} '
+          f'source={(vision_allergens or {}).get("contains_source", "vision" if (vision_allergens or {}).get("contains_statement") else "text")} '
+          + ('fda check absent — allergen comparison NOT RUN' if _allergen_issues is None else
+             f'findings={[(i["severity"], i["message"][:60]) for i in _allergen_issues]}'))
 
     # A SUSPECT READ anywhere on this file means its extraction is doubted —
     # a confident CRITICAL from a different value-comparison check on the same
@@ -1857,6 +1974,9 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
         # Full-page vision serving reads set aside because the panel crop did
         # not confirm them — likewise deliberately NOT used.
         'panel_vision_unconfirmed': _vision_unconfirmed,
+        # Vision's structured allergen read (Contains line + detected), so a
+        # missed or misread declaration can be traced from the result.
+        'vision_allergens': dict(vision_allergens or {}),
         'ocr_failures': ocr_failures,
         'error': None,
         'matched_spec': matched_spec,
@@ -2949,6 +3069,10 @@ _PREP_HEADERS = (r'what\s+you(?:\'ll)?\s+need|directions?|to\s+prepare|preparati
 
 
 def _check_prep_block(text: str, panel: dict = None) -> dict:
+    """Classify the prep block (batch / per-serving / single-serve). Advisory:
+    it tells a person whether a serving-size change needs prep-copy edits, so
+    a block it reads but cannot classify completes as UNCLASSIFIED (a note)
+    rather than blocking CLEAN. Only a genuine NOT RUN still does."""
     issues, notes = [], []
     panel = panel or {}
     tl = _normalize_fractions((text or '').lower())
@@ -3051,9 +3175,13 @@ def _check_prep_block(text: str, panel: dict = None) -> dict:
                 'panel, so the prep block could not be classified against the serving '
                 'declaration. Re-check the panel read (see Reader Provenance).')
         else:
-            # Neither signal available — never default to a value that looks like a verdict.
+            # Read, but neither signal is there. Never default to a value that looks
+            # like a verdict — and never let this advisory read block CLEAN either:
+            # the check ran and its honest result is "unclassified", reported as a
+            # note for a person. (A genuine NOT RUN, above, still blocks CLEAN.)
+            prep_status = 'UNCLASSIFIED'
             notes.append(
-                'Prep block type UNKNOWN — could not read a yield statement or a comparable mix '
+                'Prep block UNCLASSIFIED — could not read a yield statement or a comparable mix '
                 'quantity. Classify manually before assuming a serving-size change does or does '
                 'not require prep-copy edits.')
 
@@ -3726,8 +3854,11 @@ def _check_approved_panel(artwork_panel: dict, front_artwork: dict, ingredients_
     issues += _diff_text_statement('Ingredient statement', ingredients_raw,
                                    approved_panel.get('ingredients'), version)
     _artwork_allergen = f'Contains: {allergen_contains}' if allergen_contains else ''
-    issues += _diff_text_statement('Allergen statement', _artwork_allergen,
-                                   approved_panel.get('allergen_statement'), version)
+    _allergen_diff = _diff_text_statement('Allergen statement', _artwork_allergen,
+                                          approved_panel.get('allergen_statement'), version)
+    for _ad in _allergen_diff:
+        _ad['kind'] = _FALCPA_ISSUE_KIND   # never softened by the suspect downgrade
+    issues += _allergen_diff
     issues += [{'severity': 'review', 'message': (
         f'{label} could not be read from the artwork to cross-check against the approved '
         f'panel v{version} ({_fmt_amt(p_val)}) — verify manually.')} for label, p_val in gaps]
@@ -3858,6 +3989,9 @@ def _fetch_prior_panel_version(gtin=None, sku=None):
 # SUSPECT READ in _check_net_weight is doubting. A spelling, eyemark, or
 # allergen-text finding doesn't share that failure mode, so it's left alone.
 _VALUE_COMPARISON_CHECKS = {'netwt', 'nfp', 'panel'}
+# Tag on FALCPA allergen findings: exempt from the suspect downgrade by issue,
+# whatever check key carries them.
+_FALCPA_ISSUE_KIND = 'falcpa_allergen'
 _SUSPECT_FIELD_LABEL = {'netwt': 'serving size', 'nfp': 'an NFP value', 'panel': 'a panel value'}
 
 
@@ -3888,6 +4022,11 @@ def _downgrade_criticals_on_suspect_file(checks: dict) -> None:
             continue
         for issue in c.get('issues', []):
             if issue.get('severity') != 'critical':
+                continue
+            # A missing allergen is a set-membership test against the record
+            # of truth; it rests on no extracted number, so a doubted number
+            # elsewhere on the file can never soften it.
+            if issue.get('kind') == _FALCPA_ISSUE_KIND:
                 continue
             issue['severity'] = 'suspect'
             issue['message'] = (
@@ -4714,8 +4853,18 @@ def _check_contains_vs_approved(contains_statement, approved: dict, label_text: 
         return []
     stmt = (contains_statement or '').strip()
     if not stmt:
-        m = re.search(r'\bcontains\s*[:\-]?\s*([^\n.]{2,120})', (label_text or ''), re.I)
-        stmt = m.group(1).strip() if m else ''
+        # The declaration, not the first "contains" in the text: ingredient
+        # lists say "contains less than 2% of: ...", which read as a Contains
+        # line declaring no allergens and flagged every approved one missing.
+        # Take the first "Contains" that names an allergen; failing that, the
+        # first one written as a declaration ("Contains:").
+        _cands = [(m.group(2).strip(), m.group(1) is not None)
+                  for m in re.finditer(r'\bcontains\s*([:\-])?\s*([^\n.]{2,120})', label_text or '', re.I)
+                  if not re.match(r'(?i)less\s+than\b', m.group(2).strip())]
+        _named = [t for t, _ in _cands
+                  if any(_canonical_allergen(p) for p in re.split(r'[,;/&]|\band\b', t))]
+        _declared = [t for t, colon in _cands if colon]
+        stmt = (_named or _declared or [''])[0]
     if not stmt:
         return [{'severity': 'review', 'message': (
             'The approved record declares ' + ', '.join(a.title() for a in declared) + ', but no '
