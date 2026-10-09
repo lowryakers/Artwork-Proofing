@@ -853,7 +853,9 @@ def _claude_vision_ocr(img_path: str) -> dict:
             # Extraction, not generation: the same label must read the same way
             # every run. Unset, sampling ran at 1.0 and the same Contains line,
             # Added Sugars row and prep block read differently between runs.
-            temperature=0,
+            # extra_body: anthropic 1.x dropped the keyword (a TypeError), the
+            # API still honours it on claude-sonnet-4-6.
+            extra_body={'temperature': 0},
             messages=[{'role': 'user', 'content': _content}],
         )
         # Pick the first content block that actually carries text (a future model
@@ -1207,7 +1209,7 @@ def _read_nfp_panel(img_path: str, bbox) -> dict:
             # tokens, and a cut-off reply fails to parse (run 37844252128: every
             # pancake panel). 1200 leaves room for a pretty-printed object.
             _msg = _client.messages.create(
-                model='claude-sonnet-4-6', max_tokens=1200, temperature=0,
+                model='claude-sonnet-4-6', max_tokens=1200, extra_body={'temperature': 0},
                 messages=[{'role': 'user', 'content': [
                     {'type': 'image', 'source': {'type': 'base64', 'media_type': 'image/jpeg', 'data': b64}},
                     {'type': 'text', 'text': _NFP_CROP_PROMPT}]}])
@@ -1298,7 +1300,7 @@ def _read_contains_crop(img_path: str, bbox):
             _b = io.BytesIO()
             pim.save(_b, format='JPEG', quality=95)
             _msg = _client.messages.create(
-                model='claude-sonnet-4-6', max_tokens=300, temperature=0,
+                model='claude-sonnet-4-6', max_tokens=300, extra_body={'temperature': 0},
                 messages=[{'role': 'user', 'content': [
                     {'type': 'image', 'source': {'type': 'base64', 'media_type': 'image/jpeg',
                                                  'data': base64.standard_b64encode(_b.getvalue()).decode('utf-8')}},
