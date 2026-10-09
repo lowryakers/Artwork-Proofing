@@ -1,0 +1,74 @@
+name: End-to-end (vision)
+
+# Runs tests/test_end_to_end.py on the real converter PDFs with Claude Vision on.
+# Needs the ANTHROPIC_API_KEY repository secret; each run makes ~34 vision calls.
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'proof_engine.py'
+      - 'app.py'
+      - 'die_templates.py'
+      - 'readydoc.py'
+      - 'requirements.txt'
+      - 'tests/**'
+      - '.github/workflows/e2e.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  e2e:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      # Cache LFS objects so repeat runs don't spend the repo's LFS bandwidth
+      # (the whey set is ~150 MB).
+      - name: List LFS objects
+        run: git lfs ls-files --long | cut -d ' ' -f1 | sort > .lfs-assets-id
+      - uses: actions/cache@v4
+        with:
+          path: .git/lfs
+          key: lfs-${{ hashFiles('.lfs-assets-id') }}
+      - name: Pull LFS objects
+        run: git lfs pull
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      # Same system tools and Tesseract model as the Dockerfile.
+      - name: Install system tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends poppler-utils tesseract-ocr tesseract-ocr-eng libzbar0
+          TESSDATA=$(find /usr/share/tesseract-ocr -name tessdata -type d | head -1)
+          sudo curl -fsSL https://github.com/tesseract-ocr/tessdata_best/raw/main/eng.traineddata \
+            -o "${TESSDATA}/eng.traineddata" \
+            || echo "WARNING: tessdata_best download failed — using standard model"
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run end-to-end
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          # A missing key or un-pulled fixture fails the run instead of skipping.
+          ARTPROOF_E2E_REQUIRED: '1'
+        run: |
+          set -o pipefail
+          python3 tests/test_end_to_end.py 2>&1 | tee e2e.log
+
+      - name: Upload log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-log
+          path: e2e.log

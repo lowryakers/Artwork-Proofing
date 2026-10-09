@@ -1199,11 +1199,16 @@ def _read_nfp_panel(img_path: str, bbox) -> dict:
             _b = io.BytesIO()
             pim.save(_b, format='JPEG', quality=95)
             b64 = base64.standard_b64encode(_b.getvalue()).decode('utf-8')
+            # The prompt asks for ~37 fields; a full panel's JSON runs past 400
+            # tokens, and a cut-off reply fails to parse (run 37844252128: every
+            # pancake panel). 1200 leaves room for a pretty-printed object.
             _msg = _client.messages.create(
-                model='claude-sonnet-4-6', max_tokens=400,
+                model='claude-sonnet-4-6', max_tokens=1200,
                 messages=[{'role': 'user', 'content': [
                     {'type': 'image', 'source': {'type': 'base64', 'media_type': 'image/jpeg', 'data': b64}},
                     {'type': 'text', 'text': _NFP_CROP_PROMPT}]}])
+            if getattr(_msg, 'stop_reason', None) == 'max_tokens':
+                raise ValueError('reply cut off at max_tokens — panel JSON incomplete')
             _txt = ''
             for _blk in (_msg.content or []):
                 if getattr(_blk, 'text', None):
@@ -1579,10 +1584,22 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
     # values it actually returned. Every field carries its reader in _src
     # ('nfp_crop' | 'vision_struct' | 'page_regex' | None) so the report can tell
     # a value read cleanly from the panel crop from one scraped off the page.
-    for _k in ('serving_size_g', 'serving_size_cups', 'servings_per_container', 'serving_size_desc'):
+    _SERVING_FIELDS = ('serving_size_g', 'serving_size_cups', 'servings_per_container', 'serving_size_desc')
+    for _k in _SERVING_FIELDS:
         if nfp_read.get(_k) is not None:
             _panel[_k] = nfp_read[_k]
             _panel['_src'][_k] = 'nfp_crop'
+    # The crop ran but recovered no serving line (a failed or unreadable read).
+    # The full-page structured read is NOT a stand-in for it: on run 37844252128
+    # it read the pancake panels as 65g / 7 servings (true 83g / 5) and raised a
+    # false serving CRITICAL on every one. Quarantine those values, as page-regex
+    # reads are, so the serving checks report not evaluated instead.
+    _vision_unconfirmed = {}
+    if vision_panel is not None and not any(nfp_read.get(_k) is not None for _k in _SERVING_FIELDS):
+        for _k in _SERVING_FIELDS:
+            if _panel['_src'].get(_k) == 'vision_struct' and _panel.get(_k) is not None:
+                _vision_unconfirmed[_k] = _panel.pop(_k)
+                _panel['_src'].pop(_k, None)
     _PANEL_FIELDS = ('serving_size_g', 'serving_size_cups', 'servings_per_container',
                      'serving_size_desc', 'declared_net_weight_g', 'unit_count')
     _panel_provenance = {k: (_panel['_src'].get(k) if _panel.get(k) is not None else None)
@@ -1590,7 +1607,8 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
     _panel_values = {k: _panel.get(k) for k in _PANEL_FIELDS}
     print('[reader] ' + fname + ' ' + ' '.join(
         f'{k}={_panel_values[k]!r}<{_panel_provenance[k] or "absent"}>' for k in _PANEL_FIELDS)
-        + (f' page_regex_only={_panel["_page_regex"]}' if _panel.get('_page_regex') else ''))
+        + (f' page_regex_only={_panel["_page_regex"]}' if _panel.get('_page_regex') else '')
+        + (f' vision_unconfirmed={_vision_unconfirmed}' if _vision_unconfirmed else ''))
     # Feed the crop's NFP calories/protein into the front-vs-NFP comparison, and
     # keep its carb components for the net-carb recompute.
     if nfp_read:
@@ -1836,6 +1854,9 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
         'panel_values': _panel_values,
         'panel_provenance': _panel_provenance,
         'panel_page_regex': dict(_panel.get('_page_regex') or {}),
+        # Full-page vision serving reads set aside because the panel crop did
+        # not confirm them — likewise deliberately NOT used.
+        'panel_vision_unconfirmed': _vision_unconfirmed,
         'ocr_failures': ocr_failures,
         'error': None,
         'matched_spec': matched_spec,
@@ -2197,6 +2218,11 @@ def _check_nfp(ocr_text: str, front_text: str = '', vision_nutrition: dict = Non
 
     # Strategy 3: reverse window — "calories" keyword with a number in the 120
     # chars BEFORE it; protein keyword with number in 60 chars before it.
+    # This window is not bound to the keyword: on the whey bottles it took the
+    # dieline's "95.00 mm Layflat" as a 95-calorie call-out and filed a false
+    # CRITICAL on 22 of 30 correct labels. Its values are kept apart and can
+    # only mark the comparison NOT EVALUATED, never decide it.
+    _fc_cals_loose, _fc_prots_loose = set(), set()
     for _km in re.finditer(r'\bcal(?:ories?)?\b', fl):
         _before = fl[max(0, _km.start() - 120): _km.start()]
         for _vm in re.finditer(r'\b(\d{2,3})\b', _before):
@@ -2206,7 +2232,7 @@ def _check_nfp(ocr_text: str, front_text: str = '', vision_nutrition: dict = Non
                 _trail = _before[_vm.end(): _vm.end() + 4].lstrip()
                 if _trail.startswith('%'):
                     continue
-                _fc_cals.add(_vi)
+                _fc_cals_loose.add(_vi)
     for _km in re.finditer(r'\bprotein\b', fl):
         _before = fl[max(0, _km.start() - 60): _km.start()]
         for _vm in re.finditer(r'\b(\d{1,2})\b', _before):
@@ -2218,7 +2244,7 @@ def _check_nfp(ocr_text: str, front_text: str = '', vision_nutrition: dict = Non
                 _trail = _before[_vm.end(): _vm.end() + 4].lstrip()
                 if _trail.startswith('%'):
                     continue
-                _fc_prots.add(_vi)
+                _fc_prots_loose.add(_vi)
 
     front_calories  = sorted(_fc_cals)
     front_proteins  = sorted(_fc_prots)
@@ -2268,6 +2294,25 @@ def _check_nfp(ocr_text: str, front_text: str = '', vision_nutrition: dict = Non
         r'per\s+serving\s+prepared',
         tl
     ))
+
+    # A front value found only by the loose window cannot decide the front-vs-NFP
+    # comparison. When it is all there is and it doesn't simply repeat the NFP
+    # value, say the comparison was not evaluated and send it to a person.
+    _unconfirmed_front = {}
+    if not has_dual_column and not front_calories and _fc_cals_loose and nfp_calories and _fc_cals_loose != set(nfp_calories):
+        _unconfirmed_front['calories'] = sorted(_fc_cals_loose)
+        issues.append({'severity': 'review', 'message': (
+            f'NOT EVALUATED — front calorie call-out: the only front value read '
+            f'({", ".join(str(v) for v in sorted(_fc_cals_loose))}) was a number near the word '
+            f'"calories", not a call-out bound to it, so it was not compared with the NFP '
+            f'({", ".join(str(v) for v in nfp_calories)} cal). Check the front call-out by eye.')})
+    if not has_dual_column and not front_proteins and _fc_prots_loose and nfp_proteins and _fc_prots_loose != set(nfp_proteins):
+        _unconfirmed_front['protein_g'] = sorted(_fc_prots_loose)
+        issues.append({'severity': 'review', 'message': (
+            f'NOT EVALUATED — front protein call-out: the only front value read '
+            f'({", ".join(str(v) for v in sorted(_fc_prots_loose))}g) was a number near the word '
+            f'"protein", not a call-out bound to it, so it was not compared with the NFP '
+            f'({", ".join(str(v) for v in nfp_proteins)}g). Check the front call-out by eye.')})
 
     # Calorie mismatch — prefer a direct front-callout vs NFP comparison (most
     # accurate). Fall back to a pooled range check when only one source read.
@@ -2353,6 +2398,8 @@ def _check_nfp(ocr_text: str, front_text: str = '', vision_nutrition: dict = Non
             'calories': front_calories,
             'proteins': front_proteins,
             'zero_sugar': front_zero_sugar,
+            # Loose-window values set aside, not compared (see NOT EVALUATED).
+            'unconfirmed': _unconfirmed_front,
         },
         'nfp_data': {
             'calories': nfp_calories,
