@@ -10,6 +10,7 @@ every approved allergen missing — a false CRITICAL on a correct label.
 Exits non-zero on any failure. No test framework, no network, no vision API.
 """
 import os
+import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -54,6 +55,30 @@ def _run():
 
     out = pe._check_contains_vs_approved('Milk, Wheat', APPROVED)
     check('a complete Contains line raises nothing', out == [])
+
+    # Coconut: not a tree nut (FDA food allergen Q&A, 5th ed., 2025), and
+    # "Coconut Milk Powder" is not dairy. Every beef bottle carries it with no
+    # Contains line, correctly.
+    beef = ('ingredients: grass fed beef protein isolate, coconut milk powder, bovine collagen '
+            'peptides, natural flavors, cinnamon powder, contains less than 2% of: himalayan '
+            'pink salt, stevia leaf extract (reb a & reb m), guar gum\n'
+            'nutrition facts 1 serving per container serving size 1 bottle (35g) calories 130\n'
+            'total fat 1.5g saturated fat 1.5g cholesterol 0mg sodium 330mg total carbohydrate 4g\n'
+            'dietary fiber 1g total sugars 1g includes 0g added sugars protein 25g\n'
+            'manufactured by powderops vineyard, ut 84059 net wt. 1.23 oz (35g)\n'
+            'amazing taste made with premium ingredients for real results whether you are '
+            'building muscle improving recovery managing hunger supporting healthy weight '
+            'boosting glycemic balance or simply elevating everyday wellness prodough beef '
+            'protein delivers all natural ingredients supports digestion mixes instantly\n')
+    out = pe._check_fda(beef, 'PD_beef_bottle_cinnamon_sugar.pdf')
+    check('coconut milk powder raises no allergen finding (not a tree nut, not milk)',
+          not any(re.search(r'allergen|tree nut|\bmilk\b', i['message'].lower()) for i in out['issues']))
+    out = pe._check_fda(beef.replace('coconut milk powder', 'nonfat dry milk'),
+                        'PD_beef_bottle_cinnamon_sugar.pdf')
+    check('...while a dairy milk on the same label still reads as milk',
+          any('"milk" (milk)' in i['message'].lower() for i in out['issues']))
+    check('a Contains line naming only coconut no longer satisfies a tree-nut declaration',
+          pe._canonical_allergen('coconut') != 'tree nut')
 
     # SUSPECT downgrade: a doubted number elsewhere on the file softens
     # value-comparison criticals, never an allergen finding — pinned by issue

@@ -61,6 +61,23 @@ def _run():
           any('Calorie mismatch: front call-out shows 110' in i['message'] for i in crit(out)))
     check('...with no NOT EVALUATED alongside it', not not_eval(out, 'calorie'))
 
+    # Side-by-side rings interleave in OCR. On the beef bottles the "100%
+    # Grass-Fed" ring lost its superscript % and read "100 / Calories Per /
+    # Grass-F" — the neighbouring ring's caption — a false 100-cal CRITICAL on
+    # Cinnamon Sugar and Frosted Vanilla. A number whose caption lines carry
+    # another ring's caption is not bound to calories.
+    beef_nfp = NFP.replace('120', '130')
+    out = pe._check_nfp(beef_nfp, front_text='0%\n130\nSTEP 3\nProtein 25g\n100\nCalories Per\nGrass-F\nServing Beef')
+    check('a ring number whose caption lines carry a competing caption raises no CRITICAL',
+          not crit(out))
+    check('...and is not taken as the front call-out value', out['front_callout']['calories'] == [])
+    out = pe._check_nfp(beef_nfp, front_text='100\n\nCalories Per\n\nGrass-F\n\nEnjoy your protein')
+    check('...also when OCR puts blank lines between the ring lines (as the pipeline text does)',
+          not crit(out) and out['front_callout']['calories'] == [])
+    out = pe._check_nfp(beef_nfp, front_text='100\nCalories\nPer Serving')
+    check('a ring number with only its calorie caption is still bound, and still a CRITICAL',
+          any('front call-out shows 100' in i['message'] for i in crit(out)))
+
     # A vision read of the call-out overrides the text reads entirely.
     vn = {'front_callout': {'calories': 120, 'protein_g': 25}, 'nfp': {'calories': 120, 'protein_g': 25}}
     out = pe._check_nfp(NFP, front_text='95.00 mm Layflat\nGrass-Fed Calories Per Serving',

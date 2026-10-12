@@ -2298,10 +2298,13 @@ def _check_nfp(ocr_text: str, front_text: str = '', vision_nutrition: dict = Non
     # Front callout format — circular badge callouts show the number on one line
     # and the label on the next, so we need multi-strategy detection.
     _fc_cals, _fc_prots = set(), set()
+    _fc_cals_loose, _fc_prots_loose = set(), set()
 
     # Strategy 1: inline "117 cal/calories" or "25g protein" on same line
     # Run on fl (left-half / front-panel text) for accuracy
-    for _v in re.findall(r'\b(\d{2,3})\s*cal(?:ories?)?\b(?!\s*\d)', fl):
+    # Same line only ([ \t], not \s): a number and caption on separate lines
+    # is a badge, and Strategy 2 decides whether the caption is its own.
+    for _v in re.findall(r'\b(\d{2,3})[ \t]*cal(?:ories?)?\b(?!\s*\d)', fl):
         if 30 <= int(_v) <= 800: _fc_cals.add(int(_v))
     for _v in re.findall(r'\b(\d+)\s*g\s+protein\b', fl):
         if 0 < int(_v) < 120: _fc_prots.add(int(_v))
@@ -2320,7 +2323,16 @@ def _check_nfp(ocr_text: str, front_text: str = '', vision_nutrition: dict = Non
             _next_few = ' '.join(l.strip() for l in _lines[_i + 1: _i + 3])
             _is_pct = '%' in _next_few or 'percent' in _next_few.lower()
             if not _is_pct and 30 <= _v <= 800 and re.search(r'\bcal(?:ories?)?\b', _ctx_fwd):
-                _fc_cals.add(_v)
+                # Side-by-side rings interleave in OCR: on the beef bottles the
+                # "100%" ring loses its superscript % and reads "100 / Calories
+                # Per / Grass-F", taking the neighbouring ring's caption. A number
+                # whose caption lines also carry another ring's caption is not
+                # bound to calories — keep it loose (NOT EVALUATED at most).
+                _caption = ' '.join([l.strip() for l in _lines[_i + 1: _i + 8] if l.strip()][:3]).lower()
+                if re.search(r'grass|\bfed\b|%|protein|sugar', _caption):
+                    _fc_cals_loose.add(_v)
+                else:
+                    _fc_cals.add(_v)
         # Standalone "NNg" or "NN" followed by "g" on next line (e.g. "25g" or "25G")
         _mg = re.match(r'^(\d+)g$', _s)
         if _mg:
@@ -2342,7 +2354,6 @@ def _check_nfp(ocr_text: str, front_text: str = '', vision_nutrition: dict = Non
     # dieline's "95.00 mm Layflat" as a 95-calorie call-out and filed a false
     # CRITICAL on 22 of 30 correct labels. Its values are kept apart and can
     # only mark the comparison NOT EVALUATED, never decide it.
-    _fc_cals_loose, _fc_prots_loose = set(), set()
     for _km in re.finditer(r'\bcal(?:ories?)?\b', fl):
         _before = fl[max(0, _km.start() - 120): _km.start()]
         for _vm in re.finditer(r'\b(\d{2,3})\b', _before):
@@ -4803,8 +4814,10 @@ _FALCPA_SYNONYMS = {
     'wheat': ('wheat',),
     'soy': ('soy',),
     'peanut': ('peanut',),
+    # Not coconut: FDA's food allergen guidance (Q&A, 5th ed., Jan 2025) no
+    # longer lists it as a tree nut.
     'tree nut': ('tree nut', 'almond', 'cashew', 'walnut', 'pecan', 'hazelnut', 'pistachio',
-                 'macadamia', 'coconut'),
+                 'macadamia'),
     'fish': ('fish',),
     'shellfish': ('shellfish', 'crustacean', 'shrimp', 'crab', 'lobster'),
     'sesame': ('sesame',),
@@ -5063,6 +5076,11 @@ def _check_fda(ocr_text: str, fname: str, vision_allergens: dict = None) -> dict
     _alg_text = re.sub(r'\blact(?:ase|ose)\s*\d*\s*alu\b', ' ', _alg_text)
     _alg_text = re.sub(r'\blactase\b', ' ', _alg_text)
 
+    # A plant "milk" is not dairy: "Coconut Milk Powder" is on every beef bottle,
+    # which carries no milk. Keep the plant word so an almond or soy milk still
+    # counts as that allergen.
+    _alg_text = re.sub(r'\b(coconut|almond|cashew|oat|rice|soy|hemp|pea)\s+milk\b', r'\1', _alg_text)
+
     # Per-allergen ingredient presence (directions/advisory text removed). Each
     # hit records the matched TEXT, not just a bool — the finding this feeds can
     # then show its own evidence instead of asking the reader to take it on faith.
@@ -5076,7 +5094,8 @@ def _check_fda(ocr_text: str, fname: str, vision_allergens: dict = None) -> dict
 
     _milk_in_ocr      = _hit('milk', r'\bmilk\b|\bnon.fat\s+milk\b|\bmilk\s+powder\b|\bskim\s+milk\b|\bdairy\b|\bcasein\b|\bwhey\b|\blactose\b')
     _peanut_in_ocr    = _hit('peanut', r'\bpeanut\b')
-    _tree_nut_in_ocr  = _hit('tree nut', _TREE_NUTS + r'|\btree\s+nut\b|\bcoconut\b')
+    # Not coconut — no longer a tree nut under FDA guidance (Jan 2025).
+    _tree_nut_in_ocr  = _hit('tree nut', _TREE_NUTS + r'|\btree\s+nut\b')
     _soy_in_ocr       = _hit('soy', r'\bsoy(?:bean)?\b|\bsoy\s+lecithin\b')
     _egg_in_ocr       = _hit('egg', r'\begg\b|\begg\s+white\b|\balbumin\b')
     _fish_in_ocr      = _hit('fish', r'\bfish\b|\bsalmon\b|\btuna\b|\bpollock\b|\bcod\b|\btilapia\b')
@@ -5096,8 +5115,8 @@ def _check_fda(ocr_text: str, fname: str, vision_allergens: dict = None) -> dict
         if 'milk' in _vd and re.search(r'milk|dairy|whey|casein|lactose', _alg_text):
             _milk_in_ocr = True
         if 'peanut' in _vd and 'peanut' in _alg_text:        _peanut_in_ocr = True
-        if re.search(r'tree\s*nut|coconut|almond|cashew|walnut|pecan|hazelnut|pistachio|macadamia', _vd) \
-           and re.search(_TREE_NUTS + r'|\btree\s+nut\b|\bcoconut\b', _alg_text):
+        if re.search(r'tree\s*nut|almond|cashew|walnut|pecan|hazelnut|pistachio|macadamia', _vd) \
+           and re.search(_TREE_NUTS + r'|\btree\s+nut\b', _alg_text):
             _tree_nut_in_ocr = True
         if 'soy' in _vd and re.search(r'\bsoy', _alg_text):  _soy_in_ocr = True
         if 'egg' in _vd and 'egg' in _alg_text:              _egg_in_ocr = True

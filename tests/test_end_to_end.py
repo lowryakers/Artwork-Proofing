@@ -9,6 +9,7 @@ Fixture sets (each a folder with expected.json, master_rows.csv and optional
 defects.json):
   * tests/fixtures/artwork/        — 4 pancake pouches (run 9ffb350f), 7 scenarios
   * tests/fixtures/artwork/whey/   — 30 whey protein bottles (Git LFS), 1 scenario
+  * tests/fixtures/artwork/beef/   — 2 clean beef protein bottles + 1 defect file (Git LFS)
 
 No mocks of the reader, no pre-extracted values, no synthetic images. What IS
 stubbed, deliberately, is the reference data:
@@ -24,7 +25,9 @@ stubbed, deliberately, is the reference data:
     no_panel_values — what ReadyDoc returns today for a file-only approval.
     Prior snapshots / panel versions are None so local history can't leak in.
 
-Defects are planted in that reference data, not in the PDFs: all ProDough label
+Defects are planted in that reference data, not in the PDFs — except a
+file-level defect (defects.json entry with "file"): a real, unmodified PDF
+whose artwork carries the error, run against its own approved record: all ProDough label
 copy (and, on the bottles, the converter's technical block) is outlined.
 
 Spot colour is OFF by default (DeviceCMYK separations can't be compared
@@ -58,7 +61,8 @@ FIX = os.path.join(HERE, 'fixtures', 'artwork')
 REQUIRED = bool(os.environ.get('ARTPROOF_E2E_REQUIRED'))
 BRAND = {'brand_mode': 'prodough', 'proof_type': 'press', 'wind_direction': ''}
 CHECK_KEY = {'gtin': 'gtin', 'net_weight': 'netwt', 'spot_color': 'specs',
-             'fda_falcpa': 'fda', 'approved_panel': 'panel', 'item_reference': 'item_reference'}
+             'fda_falcpa': 'fda', 'approved_panel': 'panel', 'item_reference': 'item_reference',
+             'front_callout': 'nfp'}
 NFP_FIELDS = ('serving_size_g', 'serving_size_cups', 'servings_per_container', 'serving_size_desc')
 MASTER_URL = 'https://app.powder-ops.com/api/products/master.csv?token=e2e'
 # Sets whose separations are Lab-defined, so the spot-colour check can run.
@@ -90,12 +94,16 @@ def _is_lfs_pointer(path):
 
 def _set_unavailable(name, d):
     """Why this set's PDFs can't run, or None."""
-    for e in json.load(open(os.path.join(d, 'expected.json')))['files']:
-        p = os.path.join(d, e['file'])
+    files = [e['file'] for e in json.load(open(os.path.join(d, 'expected.json')))['files']]
+    dp = os.path.join(d, 'defects.json')
+    if os.path.exists(dp):
+        files += [x['file'] for x in json.load(open(dp))['defects'] if 'file' in x]
+    for f in files:
+        p = os.path.join(d, f)
         if not os.path.exists(p):
-            return f'{e["file"]} missing — see {os.path.relpath(d, HERE)}/README.md'
+            return f'{f} missing — see {os.path.relpath(d, HERE)}/README.md'
         if _is_lfs_pointer(p):
-            return f'{e["file"]} is a Git LFS pointer, not the PDF — run `git lfs pull`'
+            return f'{f} is a Git LFS pointer, not the PDF — run `git lfs pull`'
     return None
 
 
@@ -267,7 +275,7 @@ def _run():
             expected[key] = dict(e, set=name)
         dp = os.path.join(d, 'defects.json')
         if os.path.exists(dp):
-            defects += [dict(x, set=name) for x in json.load(open(dp))['defects']]
+            defects += [dict(x, set=name, rel=rel) for x in json.load(open(dp))['defects']]
     by_sku = {e['sku']: (k, e) for k, e in expected.items()}
 
     local = _install_engine_stubs(pe)
@@ -286,6 +294,11 @@ def _run():
     for d in defects:
         if d['sku'] == 'ALL':
             unavailable = d
+            continue
+        if 'file' in d:
+            # File-level defect: the artwork is wrong, the reference data is not.
+            key = d['file'] if d['rel'] == '.' else f'{d["rel"]}/{d["file"]}'
+            jobs.append((d['id'], key, base_rows, _approved(d['approved_panel']), d['set']))
             continue
         key, e = by_sku[d['sku']]
         rows, _ = _fetch_master(A, _master_csv(sets, {d['sku']: d['mutate'].get('master_row', {})}))
@@ -424,7 +437,7 @@ def _run():
             continue
         (_, key, res, _), = runs
         crits = _criticals(res)
-        vision_dep = exp.get('check') in ('approved_panel', 'fda_falcpa')
+        vision_dep = exp.get('check') in ('approved_panel', 'fda_falcpa', 'front_callout')
         if exp['critical_count'] == 0:
             g = _graded(res)
             negative_ok = not g
@@ -435,10 +448,17 @@ def _run():
         ck = CHECK_KEY[exp['check']]
         hit = (len(crits) == 1 and crits[0][0] == ck
                and exp['message_contains'].lower() in crits[0][1]['message'].lower())
+        if exp.get('no_other_findings'):
+            others = [(k, i['message'][:70]) for k, i in _graded(res) if i['severity'] != 'critical']
+            hit = hit and not others
+        else:
+            others = None
         if hit:
             caught += 1
         S.check(f'{d["id"]}: exactly one CRITICAL, on check={exp["check"]}, containing '
-                f'"{exp["message_contains"]}" (got {[(k, i["message"][:70]) for k, i in crits]})',
+                f'"{exp["message_contains"]}"' + (', and no other finding' if others is not None else '')
+                + f' (got {[(k, i["message"][:70]) for k, i in crits]}'
+                + (f', other findings {others}' if others else '') + ')',
                 hit, needs_vision=vision_dep)
 
     # ── Reader Provenance sheet in the real workbook ─────────────────────────
