@@ -78,6 +78,34 @@ def _run():
     check('a ring number with only its calorie caption is still bound, and still a CRITICAL',
           any('front call-out shows 100' in i['message'] for i in crit(out)))
 
+    # Isolated front-ring read (run 142db86d): the full-page pass read Toffee
+    # Cream's "100 Calories" ring as 130 — the NFP value — and nothing fired.
+    b = pe._bind_rings([{'number': '26G', 'caption': 'Protein Per Serving'},
+                        {'number': '0G', 'caption': 'Added Sugar'},
+                        {'number': '100', 'caption': 'Calories Per Serving'},
+                        {'number': '100%', 'caption': 'Grass-Fed Beef'},
+                        {'number': '120', 'caption': None}])
+    check('rings bind through their own captions; "100%" claim ignored; no caption -> unbound',
+          b['values'] == {'protein_g': 26.0, 'added_sugar_g': 0.0, 'calories': 100.0}
+          and b['unbound'] == ['120'])
+    toffee = 'Nutrition Facts Serving size 1 bottle (33g) Calories 130 Protein 26g'
+    out = pe._check_nfp(toffee, '', {'front_callout': b['values'],
+                                     'nfp': {'calories': 130, 'protein_g': 26, 'added_sugar_g': 0}})
+    check('crop-read 100-cal ring vs NFP 130 -> exactly one CRITICAL naming calories',
+          [i['message'][:40] for i in crit(out)] == ['Calorie mismatch: front call-out shows 1'])
+    out = pe._check_nfp(toffee, '', {'front_callout': {}, 'front_unconfirmed': {'calories': 100},
+                                     'nfp': {'calories': 130}})
+    check('a full-page-only ring value is NOT EVALUATED, never compared',
+          not crit(out) and len(not_eval(out, 'calorie')) == 1
+          and 'only the full-page read saw it (100 cal)' in not_eval(out, 'calorie')[0]['message'])
+    out = pe._check_nfp(toffee, '', {'front_callout': {}, 'front_unconfirmed': {'calories': 130},
+                                     'nfp': {'calories': 130}})
+    check('...and silent when it agrees with the NFP', not not_eval(out, 'calorie'))
+    out = pe._check_nfp(toffee, '', {'front_callout': {'calories': 130}, 'front_unbound': ['120'],
+                                     'nfp': {'calories': 130}})
+    check('a ring with no readable caption -> NOT EVALUATED for that ring only',
+          not crit(out) and any('front ring(s) 120' in i['message'] for i in out['issues']))
+
     # A vision read of the call-out overrides the text reads entirely.
     vn = {'front_callout': {'calories': 120, 'protein_g': 25}, 'nfp': {'calories': 120, 'protein_g': 25}}
     out = pe._check_nfp(NFP, front_text='95.00 mm Layflat\nGrass-Fed Calories Per Serving',

@@ -67,7 +67,9 @@ def _run():
         for name, call in (
                 ('full-page read (_claude_vision_ocr)', lambda: pe._claude_vision_ocr(tmp)),
                 ('NFP crop (_read_nfp_panel)', lambda: pe._read_nfp_panel(tmp, [0.3, 0.3, 0.6, 0.7])),
-                ('Contains crop (_read_contains_crop)', lambda: pe._read_contains_crop(tmp, [0.3, 0.3, 0.6, 0.7]))):
+                ('Contains crop (_read_contains_crop)', lambda: pe._read_contains_crop(tmp, [0.3, 0.3, 0.6, 0.7])),
+                ('front rings (_read_front_callouts)',
+                 lambda: pe._read_front_callouts(tmp, [0.5, 0.2, 0.9, 0.6], [0.1, 0.2, 0.4, 0.8]))):
             n = len(bodies)
             out = call()
             sent = bodies[n:]
@@ -85,6 +87,10 @@ def _run():
         check(f'NFP crop: an empty read records why ({diag})',
               out == {} and diag and diag[0].startswith('panel located by vision')
               and any('B sent' in d and '0 fields read' in d for d in diag))
+        diag = []
+        pe._read_front_callouts(tmp, [0.5, 0.2, 0.9, 0.6], [0.1, 0.2, 0.4, 0.8], diag=diag)
+        check(f'front rings: the read records crop, panel masking and what came back ({diag})',
+              diag and 'panel masked' in diag[0] and any('rings:' in d or 'no usable JSON' in d for d in diag))
         diag = []
         pe._read_nfp_panel(tmp, None, diag=diag)
         check('NFP crop: no panel box is recorded as "panel NOT located"',
