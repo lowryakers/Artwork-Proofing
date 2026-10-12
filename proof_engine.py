@@ -5842,12 +5842,21 @@ def _check_fda(ocr_text: str, fname: str, vision_allergens: dict = None) -> dict
 
     # ── Gluten-Free claim ─────────────────────────────────────────────────────
     if re.search(r'gluten[\s\-]?free', tl):
-        if any(w in tl for w in ['wheat', 'barley', 'rye', 'triticale']):
+        # Grains named in the ingredient statement, as whole words — never a
+        # substring anywhere on the page ("rye" in "dryer"; CI run 38312701844
+        # filed this CRITICAL on a gluten-free pancake with no such grain).
+        _gluten_grains = sorted({m.group(0) for ing in _ingredients for m in re.finditer(
+            r'\b(?:wheat|durum|semolina|spelt|farro|einkorn|kamut|barley|rye|triticale|malt)\b', ing)})
+        if not _ingredients_located:
+            notes.append('"Gluten-Free" claim detected, but the ingredient statement was not located — '
+                         'gluten-containing grains could not be checked. Verify manually.')
+        elif _gluten_grains:
             issues.append({
                 'severity': 'critical',
                 'message': (
-                    '"Gluten-Free" claim detected alongside wheat/barley/rye in OCR text. '
-                    'If the product contains these ingredients, the GF claim is prohibited (21 CFR 101.91).'
+                    f'"Gluten-Free" claim alongside {", ".join(_gluten_grains)} in the ingredient '
+                    'statement. A gluten-free claim is prohibited on a food made with a '
+                    'gluten-containing grain unless it is processed to remove gluten (21 CFR 101.91).'
                 ),
             })
         else:

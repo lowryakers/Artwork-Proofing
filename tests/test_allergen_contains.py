@@ -86,6 +86,15 @@ def _run():
     check('prep copy and facility advisories outside the ingredient statement match nothing',
           not any('undeclared allergen' in i['message'].lower() for i in out['issues']))
 
+    # Gluten-free claim: grains from the ingredient statement, whole words only.
+    gf = beef.replace('ingredients:', 'gluten free. ingredients:') + 'use a hand mixer or dryer-safe bottle.\n'
+    out = pe._check_fda(gf, 'PD_beef_bottle_cinnamon_sugar.pdf')
+    check('"gluten free" with no gluten grain in the ingredients raises nothing ("rye" in "dryer" is not rye)',
+          not any('Gluten-Free' in i['message'] for i in out['issues']))
+    out = pe._check_fda(gf.replace('guar gum', 'barley malt extract'), 'PD_beef_bottle_cinnamon_sugar.pdf')
+    check('...while barley in the ingredients with a gluten-free claim is a CRITICAL naming it',
+          any(i['severity'] == 'critical' and 'barley' in i['message'] for i in out['issues']))
+
     # Ingredient statement: located, split, matched by source.
     ings = pe._ingredient_list('Ingredients: Oat Flour, Wheat Flour, Whey Protein Isolate, Soy Lecithin, '
                                'Cocoa Butter, Peanut Butter, Cream of Tartar. Contains: Milk, Wheat, Soy, Peanut.')
