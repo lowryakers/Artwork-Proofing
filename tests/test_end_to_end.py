@@ -9,6 +9,7 @@ Fixture sets (each a folder with expected.json, master_rows.csv and optional
 defects.json):
   * tests/fixtures/artwork/        — 4 pancake pouches (run 9ffb350f), 7 scenarios
   * tests/fixtures/artwork/whey/   — 30 whey protein bottles (Git LFS), 1 scenario
+  * tests/fixtures/artwork/beef/   — 2 clean beef protein bottles + 1 defect file (Git LFS)
 
 No mocks of the reader, no pre-extracted values, no synthetic images. What IS
 stubbed, deliberately, is the reference data:
@@ -24,7 +25,9 @@ stubbed, deliberately, is the reference data:
     no_panel_values — what ReadyDoc returns today for a file-only approval.
     Prior snapshots / panel versions are None so local history can't leak in.
 
-Defects are planted in that reference data, not in the PDFs: all ProDough label
+Defects are planted in that reference data, not in the PDFs — except a
+file-level defect (defects.json entry with "file"): a real, unmodified PDF
+whose artwork carries the error, run against its own approved record: all ProDough label
 copy (and, on the bottles, the converter's technical block) is outlined.
 
 Spot colour is OFF by default (DeviceCMYK separations can't be compared
@@ -58,8 +61,15 @@ FIX = os.path.join(HERE, 'fixtures', 'artwork')
 REQUIRED = bool(os.environ.get('ARTPROOF_E2E_REQUIRED'))
 BRAND = {'brand_mode': 'prodough', 'proof_type': 'press', 'wind_direction': ''}
 CHECK_KEY = {'gtin': 'gtin', 'net_weight': 'netwt', 'spot_color': 'specs',
-             'fda_falcpa': 'fda', 'approved_panel': 'panel', 'item_reference': 'item_reference'}
+             'fda_falcpa': 'fda', 'approved_panel': 'panel', 'item_reference': 'item_reference',
+             'front_callout': 'nfp'}
 NFP_FIELDS = ('serving_size_g', 'serving_size_cups', 'servings_per_container', 'serving_size_desc')
+
+
+def _nfp_fields(expect):
+    """The panel fields a file's crop must supply: a bottle declares no cup
+    measure, so serving_size_cups is required only where the file expects one."""
+    return tuple(f for f in NFP_FIELDS if f != 'serving_size_cups' or 'serving_size_cups' in expect)
 MASTER_URL = 'https://app.powder-ops.com/api/products/master.csv?token=e2e'
 # Sets whose separations are Lab-defined, so the spot-colour check can run.
 SPOT_COLOR_SETS = {'pancake'}
@@ -90,12 +100,16 @@ def _is_lfs_pointer(path):
 
 def _set_unavailable(name, d):
     """Why this set's PDFs can't run, or None."""
-    for e in json.load(open(os.path.join(d, 'expected.json')))['files']:
-        p = os.path.join(d, e['file'])
+    files = [e['file'] for e in json.load(open(os.path.join(d, 'expected.json')))['files']]
+    dp = os.path.join(d, 'defects.json')
+    if os.path.exists(dp):
+        files += [x['file'] for x in json.load(open(dp))['defects'] if 'file' in x]
+    for f in files:
+        p = os.path.join(d, f)
         if not os.path.exists(p):
-            return f'{e["file"]} missing — see {os.path.relpath(d, HERE)}/README.md'
+            return f'{f} missing — see {os.path.relpath(d, HERE)}/README.md'
         if _is_lfs_pointer(p):
-            return f'{e["file"]} is a Git LFS pointer, not the PDF — run `git lfs pull`'
+            return f'{f} is a Git LFS pointer, not the PDF — run `git lfs pull`'
     return None
 
 
@@ -185,18 +199,26 @@ def _install_engine_stubs(pe):
     cache, locks, glock = {}, {}, threading.Lock()
 
     def _memo(fn, kind):
-        def wrapped(img_path, *args):
+        def wrapped(img_path, *args, diag=None):
+            # `diag` is an out-parameter (see _read_nfp_panel): cached with the
+            # result and replayed into the caller's list on every hit.
             key = (kind, os.path.basename(img_path).split('_', 1)[-1], repr(args))
             with glock:
                 lk = locks.setdefault(key, threading.Lock())
             with lk:
                 if key not in cache:
-                    cache[key] = fn(img_path, *args)
-                return copy.deepcopy(cache[key])
+                    d = []
+                    out = fn(img_path, *args, diag=d) if diag is not None else fn(img_path, *args)
+                    cache[key] = (out, d)
+                out, d = cache[key]
+                if diag is not None:
+                    diag.extend(d)
+                return copy.deepcopy(out)
         return wrapped
     pe._claude_vision_ocr = _memo(pe._claude_vision_ocr, 'vision')
     pe._read_nfp_panel = _memo(pe._read_nfp_panel, 'nfp_crop')
     pe._read_contains_crop = _memo(pe._read_contains_crop, 'contains_crop')
+    pe._read_front_callouts = _memo(pe._read_front_callouts, 'front_crop')
     return local
 
 
@@ -209,7 +231,12 @@ def _approved(expect, mutate=None):
     panel = {'serving_size_g': expect['serving_size_g'],
              'servings_per_container': expect['servings_per_container']}
     panel.update(mutate or {})
-    return {'version': 1, 'status': 'approved', 'panel': panel, 'front_callouts': {}}, 'ok'
+    rec = {'version': 1, 'status': 'approved', 'panel': panel, 'front_callouts': {}}
+    # The formula the panel was approved against, where the set records it.
+    for k in ('formula_ref', 'formula_version'):
+        if expect.get(k):
+            rec[k] = expect[k]
+    return rec, 'ok'
 
 
 def _graded(res):
@@ -267,7 +294,7 @@ def _run():
             expected[key] = dict(e, set=name)
         dp = os.path.join(d, 'defects.json')
         if os.path.exists(dp):
-            defects += [dict(x, set=name) for x in json.load(open(dp))['defects']]
+            defects += [dict(x, set=name, rel=rel) for x in json.load(open(dp))['defects']]
     by_sku = {e['sku']: (k, e) for k, e in expected.items()}
 
     local = _install_engine_stubs(pe)
@@ -286,6 +313,11 @@ def _run():
     for d in defects:
         if d['sku'] == 'ALL':
             unavailable = d
+            continue
+        if 'file' in d:
+            # File-level defect: the artwork is wrong, the reference data is not.
+            key = d['file'] if d['rel'] == '.' else f'{d["rel"]}/{d["file"]}'
+            jobs.append((d['id'], key, base_rows, _approved(d['approved_panel']), d['set']))
             continue
         key, e = by_sku[d['sku']]
         rows, _ = _fetch_master(A, _master_csv(sets, {d['sku']: d['mutate'].get('master_row', {})}))
@@ -382,8 +414,8 @@ def _run():
                     and vals.get('servings_per_container') == exp['servings_per_container'],
                     needs_vision=True)
             S.check(f'{key}: every nutrition-panel field sourced from nfp_crop '
-                    f'(got {[prov.get(k) for k in NFP_FIELDS]})',
-                    all(prov.get(k) == 'nfp_crop' for k in NFP_FIELDS), needs_vision=True)
+                    f'(got {[prov.get(k) for k in _nfp_fields(exp)]})',
+                    all(prov.get(k) == 'nfp_crop' for k in _nfp_fields(exp)), needs_vision=True)
         if 'serving_size_desc' in exp:
             want_desc = exp['serving_size_desc'].split('(')[0].strip().lower()
             S.check(f'{key}: serving size description reads "{want_desc}" (got {vals.get("serving_size_desc")!r})',
@@ -399,6 +431,10 @@ def _run():
             S.check(f'{key}: {exp["overall_status"]}, with every check run (got {res.get("severity")}, '
                     f'skipped {res.get("checks_skipped")})',
                     res.get('severity') == exp['overall_status'].lower() and not res.get('checks_skipped'),
+                    needs_vision=True)
+        if 'reviews_only_from' in exp:
+            stray = [(k, i['message'][:60]) for k, i in _reviews(res) if k not in exp['reviews_only_from']]
+            S.check(f'{key}: review findings only from {exp["reviews_only_from"]} (stray: {stray})', not stray,
                     needs_vision=True)
 
     # ── Score: defects ──────────────────────────────────────────────────────
@@ -424,7 +460,23 @@ def _run():
             continue
         (_, key, res, _), = runs
         crits = _criticals(res)
-        vision_dep = exp.get('check') in ('approved_panel', 'fda_falcpa')
+        vision_dep = exp.get('check') in ('approved_panel', 'fda_falcpa', 'front_callout')
+        if 'status' in exp:
+            # A planted defect the tool must refuse to evaluate, not flag: the
+            # check reports exp['status'] with the reason in its notes, and no
+            # CRITICAL/WARNING is raised from data it could not trust.
+            planted += 1
+            ck = CHECK_KEY[exp['check']]
+            c = (res.get('checks') or {}).get(ck) or {}
+            notes = ' '.join(str(n) for n in c.get('notes', []))
+            hit = (str(c.get('status', '')).upper() == exp['status'] and exp['note_contains'] in notes
+                   and ck in (res.get('checks_skipped') or []) and res.get('severity') != 'clean'
+                   and not _graded(res))
+            caught += hit
+            S.check(f'{d["id"]}: {exp["check"]} {exp["status"]} with "{exp["note_contains"]}", '
+                    f'not CLEAN, no graded finding (got {c.get("status")}, {res.get("severity")}, '
+                    f'{notes[:90]!r}, graded {[(k, i["message"][:50]) for k, i in _graded(res)]})', hit)
+            continue
         if exp['critical_count'] == 0:
             g = _graded(res)
             negative_ok = not g
@@ -435,10 +487,17 @@ def _run():
         ck = CHECK_KEY[exp['check']]
         hit = (len(crits) == 1 and crits[0][0] == ck
                and exp['message_contains'].lower() in crits[0][1]['message'].lower())
+        if exp.get('no_other_findings'):
+            others = [(k, i['message'][:70]) for k, i in _graded(res) if i['severity'] != 'critical']
+            hit = hit and not others
+        else:
+            others = None
         if hit:
             caught += 1
         S.check(f'{d["id"]}: exactly one CRITICAL, on check={exp["check"]}, containing '
-                f'"{exp["message_contains"]}" (got {[(k, i["message"][:70]) for k, i in crits]})',
+                f'"{exp["message_contains"]}"' + (', and no other finding' if others is not None else '')
+                + f' (got {[(k, i["message"][:70]) for k, i in crits]}'
+                + (f', other findings {others}' if others else '') + ')',
                 hit, needs_vision=vision_dep)
 
     # ── Reader Provenance sheet in the real workbook ─────────────────────────
@@ -447,16 +506,16 @@ def _run():
            'summary': pe._build_summary(clean_results), 'results': clean_results}
     wb = openpyxl.load_workbook(io.BytesIO(A._generate_report(job).getvalue()))
     S.check('workbook carries a Reader Provenance sheet', 'Reader Provenance' in wb.sheetnames)
-    with_panel = [i for i, r in enumerate(clean_results)
-                  if 'serving_size_g' in expected[next(k for k, e in expected.items()
-                                                       if os.path.basename(k) == r['filename'])]['expect']]
+    _exp_of = lambda r: expected[next(k for k in expected if os.path.basename(k) == r['filename'])]['expect']
+    with_panel = [i for i, r in enumerate(clean_results) if 'serving_size_g' in _exp_of(r)]
     if 'Reader Provenance' in wb.sheetnames and with_panel:
         ws = wb['Reader Provenance']
         hdr = {ws.cell(row=4, column=c).value: c for c in range(1, ws.max_column + 1)}
-        cells = [str(ws.cell(row=5 + i, column=hdr[f]).value) for i in with_panel for f in NFP_FIELDS if f in hdr]
+        want = [(i, f) for i in with_panel for f in _nfp_fields(_exp_of(clean_results[i]))]
+        cells = [str(ws.cell(row=5 + i, column=hdr[f]).value) for i, f in want if f in hdr]
         S.check(f'Reader Provenance sheet shows nfp_crop for every nutrition-panel field on the '
                 f'{len(with_panel)} files with verified panel values',
-                len(cells) == len(with_panel) * len(NFP_FIELDS) and all('nfp_crop' in c for c in cells),
+                len(cells) == len(want) and all('nfp_crop' in c for c in cells),
                 needs_vision=True)
 
     # ── Score line ───────────────────────────────────────────────────────────

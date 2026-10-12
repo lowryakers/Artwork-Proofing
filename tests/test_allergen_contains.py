@@ -10,6 +10,7 @@ every approved allergen missing — a false CRITICAL on a correct label.
 Exits non-zero on any failure. No test framework, no network, no vision API.
 """
 import os
+import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -54,6 +55,65 @@ def _run():
 
     out = pe._check_contains_vs_approved('Milk, Wheat', APPROVED)
     check('a complete Contains line raises nothing', out == [])
+
+    # Coconut: not a tree nut (FDA food allergen Q&A, 5th ed., 2025), and
+    # "Coconut Milk Powder" is not dairy. Every beef bottle carries it with no
+    # Contains line, correctly.
+    beef = ('ingredients: grass fed beef protein isolate, coconut milk powder, bovine collagen '
+            'peptides, natural flavors, cinnamon powder, contains less than 2% of: himalayan '
+            'pink salt, stevia leaf extract (reb a & reb m), guar gum\n'
+            'nutrition facts 1 serving per container serving size 1 bottle (35g) calories 130\n'
+            'total fat 1.5g saturated fat 1.5g cholesterol 0mg sodium 330mg total carbohydrate 4g\n'
+            'dietary fiber 1g total sugars 1g includes 0g added sugars protein 25g\n'
+            'manufactured by powderops vineyard, ut 84059 net wt. 1.23 oz (35g)\n'
+            'amazing taste made with premium ingredients for real results whether you are '
+            'building muscle improving recovery managing hunger supporting healthy weight '
+            'boosting glycemic balance or simply elevating everyday wellness prodough beef '
+            'protein delivers all natural ingredients supports digestion mixes instantly\n')
+    out = pe._check_fda(beef, 'PD_beef_bottle_cinnamon_sugar.pdf')
+    check('coconut milk powder raises no allergen finding (not a tree nut, not milk)',
+          not any(re.search(r'allergen|tree nut|\bmilk\b', i['message'].lower()) for i in out['issues']))
+    out = pe._check_fda(beef.replace('coconut milk powder', 'nonfat dry milk'),
+                        'PD_beef_bottle_cinnamon_sugar.pdf')
+    check('...while a dairy milk on the same label still reads as milk, quoting the ingredient',
+          any('"nonfat dry milk" (milk)' in i['message'].lower() for i in out['issues']))
+    out = pe._check_fda(beef.replace('coconut milk powder', 'almond flour'), 'PD_beef_bottle_cinnamon_sugar.pdf')
+    check('an undeclared almond is flagged (product type comes from the filename, not the label)',
+          any('(tree nut)' in i['message'] for i in out['issues']))
+    out = pe._check_fda(beef + 'directions step 1 add water or milk to dotted line (7oz).\n'
+                        'made in a facility that also processes milk, egg, wheat and peanuts.\n',
+                        'PD_beef_bottle_cinnamon_sugar.pdf')
+    check('prep copy and facility advisories outside the ingredient statement match nothing',
+          not any('undeclared allergen' in i['message'].lower() for i in out['issues']))
+
+    # Gluten-free claim: grains from the ingredient statement, whole words only.
+    gf = beef.replace('ingredients:', 'gluten free. ingredients:') + 'use a hand mixer or dryer-safe bottle.\n'
+    out = pe._check_fda(gf, 'PD_beef_bottle_cinnamon_sugar.pdf')
+    check('"gluten free" with no gluten grain in the ingredients raises nothing ("rye" in "dryer" is not rye)',
+          not any('Gluten-Free' in i['message'] for i in out['issues']))
+    out = pe._check_fda(gf.replace('guar gum', 'barley malt extract'), 'PD_beef_bottle_cinnamon_sugar.pdf')
+    check('...while barley in the ingredients with a gluten-free claim is a CRITICAL naming it',
+          any(i['severity'] == 'critical' and 'barley' in i['message'] for i in out['issues']))
+
+    # Ingredient statement: located, split, matched by source.
+    ings = pe._ingredient_list('Ingredients: Oat Flour, Wheat Flour, Whey Protein Isolate, Soy Lecithin, '
+                               'Cocoa Butter, Peanut Butter, Cream of Tartar. Contains: Milk, Wheat, Soy, Peanut.')
+    check('the statement ends at "Contains:"', 'milk' not in ings and ings[-1] == 'cream of tartar')
+    hits = pe._ingredient_allergens(ings)
+    check('a source named as the modifier counts (wheat flour, whey protein isolate, soy lecithin)',
+          hits.get('wheat') == 'wheat flour' and hits.get('milk') == 'whey protein isolate'
+          and hits.get('soy') == 'soy lecithin')
+    check('cocoa butter, peanut butter and cream of tartar are not milk; peanut butter is peanut',
+          hits.get('peanut') == 'peanut butter' and set(hits) == {'wheat', 'milk', 'soy', 'peanut'})
+    check('"contains less than 2% of:" stays inside the statement',
+          pe._ingredient_list('Ingredients: Beef, contains less than 2% of: Salt, Guar Gum.')
+          == ['beef', 'salt', 'guar gum'])
+    out = pe._check_fda(beef.replace('ingredients:', 'ingr3dients'), 'PD_pancake_buttermilk.pdf')
+    check('no ingredient statement located -> a note, and no "wheat not detected" CRITICAL on a pancake',
+          not any(i['severity'] == 'critical' for i in out['issues'])
+          and any('Ingredient statement not located' in n for n in out['notes']))
+    check('a Contains line naming only coconut no longer satisfies a tree-nut declaration',
+          pe._canonical_allergen('coconut') != 'tree nut')
 
     # SUSPECT downgrade: a doubted number elsewhere on the file softens
     # value-comparison criticals, never an allergen finding — pinned by issue

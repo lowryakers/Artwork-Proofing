@@ -222,8 +222,11 @@ def fetch_approved_panel(gtin=None, sku=None):
 
     Endpoint: GET /api/products/nutrition-panel?gtin=&sku=, returning
     {"sku":, "gtin":, "version":, "status": "draft"|"approved", "panel": {...},
-    "front_callouts": {...}, ...}. See PROMPT_2 (companion: PROMPT_1 builds this
-    route in the ReadyDoc session) for the exact contract.
+    "front_callouts": {...}, "formula_ref": "F-00069", "formula_version": "1.2", ...}.
+    See PROMPT_2 (companion: PROMPT_1 builds this route in the ReadyDoc session)
+    for the exact contract. formula_ref / formula_version name the formula the
+    panel was approved against; when present, the master-list fill weight is
+    used only if its row names the same formula (proof_engine._formula_provenance).
     """
     if not enabled() or (not gtin and not sku):
         return None, 'disabled'

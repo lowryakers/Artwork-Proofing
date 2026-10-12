@@ -1,0 +1,40 @@
+{
+  "note": "DEFECT_front_callout_calories is the real, unmodified artwork (nothing planted): a file-level fixture. DEFECT_stale_fill_weight_provenance is planted in the master row. See README.md.",
+  "defects": [
+    {
+      "id": "DEFECT_front_callout_calories",
+      "sku": "BEF-BTL-TFC",
+      "file": "DEFECT_front_callout_calories_beef_toffee_cream.pdf",
+      "approved_panel": {
+        "serving_size_g": 33.0,
+        "servings_per_container": 1.0,
+        "formula_ref": "F-00068",
+        "formula_version": "1.0"
+      },
+      "expect": {
+        "critical_count": 1,
+        "check": "front_callout",
+        "message_contains": "calorie",
+        "no_other_findings": true
+      },
+      "why": "Front ring reads 100 Calories Per Serving; the file's own NFP and approved F-00068 v1.0 read 130. Three of the four rings are correct, so a check that binds a ring to the wrong value either misses this or fires on a correct ring. Calories is a do-not-exceed nutrient (21 CFR 101.9(g)(5)): 130 against a declared 100 is 130%, so CRITICAL."
+    },
+    {
+      "id": "DEFECT_stale_fill_weight_provenance",
+      "sku": "BEF-BTL-CSG",
+      "mutate": {
+        "master_row": {
+          "Formula ref": "",
+          "Formula version": ""
+        }
+      },
+      "expect": {
+        "check": "net_weight",
+        "status": "NOT_RUN",
+        "note_contains": "predates the formula",
+        "critical_count": 0
+      },
+      "why": "The approved panel names F-00069 v1.2; the master row names no formula, as the live export does. Its fill weight cannot be shown to belong to the approved formula (the live export's pre-reformulation weights produced four false CRITICALs), so the net-weight check must not use it: could not evaluate, NOT_RUN, not CLEAN."
+    }
+  ]
+}

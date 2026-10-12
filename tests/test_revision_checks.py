@@ -24,6 +24,29 @@ def _run():
         if not cond:
             failures.append(name)
 
+    # 7.0 — run 142db86d, Double Chocolate: the baseline (older reader) had
+    # swept the brand paragraph into the last ingredient; the current read
+    # stopped at "Guar Gum" correctly, and the drift check called the
+    # improvement a dropped descriptor (WARNING).
+    dch = ('Ingredients: Grass Fed Beef Protein Isolate, Cocoa Powder, Xanthan Gum, Guar Gum\n'
+           'Amazing taste made with premium ingredients for real results whether you re building muscle')
+    cur = pe._build_label_snapshot(dch, {}, {}, reader_source='vision')
+    check('the statement stops before the brand paragraph',
+          cur['ingredients'][-1] == 'guar gum')
+    old = dict(cur, ingredients=cur['ingredients'][:-1] + [
+        'guar gum amazing taste made with premium ingredients for real results whether you re building muscle'])
+    old.pop('ingredients_reader')
+    r = pe._check_ingredient_drift(cur, old)
+    check('a baseline with no recorded reader -> could not evaluate, no WARNING',
+          not r['issues'] and not r['compared'] and 'Could not evaluate' in r['notes'][0]
+          and 'unrecorded (older) reader' in r['notes'][0])
+    r = pe._check_ingredient_drift(cur, dict(old, ingredients_reader={'version': 1, 'source': 'vision'}))
+    check('a baseline from an older reader version -> could not evaluate',
+          not r['issues'] and 'reader v1 (vision)' in r['notes'][0])
+    r = pe._check_ingredient_drift(cur, dict(old, ingredients_reader=dict(cur['ingredients_reader'])))
+    check('the same reader on both sides still compares (and still sees a real change)',
+          r['compared'] and r['issues'])
+
     # 7.1 — headline ingredient order change is flagged.
     r = pe._check_ingredient_drift(
         _snap('Ingredients: Cocoa, Natural Flavors, Whey Protein Isolate, Stevia'),

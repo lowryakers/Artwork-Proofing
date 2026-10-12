@@ -89,6 +89,33 @@ def _disabled_checks() -> list:
            ([] if CHECK_TRIM_DIMENSION else ['trim_dimension'])
 
 
+# A check that does not apply to this SKU (its master-list spec reads "NA"):
+# listed alongside the disabled checks, never skipped, never blocks CLEAN.
+_NOT_APPLICABLE = 'NOT_APPLICABLE'
+
+# Master-list spec field -> (check it switches off as a whole, label).
+_NA_SPEC_CHECK = {
+    'eye_mark_color': ('eyemark', 'eyemark colour'),
+    'wind_direction': ('wind', 'wind direction'),
+}
+
+
+def _not_applicable_checks(checks: dict) -> list:
+    return [k for k, c in (checks or {}).items()
+            if isinstance(c, dict) and str(c.get('status', '')).upper() == _NOT_APPLICABLE]
+
+
+def _apply_not_applicable_spec(checks: dict, matched_spec: dict) -> None:
+    """Replace each check whose spec the master row marks "NA" with a
+    NOT_APPLICABLE block: no finding, no scan, no message built from the
+    sentinel as if it were a value."""
+    for field in ((matched_spec or {}).get('_not_applicable') or []):
+        key, label = _NA_SPEC_CHECK.get(field, (None, None))
+        if key and key in checks:
+            checks[key] = {'status': _NOT_APPLICABLE, 'issues': [], 'notes': [
+                f'Not applicable to this SKU — the master list gives no {label} requirement.']}
+
+
 def _completeness(checks: dict) -> tuple:
     """(checks_run, checks_skipped) for one file's check blocks. A check whose
     status says "not evaluated" (NOT_RUN, UNVERIFIED, UNKNOWN, PANEL_*) was
@@ -97,7 +124,7 @@ def _completeness(checks: dict) -> tuple:
     (run 9ffb350f: a file whose nutrition panel was never read filed CLEAN)."""
     run, skipped = [], []
     for k, c in (checks or {}).items():
-        if not isinstance(c, dict):
+        if not isinstance(c, dict) or str(c.get('status', '')).upper() == _NOT_APPLICABLE:
             continue
         (skipped if str(c.get('status', '')).upper() in _NOT_VERIFIED_STATUSES else run).append(k)
     return run, skipped
@@ -993,6 +1020,120 @@ _NFP_CROP_FIELDS = (
     'calcium_dv', 'iron_mg', 'iron_dv', 'potassium_mg', 'potassium_dv',
 )
 
+_FRONT_CROP_PROMPT = (
+    'This image is a food package artwork. Find the call-out badges on its FRONT panel: each is a '
+    'big number with a short caption printed with it (e.g. "130" with "Calories Per Serving"), '
+    'usually in circles. Transcribe every badge EXACTLY as printed, and nothing else on the pack. Return ONLY this JSON object:\n'
+    '{"rings": [{"number": "<the big number exactly as printed, with any unit or % sign, e.g. '
+    '\\"130\\", \\"26G\\", \\"100%\\">", "caption": "<the caption printed with that number, '
+    'e.g. \\"Calories Per Serving\\", or null if you cannot read it>"}]}\n'
+    'Transcribe only. Do NOT correct, infer or reconcile any number against anything else on the '
+    'package: a badge that prints 100 is "100" even if you believe it should be something else. '
+    'Return {"rings": []} if there are no badges.')
+
+# Caption -> the NFP field it declares. Anything else (100% Grass-Fed, All
+# Natural) is a claim, not a nutrient call-out, and is not compared.
+_RING_FIELDS = (('calories', r'\bcal(?:orie)?s?\b'), ('protein_g', r'\bprotein\b'),
+                ('added_sugar_g', r'\badded\s+sugars?\b|\bsugars?\b'))
+
+
+def _bind_rings(rings: list) -> dict:
+    """{'values': {field: number}, 'unbound': [number, ...]} from transcribed
+    rings. A ring binds to a field only through its own caption; a ring with
+    a number but no readable caption is unbound (NOT EVALUATED), never guessed."""
+    values, unbound = {}, []
+    for r in rings or []:
+        if not isinstance(r, dict):
+            continue
+        num = str(r.get('number') or '').strip()
+        cap = str(r.get('caption') or '').strip().lower()
+        m = re.match(r'^<?\s*(\d+(?:\.\d+)?)\s*(%|g|mg|cal)?\b', num, re.I)
+        if not m:
+            continue
+        if not cap or cap in ('null', 'none'):
+            unbound.append(num)
+            continue
+        if m.group(2) == '%':
+            continue                      # "100% Grass-Fed" is a claim
+        for field, pat in _RING_FIELDS:
+            if re.search(pat, cap):
+                values.setdefault(field, float(m.group(1)))
+                break
+    return {'values': values, 'unbound': unbound}
+
+
+def _read_front_callouts(img_path: str, nfp_bbox=None, diag: list = None) -> dict:
+    """Front call-out rings, transcribed number + caption together, from the
+    artwork with the Nutrition Facts panel masked out. The full-page pass reads
+    the rings next to the panel and can report a ring as the panel's value:
+    run 142db86d read Toffee Cream's "100 Calories" ring as 130, the NFP value,
+    and the mismatch went unreported.
+
+    The panel is masked by its exact white rectangle (_locate_nfp_rect), and
+    the whole artwork is read — never a vision-estimated ring box: on the
+    bottle sleeves that box landed half on the back panel, and masking with
+    vision's rough panel box erased the left ring column (CI runs 38305043657,
+    38308802272). Returns {'rings': [...], 'values': {...}, 'unbound': [...]}
+    or {} on failure, and records why in `diag`. Never raises."""
+    diag = diag if diag is not None else []
+    if not (ANTHROPIC_AVAILABLE and PIL_AVAILABLE):
+        diag.append('not attempted: vision unavailable')
+        return {}
+    try:
+        import base64, io
+        from PIL import ImageDraw as _Draw, ImageChops as _Chops
+        im = Image.open(img_path).convert('RGB')
+        W, H = im.size
+        # Masked only where the panel's exact rectangle is found. A guessed
+        # region is worse than none: it can erase the rings themselves. The
+        # read's main guard is its prompt — badges only, transcribed — where
+        # the full-page pass asked for ring and panel values in one answer.
+        rect = _locate_nfp_rect(im, nfp_bbox)
+        if rect:
+            _Draw.Draw(im).rectangle(rect, fill='white')
+        # Drop the white page margins so the rings keep their size after the
+        # resize to the API's pixel budget.
+        content = _Chops.difference(im.convert('L'), Image.new('L', im.size, 255)).point(
+            lambda p: 255 if p > 24 else 0).getbbox()
+        crop = im.crop(content) if content else im
+        diag.append(f'artwork {crop.width}x{crop.height}px of {W}x{H}; '
+                    + (f'panel masked at {rect}' if rect else
+                       'panel NOT masked (not located)' if nfp_bbox else 'no panel box from vision'))
+        _long = max(crop.width, crop.height)
+        if _long < 1600:
+            sc = min(3.0, 1600.0 / _long)
+            crop = crop.resize((int(crop.width * sc), int(crop.height * sc)))
+        _cap = 1_140_000
+        if crop.width * crop.height > _cap:
+            sc = (_cap / float(crop.width * crop.height)) ** 0.5
+            crop = crop.resize((max(1, int(crop.width * sc)), max(1, int(crop.height * sc))))
+        _b = io.BytesIO()
+        crop.save(_b, format='JPEG', quality=95)
+        _client = _anthropic.Anthropic(api_key=os.environ['ANTHROPIC_API_KEY'])
+        _msg = _client.messages.create(
+            model='claude-sonnet-4-6', max_tokens=600, extra_body={'temperature': 0},
+            messages=[{'role': 'user', 'content': [
+                {'type': 'image', 'source': {'type': 'base64', 'media_type': 'image/jpeg',
+                                             'data': base64.standard_b64encode(_b.getvalue()).decode('utf-8')}},
+                {'type': 'text', 'text': _FRONT_CROP_PROMPT}]}])
+        _stop = getattr(_msg, 'stop_reason', None)
+        _txt = next((blk.text for blk in (_msg.content or []) if getattr(blk, 'text', None)), '')
+        _start = _txt.find('{')
+        if _stop == 'max_tokens' or _start < 0:
+            diag.append(f'{len(_b.getvalue())}B sent; stop={_stop}, reply {len(_txt)} chars, no usable JSON')
+            return {}
+        data, _ = json.JSONDecoder().raw_decode(_txt[_start:])
+        rings = [r for r in (data.get('rings') or []) if isinstance(r, dict)]
+        bound = _bind_rings(rings)
+        diag.append(f'{len(_b.getvalue())}B sent; stop={_stop}; {len(rings)} rings: '
+                    + ', '.join(f'{r.get("number")} / {r.get("caption")}' for r in rings))
+        return dict(bound, rings=rings)
+    except Exception as _e:
+        diag.append(f'error: {type(_e).__name__}: {_e}')
+        print(f'[vision] front-callout crop read failed: {_e}')
+        return {}
+
+
 _NFP_CROP_PROMPT = (
     'This image is a crop of ONE Nutrition Facts (or Supplement Facts) panel and nothing '
     'else. It may be MIRROR-REVERSED or rotated (these are film/pouch back panels printed '
@@ -1002,7 +1143,9 @@ _NFP_CROP_PROMPT = (
     'strip entirely; it is not the Nutrition Facts panel, even if it shares the crop. Read '
     'protein_g, and every other field, only from the bordered Nutrition/Supplement Facts '
     'table itself. Return ONLY this JSON object:\n'
-    '{"serving_size_g": <grams in the Serving size line, e.g. 98 from "3/4 Cup (98g)", or '
+    '{"serving_size_text": "<the Serving size line copied character for character as printed, '
+    'e.g. \\"3/4 Cup (98g)\\", or null>", '
+    '"serving_size_g": <grams in the Serving size line, e.g. 98 from "3/4 Cup (98g)", or '
     'null>, "serving_size_desc": "<unit portion, e.g. \\"3/4 Cup\\", \\"4 Cupcakes\\", or '
     'null>", "serving_size_cups": <cup quantity as a decimal if given in cups, else null>, '
     '"servings_per_container": <the number on the line that literally reads "servings per '
@@ -1173,7 +1316,78 @@ def _upright(im):
     return im
 
 
-def _read_nfp_panel(img_path: str, bbox) -> dict:
+def _locate_nfp_rect(im, bbox):
+    """The Nutrition Facts panel's own white rectangle in `im`, in pixels
+    (x0, y0, x1, y1), from vision's approximate box padded 15% and tightened
+    geometrically to the white-filled panel. None without a usable box. The
+    same geometry the panel crop reads from — vision's box alone is too rough
+    to mask with (CI run 38308802272)."""
+    if not bbox:
+        return None
+    W, H = im.size
+    x0, y0, x1, y1 = bbox
+    pw, ph = (x1 - x0) * 0.15, (y1 - y0) * 0.15
+    px0, py0 = max(0, int((x0 - pw) * W)), max(0, int((y0 - ph) * H))
+    px1, py1 = min(W, int((x1 + pw) * W)), min(H, int((y1 + ph) * H))
+    if px1 - px0 < 8 or py1 - py0 < 8:
+        return None
+    refined = _largest_white_region_bbox_frac(im.crop((px0, py0, px1, py1)))
+    if not refined:
+        return None
+    rx0, ry0, rx1, ry1 = refined
+    # A white region filling the padded box is not a panel found — it is white
+    # background, and masking it could erase whatever else is in the box.
+    if (rx1 - rx0) * (ry1 - ry0) > 0.75:
+        return None
+    cw, ch = px1 - px0, py1 - py0
+    return (px0 + int(rx0 * cw), py0 + int(ry0 * ch), px0 + int(rx1 * cw), py0 + int(ry1 * ch))
+
+
+def _grams_in_serving_text(text) -> float:
+    """Grams declared in a transcribed serving line: "1 bottle (37g)" -> 37.0.
+    The gram figure is the one followed by "g" (preferring a parenthesised
+    one); None when the line declares no grams."""
+    if not isinstance(text, str):
+        return None
+    t = text.replace(',', '.')
+    m = (re.search(r'\(\s*(\d+(?:\.\d+)?)\s*g\b[^)]*\)', t, re.I)
+         or re.search(r'(\d+(?:\.\d+)?)\s*g(?:rams?)?\b', t, re.I))
+    return float(m.group(1)) if m else None
+
+
+def _settle_serving_g(first: dict, reread, diag: list) -> dict:
+    """The serving size the crop read gives as a number (the model's own
+    extraction) is checked against the grams parsed from its verbatim copy of
+    the serving line. Agree -> kept. Disagree -> one independent re-read of
+    the same crop, and a value is accepted only where two readings agree;
+    otherwise serving_size_g is left unread (dependent checks say NOT RUN) and
+    the conflict is recorded. CI run 38294631493: the crop returned 370 for a
+    panel that prints "1 bottle (37g)".
+
+    `reread` is a zero-argument callable returning another read dict."""
+    num, txt = first.get('serving_size_g'), _grams_in_serving_text(first.get('serving_size_text'))
+    if txt is None or num is None or _num_or_none(num) == txt:
+        if num is None and txt is not None:
+            first = dict(first, serving_size_g=txt)
+        return first
+    second = reread() or {}
+    num2 = second.get('serving_size_g')
+    txt2 = _grams_in_serving_text(second.get('serving_size_text'))
+    readings = [_num_or_none(num), txt, _num_or_none(num2), txt2]
+    agreed = [v for v in readings if v is not None and readings.count(v) >= 2]
+    choice = agreed[0] if agreed and len(set(agreed)) == 1 else None
+    diag.append(f'serving size readings disagreed — number {num}, text "{first.get("serving_size_text")}"; '
+                f're-read number {num2}, text "{second.get("serving_size_text")}" -> '
+                + (f'{choice:g}g (two readings agree)' if choice is not None else 'left unread (no two agree)'))
+    out = dict(first)
+    if choice is None:
+        out.pop('serving_size_g', None)
+    else:
+        out['serving_size_g'] = choice
+    return out
+
+
+def _read_nfp_panel(img_path: str, bbox, diag: list = None) -> dict:
     """Durable NFP read: crop the Nutrition/Supplement Facts panel to its own image
     (using the bbox from the first vision pass) and read that rectangle in isolation.
     Isolated + upscaled, the small NFP digits are legible instead of lost in a
@@ -1182,8 +1396,15 @@ def _read_nfp_panel(img_path: str, bbox) -> dict:
     ProDough back panels are printed on clear film and read MIRRORED, so a straight
     crop is unreadable — try the crop normal, then horizontally flipped, then rotated
     180°, and keep the orientation that reads the most fields. Returns {} on any
-    failure — the caller degrades to the full-page reads. Never raises."""
+    failure — the caller degrades to the full-page reads. Never raises.
+
+    `diag`, when given, collects one line per step — panel located or not, crop
+    size, bytes sent, stop reason, reply length, fields recovered, or the error
+    — so a read that comes back empty says why (run 142db86d: one of four
+    identical sleeves read nothing, with no trace of the reason)."""
+    diag = diag if diag is not None else []
     if not (ANTHROPIC_AVAILABLE and PIL_AVAILABLE):
+        diag.append('not attempted: vision unavailable')
         return {}
     try:
         import base64, io
@@ -1196,6 +1417,7 @@ def _read_nfp_panel(img_path: str, bbox) -> dict:
             px0, py0 = max(0, int((x0 - pw) * W)), max(0, int((y0 - ph) * H))
             px1, py1 = min(W, int((x1 + pw) * W)), min(H, int((y1 + ph) * H))
             if px1 - px0 < 8 or py1 - py0 < 8:
+                diag.append(f'panel box {bbox} too small to crop')
                 return {}
             candidate = im.crop((px0, py0, px1, py1))
             # Tighten the padded box to the panel's own white-filled rectangle,
@@ -1210,11 +1432,14 @@ def _read_nfp_panel(img_path: str, bbox) -> dict:
                 crop = im.crop((tx0, ty0, tx1, ty1)) if (tx1 - tx0 >= 8 and ty1 - ty0 >= 8) else candidate
             else:
                 crop = candidate
+            diag.append(f'panel located by vision {[round(v, 3) for v in bbox]}; crop {crop.width}x{crop.height}px'
+                        f'{" (tightened to white panel)" if refined else ""}')
         else:
             # No bbox — vision couldn't locate the panel. Fall back to the whole
             # image with the focused prompt + orientation flips; better than leaving
             # the panel unread, and still degrades to {} if nothing legible comes back.
             crop = im
+            diag.append(f'panel NOT located by vision — reading the whole page {W}x{H}px')
         crop = _upright(crop)
         # Upscale small crops so digits are large; then cap to the API's ~1.1MP.
         _long = max(crop.width, crop.height)
@@ -1228,10 +1453,11 @@ def _read_nfp_panel(img_path: str, bbox) -> dict:
 
         _client = _anthropic.Anthropic(api_key=os.environ['ANTHROPIC_API_KEY'])
 
-        def _read_crop(pim):
+        def _read_crop(pim, label):
             _b = io.BytesIO()
             pim.save(_b, format='JPEG', quality=95)
             b64 = base64.standard_b64encode(_b.getvalue()).decode('utf-8')
+            _sent = len(_b.getvalue())
             # The prompt asks for ~37 fields; a full panel's JSON runs past 400
             # tokens, and a cut-off reply fails to parse (run 37844252128: every
             # pancake panel). 1200 leaves room for a pretty-printed object.
@@ -1240,7 +1466,9 @@ def _read_nfp_panel(img_path: str, bbox) -> dict:
                 messages=[{'role': 'user', 'content': [
                     {'type': 'image', 'source': {'type': 'base64', 'media_type': 'image/jpeg', 'data': b64}},
                     {'type': 'text', 'text': _NFP_CROP_PROMPT}]}])
-            if getattr(_msg, 'stop_reason', None) == 'max_tokens':
+            _stop = getattr(_msg, 'stop_reason', None)
+            if _stop == 'max_tokens':
+                diag.append(f'{label}: {pim.width}x{pim.height}px {_sent}B sent; reply cut off at max_tokens')
                 raise ValueError('reply cut off at max_tokens — panel JSON incomplete')
             _txt = ''
             for _blk in (_msg.content or []):
@@ -1249,6 +1477,8 @@ def _read_nfp_panel(img_path: str, bbox) -> dict:
                     break
             _start = _txt.find('{')
             if _start < 0:
+                diag.append(f'{label}: {pim.width}x{pim.height}px {_sent}B sent; stop={_stop}, '
+                            f'reply {len(_txt)} chars with no JSON: {_txt[:80]!r}')
                 return {}
             data, _ = json.JSONDecoder().raw_decode(_txt[_start:])
             out = {}
@@ -1259,6 +1489,12 @@ def _read_nfp_panel(img_path: str, bbox) -> dict:
             d = data.get('serving_size_desc')
             if isinstance(d, str) and d.strip() and d.strip().lower() not in ('null', 'none'):
                 out['serving_size_desc'] = d.strip()
+            st = data.get('serving_size_text')
+            if isinstance(st, str) and st.strip() and st.strip().lower() not in ('null', 'none'):
+                out['serving_size_text'] = st.strip()
+            diag.append(f'{label}: {pim.width}x{pim.height}px {_sent}B sent; stop={_stop}, '
+                        f'reply {len(_txt)} chars, {len(out)} fields read'
+                        + ('' if out else ' (model returned the panel as unreadable)'))
             return out
 
         def _score(d):
@@ -1268,16 +1504,20 @@ def _read_nfp_panel(img_path: str, bbox) -> dict:
 
         # Straight read first; only try flipped/rotated orientations if it is sparse,
         # to keep the call count down. Mirror (left-right) is the common film case.
-        best = _read_crop(crop)
+        best, best_img = _read_crop(crop, 'straight'), crop
         if _score(best) < 3:
-            for _t in (Image.FLIP_LEFT_RIGHT, Image.ROTATE_180):
-                alt = _read_crop(crop.transpose(_t))
+            for _t, _lbl in ((Image.FLIP_LEFT_RIGHT, 'mirrored'), (Image.ROTATE_180, 'rotated 180')):
+                alt_img = crop.transpose(_t)
+                alt = _read_crop(alt_img, _lbl)
                 if _score(alt) > _score(best):
-                    best = alt
+                    best, best_img = alt, alt_img
                 if _score(best) >= 3:
                     break
+        best = _settle_serving_g(best, lambda: _read_crop(best_img, 're-read'), diag)
+        best.pop('serving_size_text', None)
         return best
     except Exception as _e:
+        diag.append(f'error: {type(_e).__name__}: {_e}')
         print(f'[vision] nfp-crop read failed: {_e}')
         return {}
 
@@ -1576,6 +1816,9 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
     _gtin_lookup = barcode_gtins[0] if (barcode_gtins and len(set(barcode_gtins)) == 1) else None
     _sku_lookup = matched_spec.get('sku') if matched_spec else None
     _approved_panel, _panel_fetch_reason = _fetch_approved_panel(_gtin_lookup, _sku_lookup)
+    # Is the master fill weight for the approved formula? Withheld if not.
+    _formula_prov = _formula_provenance(matched_spec, _approved_panel) if matched_spec else None
+    _fill_for_netwt = None if (_formula_prov or {}).get('state') == 'mismatch' else _fill_weight
     _prior_panel_version = _fetch_prior_panel_version(_gtin_lookup, _sku_lookup)
 
     ocr_claude = ''
@@ -1586,6 +1829,8 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
     vision_nfp_bbox = None
     vision_dshea = False
     nfp_read = {}
+    _nfp_crop_diag = []
+    _front_crop_diag = []
     _vision_diag = ''
     # Gate Claude Vision on whether the nutrition content actually came through —
     # not raw word count. Outlined-text PDFs yield garbage; reverse/mirror-printed
@@ -1621,7 +1866,23 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
         vision_dshea = bool(_vision.get('dshea_disclaimer'))
         # Durable read: re-read the Nutrition Facts panel from an isolated crop so
         # its small digits are legible instead of squashed in the full-page pass.
-        nfp_read = _read_nfp_panel(img_path, vision_nfp_bbox)
+        nfp_read = _read_nfp_panel(img_path, vision_nfp_bbox, diag=_nfp_crop_diag)
+        print(f'[nfp-crop] {fname} ' + ('OK ' if nfp_read else 'NOTHING READ ') + ' | '.join(_nfp_crop_diag))
+        # Front call-out rings: only the isolated read (panel masked) may supply
+        # them. The full-page values are kept as unconfirmed — reported, never
+        # compared (run 142db86d: the full page read a 100-cal ring as 130).
+        _front_read = _read_front_callouts(img_path, vision_nfp_bbox, diag=_front_crop_diag)
+        print(f'[front-crop] {fname} ' + ('OK ' if _front_read else 'NOTHING READ ')
+              + ' | '.join(_front_crop_diag) + f' | full-page front={_vision.get("front_callout", {})}')
+        _full_front = dict(vision_nutrition.get('front_callout') or {})
+        _crop_vals = dict(_front_read.get('values') or {}) if _front_read.get('rings') else {}
+        vision_nutrition['front_callout'] = _crop_vals
+        vision_nutrition['front_unbound'] = list(_front_read.get('unbound') or [])
+        # Per field: a ring the full page saw but the crop did not read is
+        # unconfirmed (NOT EVALUATED), never silently absent.
+        vision_nutrition['front_unconfirmed'] = {k: v for k, v in _full_front.items()
+                                                 if v is not None and k not in _crop_vals}
+        vision_nutrition['front_read_by_vision'] = True
         # No Contains line from the full-page pass, and an approved record that
         # declares allergens to check it against: re-read it from a crop.
         if not (vision_allergens or {}).get('contains_statement') and _approved_allergens(_approved_panel):
@@ -1764,7 +2025,8 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
 
     # Revision comparison (Checks 7 & 8): snapshot this label's content and pull
     # the prior proofed version for this SKU from stored history (ReadyDoc → local).
-    _snapshot = _build_label_snapshot(label_text, _panel, vision_nutrition)
+    _snapshot = _build_label_snapshot(label_text, _panel, vision_nutrition,
+                                      reader_source='vision' if _label_is_vision else 'ocr')
     # DSHEA disclaimer detection is robust to vision omitting it from raw_text: the
     # first pass reports it as a structured boolean, OR-ed with the text regex.
     _snapshot['dshea_disclaimer'] = bool(_snapshot.get('dshea_disclaimer')) or vision_dshea
@@ -1811,7 +2073,7 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
         brand_name = brand_config.get('brand_name', '')
         checks = {
             'gtin':     _check_gtin(combined_text, fname, gtin_rows, barcode_gtins),
-            'netwt':    _check_net_weight(_panel, fill_weight_g=_fill_weight, fname=fname, serving_vision_backed=_netwt_vision_backed, prior_snapshot=_prior_snapshot),
+            'netwt':    _check_net_weight(_panel, fill_weight_g=_fill_for_netwt, fname=fname, serving_vision_backed=_netwt_vision_backed, prior_snapshot=_prior_snapshot),
             'eyemark':  _check_eyemark(img, is_film, fname, required_eyemark, vision_eyemark=vision_eyemark),
             'spelling': _check_spelling_generic(label_text, brand_name),
             'fda':      _check_fda_light(label_text, fname),
@@ -1828,7 +2090,7 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
         checks = {
             'gtin':     _check_gtin(combined_text, fname, gtin_rows, barcode_gtins),
             'panel':    _panel_check,
-            'netwt':    _check_net_weight(_panel, fill_weight_g=_fill_weight, fname=fname, serving_vision_backed=_netwt_vision_backed, prior_snapshot=_prior_snapshot),
+            'netwt':    _check_net_weight(_panel, fill_weight_g=_fill_for_netwt, fname=fname, serving_vision_backed=_netwt_vision_backed, prior_snapshot=_prior_snapshot),
             'nfp':      _check_nfp(label_text, front_text=_nfp_front_text, vision_nutrition=vision_nutrition),
             'eyemark':  _check_eyemark(img, is_film, fname, required_eyemark, vision_eyemark=vision_eyemark),
             'spelling': _check_spelling(label_text, fname),
@@ -1869,6 +2131,8 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
         checks['gtin']['spec_gtin'] = str(matched_spec.get('gtin', '')).strip()
         _check_gtin_vs_spec_row(checks['gtin'], matched_spec)
         _apply_unparseable_spec(checks, matched_spec)
+        _apply_not_applicable_spec(checks, matched_spec)
+        _apply_formula_provenance(checks.get('netwt'), _formula_prov)
 
     # Converter's item reference vs the SKU the artwork's own barcode resolves to.
     _item_ref_check = _check_item_reference(combined_text, barcode_gtins, gtin_rows)
@@ -1965,11 +2229,17 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
         # never a reason to withhold CLEAN. Only meaningful where the print-
         # spec check (which owns both sub-checks) actually ran.
         'checks_disabled': _disabled_checks() if 'specs' in checks else [],
+        # Does not apply to this SKU (master list reads "NA") — likewise listed,
+        # never skipped, never a reason to withhold CLEAN.
+        'checks_not_applicable': _not_applicable_checks(checks),
         # Which reader produced each panel field ('nfp_crop' / 'vision_struct' /
         # 'page_regex' / None), plus the whole-page regex candidates that were
         # deliberately NOT used — rendered on the Reader Provenance sheet.
         'panel_values': _panel_values,
         'panel_provenance': _panel_provenance,
+        # Why the isolated panel-crop read returned what it did (see _read_nfp_panel).
+        'nfp_crop_diag': _nfp_crop_diag,
+        'front_crop_diag': _front_crop_diag,
         'panel_page_regex': dict(_panel.get('_page_regex') or {}),
         # Full-page vision serving reads set aside because the panel crop did
         # not confirm them — likewise deliberately NOT used.
@@ -2190,6 +2460,67 @@ def _apply_unparseable_spec(checks: dict, matched_spec: dict) -> None:
             chk['notes'] = [n for n in chk.get('notes', []) if not str(n).startswith('NOT VERIFIED')]
 
 
+def _norm_formula(ref, ver) -> tuple:
+    """(REF, version) normalised for comparison: case and whitespace off the
+    ref, a leading "v" off the version, "1.20" == "1.2"."""
+    r = re.sub(r'\s+', '', str(ref or '')).upper()
+    v = re.sub(r'^[vV]\s*', '', str(ver or '').strip())
+    try:
+        v = repr(float(v)) if v else ''
+    except ValueError:
+        pass
+    return r, v
+
+
+def _formula_provenance(matched_spec: dict, approved: dict) -> dict:
+    """Does the master-list fill weight belong to the formula the artwork was
+    approved against? A fill weight from a superseded formula reads like a
+    real one: the beef bottles' live export still carried pre-reformulation
+    fill weights, four false net-weight CRITICALs.
+
+      match         approved record and master row name the same formula
+      mismatch      the approved record names a formula; the master row names
+                    a different one, or none — the fill weight cannot be used
+      not_recorded  the approved record names no formula (ReadyDoc does not
+                    carry the field yet) — compared as before, and said so
+
+    Enforcement is per SKU and automatic: a SKU becomes binding as soon as its
+    approved record carries a formula ref. No flag, no flag day."""
+    approved = approved or {}
+    a_ref = approved.get('formula_ref') or (approved.get('panel') or {}).get('formula_ref')
+    a_ver = approved.get('formula_version') or (approved.get('panel') or {}).get('formula_version')
+    m_ref, m_ver = (matched_spec or {}).get('formula_ref'), (matched_spec or {}).get('formula_version')
+    _fmt = lambda r, v: (f'{r} v{re.sub(r"^[vV]", "", str(v))}' if v else str(r)) if r else 'no formula recorded'
+    if not a_ref:
+        return {'state': 'not_recorded', 'note': (
+            'Fill-weight provenance not recorded — the approved panel record names no formula, so '
+            f'the master-list fill weight ({_fmt(m_ref, m_ver)}) could not be confirmed to belong '
+            'to the approved formula. Compared as supplied.')}
+    if _norm_formula(a_ref, a_ver) == _norm_formula(m_ref, m_ver):
+        return {'state': 'match', 'note': (
+            f'Fill-weight provenance: master list and approved panel both name {_fmt(a_ref, a_ver)}.')}
+    return {'state': 'mismatch', 'note': (
+        f'Could not evaluate — reference data predates the formula: the master-list fill weight '
+        f'is recorded against {_fmt(m_ref, m_ver)}, but the artwork was approved against '
+        f'{_fmt(a_ref, a_ver)}. A fill weight from another formula proves nothing about this '
+        'label. Update the master row\'s formula and fill weight, then re-proof.')}
+
+
+def _apply_formula_provenance(netwt: dict, prov: dict) -> None:
+    """Record the provenance on the net-weight check. On a mismatch the fill
+    weight was withheld from the comparison; the check is NOT_RUN (blocks
+    CLEAN) and says why, instead of "no fill weight supplied"."""
+    if not isinstance(netwt, dict) or not prov:
+        return
+    netwt['formula_provenance'] = prov['state']
+    if prov['state'] == 'mismatch':
+        netwt['status'] = 'NOT_RUN'
+        netwt['notes'] = [prov['note']] + [n for n in netwt.get('notes', [])
+                                           if not str(n).startswith('NOT VERIFIED')]
+    else:
+        netwt.setdefault('notes', []).append(prov['note'])
+
+
 _ITEM_REF_RE = re.compile(r'cust(?:omer)?\.?\s*item\s*ref(?:erence)?\.?\s*[:#]?\s*([A-Z0-9][A-Z0-9_\-]{2,})',
                           re.I)
 
@@ -2264,6 +2595,11 @@ def _check_nfp(ocr_text: str, front_text: str = '', vision_nutrition: dict = Non
     # Claude Vision structured read (set when Tesseract couldn't parse outlined /
     # reverse-printed art). Normalize up-front so it feeds NFP-presence detection.
     _vfc = (vision_nutrition or {}).get('front_callout') or {}
+    # Full-page ring values the isolated front read did not confirm, and rings
+    # whose caption could not be read: reported NOT EVALUATED, never compared.
+    _vunconf = (vision_nutrition or {}).get('front_unconfirmed') or {}
+    _vunbound = (vision_nutrition or {}).get('front_unbound') or []
+    _vision_read_front = bool((vision_nutrition or {}).get('front_read_by_vision'))
     _vnfp = (vision_nutrition or {}).get('nfp') or {}
     _vision_has_nfp = _vnfp.get('calories') is not None or _vnfp.get('protein_g') is not None
 
@@ -2298,10 +2634,13 @@ def _check_nfp(ocr_text: str, front_text: str = '', vision_nutrition: dict = Non
     # Front callout format — circular badge callouts show the number on one line
     # and the label on the next, so we need multi-strategy detection.
     _fc_cals, _fc_prots = set(), set()
+    _fc_cals_loose, _fc_prots_loose = set(), set()
 
     # Strategy 1: inline "117 cal/calories" or "25g protein" on same line
     # Run on fl (left-half / front-panel text) for accuracy
-    for _v in re.findall(r'\b(\d{2,3})\s*cal(?:ories?)?\b(?!\s*\d)', fl):
+    # Same line only ([ \t], not \s): a number and caption on separate lines
+    # is a badge, and Strategy 2 decides whether the caption is its own.
+    for _v in re.findall(r'\b(\d{2,3})[ \t]*cal(?:ories?)?\b(?!\s*\d)', fl):
         if 30 <= int(_v) <= 800: _fc_cals.add(int(_v))
     for _v in re.findall(r'\b(\d+)\s*g\s+protein\b', fl):
         if 0 < int(_v) < 120: _fc_prots.add(int(_v))
@@ -2320,7 +2659,16 @@ def _check_nfp(ocr_text: str, front_text: str = '', vision_nutrition: dict = Non
             _next_few = ' '.join(l.strip() for l in _lines[_i + 1: _i + 3])
             _is_pct = '%' in _next_few or 'percent' in _next_few.lower()
             if not _is_pct and 30 <= _v <= 800 and re.search(r'\bcal(?:ories?)?\b', _ctx_fwd):
-                _fc_cals.add(_v)
+                # Side-by-side rings interleave in OCR: on the beef bottles the
+                # "100%" ring loses its superscript % and reads "100 / Calories
+                # Per / Grass-F", taking the neighbouring ring's caption. A number
+                # whose caption lines also carry another ring's caption is not
+                # bound to calories — keep it loose (NOT EVALUATED at most).
+                _caption = ' '.join([l.strip() for l in _lines[_i + 1: _i + 8] if l.strip()][:3]).lower()
+                if re.search(r'grass|\bfed\b|%|protein|sugar', _caption):
+                    _fc_cals_loose.add(_v)
+                else:
+                    _fc_cals.add(_v)
         # Standalone "NNg" or "NN" followed by "g" on next line (e.g. "25g" or "25G")
         _mg = re.match(r'^(\d+)g$', _s)
         if _mg:
@@ -2342,7 +2690,6 @@ def _check_nfp(ocr_text: str, front_text: str = '', vision_nutrition: dict = Non
     # dieline's "95.00 mm Layflat" as a 95-calorie call-out and filed a false
     # CRITICAL on 22 of 30 correct labels. Its values are kept apart and can
     # only mark the comparison NOT EVALUATED, never decide it.
-    _fc_cals_loose, _fc_prots_loose = set(), set()
     for _km in re.finditer(r'\bcal(?:ories?)?\b', fl):
         _before = fl[max(0, _km.start() - 120): _km.start()]
         for _vm in re.finditer(r'\b(\d{2,3})\b', _before):
@@ -2366,6 +2713,13 @@ def _check_nfp(ocr_text: str, front_text: str = '', vision_nutrition: dict = Non
                     continue
                 _fc_prots_loose.add(_vi)
 
+    # Where vision read the front, a text-found ring value is evidence of
+    # nothing on its own (CI run 38305043657: OCR bound a stray "269" to
+    # "Calories" and filed a CRITICAL): it can only mark NOT EVALUATED.
+    if _vision_read_front:
+        _fc_cals_loose |= _fc_cals
+        _fc_prots_loose |= _fc_prots
+        _fc_cals, _fc_prots = set(), set()
     front_calories  = sorted(_fc_cals)
     front_proteins  = sorted(_fc_prots)
     front_zero_sugar = bool(re.search(r'\b0\s*g\s*\n?\s*added\s+sugar|\b0\s+added\s+sugar', fl))
@@ -2419,20 +2773,40 @@ def _check_nfp(ocr_text: str, front_text: str = '', vision_nutrition: dict = Non
     # comparison. When it is all there is and it doesn't simply repeat the NFP
     # value, say the comparison was not evaluated and send it to a person.
     _unconfirmed_front = {}
-    if not has_dual_column and not front_calories and _fc_cals_loose and nfp_calories and _fc_cals_loose != set(nfp_calories):
+    # (Skipped where the full-page vision value for the field is reported as
+    # unconfirmed below — one NOT EVALUATED per ring, not two.)
+    if not has_dual_column and not front_calories and _fc_cals_loose and nfp_calories and _fc_cals_loose != set(nfp_calories) \
+            and _vunconf.get('calories') is None:
         _unconfirmed_front['calories'] = sorted(_fc_cals_loose)
         issues.append({'severity': 'review', 'message': (
             f'NOT EVALUATED — front calorie call-out: the only front value read '
             f'({", ".join(str(v) for v in sorted(_fc_cals_loose))}) was a number near the word '
             f'"calories", not a call-out bound to it, so it was not compared with the NFP '
             f'({", ".join(str(v) for v in nfp_calories)} cal). Check the front call-out by eye.')})
-    if not has_dual_column and not front_proteins and _fc_prots_loose and nfp_proteins and _fc_prots_loose != set(nfp_proteins):
+    if not has_dual_column and not front_proteins and _fc_prots_loose and nfp_proteins and _fc_prots_loose != set(nfp_proteins) \
+            and _vunconf.get('protein_g') is None:
         _unconfirmed_front['protein_g'] = sorted(_fc_prots_loose)
         issues.append({'severity': 'review', 'message': (
             f'NOT EVALUATED — front protein call-out: the only front value read '
             f'({", ".join(str(v) for v in sorted(_fc_prots_loose))}g) was a number near the word '
             f'"protein", not a call-out bound to it, so it was not compared with the NFP '
             f'({", ".join(str(v) for v in nfp_proteins)}g). Check the front call-out by eye.')})
+
+    for _fld, _have, _nfpv, _lbl, _u in (('calories', front_calories, nfp_calories, 'calorie', ' cal'),
+                                         ('protein_g', front_proteins, nfp_proteins, 'protein', 'g')):
+        # Agreement with the NFP is not evidence here: the full-page pass is
+        # the reader that reports a ring as the panel's value (run 142db86d).
+        _uv = _num_or_none(_vunconf.get(_fld))
+        if not has_dual_column and not _have and _uv is not None and _nfpv:
+            _unconfirmed_front[_fld] = [_uv]
+            issues.append({'severity': 'review', 'message': (
+                f'NOT EVALUATED — front {_lbl} call-out: only the full-page read saw it ({_uv:g}{_u}); '
+                f'the isolated read of the front rings did not confirm it, so it was not compared with '
+                f'the NFP ({", ".join(f"{v:g}" for v in _nfpv)}{_u}). Check the front call-out by eye.')})
+    if _vunbound and not has_dual_column:
+        issues.append({'severity': 'review', 'message': (
+            f'NOT EVALUATED — front ring(s) {", ".join(_vunbound)}: the caption printed with the '
+            'number could not be read, so the ring was not compared with any NFP field. Check it by eye.')})
 
     # Calorie mismatch — prefer a direct front-callout vs NFP comparison (most
     # accurate). Fall back to a pooled range check when only one source read.
@@ -3213,13 +3587,18 @@ _COMPARATIVE_PATTERNS = [
 ]
 
 
+# Which reader produced a stored ingredient statement. Bump the version
+# whenever _ingredient_statements changes what it captures: a baseline taken by
+# an older reader is a statement about that reader, not about the artwork, and
+# diffing against it reports reader improvements as label changes (run
+# 142db86d: Double Chocolate's baseline had swept in the brand paragraph).
+INGREDIENT_READER_VERSION = 2
+
+
 def _ingredient_statement(text: str) -> str:
-    """The raw text of the ingredient declaration, if present."""
-    m = re.search(
-        r'ingredients?\s*:\s*(.+?)(?:\bcontains?\s*:|these\s+statements|manufactured|'
-        r'distributed|\bnet\s+wt|\*these|\Z)',
-        text or '', re.IGNORECASE | re.DOTALL)
-    return re.sub(r'\s+', ' ', m.group(1)).strip(' .') if m else ''
+    """The raw text of the (first) ingredient declaration, if present."""
+    found = _ingredient_statements(text)
+    return found[0] if found else ''
 
 
 def _split_ingredients(statement: str) -> list:
@@ -3250,8 +3629,11 @@ def _norm_ing(s: str) -> str:
     return re.sub(r'[^a-z0-9 ]', ' ', s).strip()
 
 
-def _build_label_snapshot(text: str, panel: dict, vision_nutrition: dict) -> dict:
-    """Compact record of the label content used for revision comparison."""
+def _build_label_snapshot(text: str, panel: dict, vision_nutrition: dict,
+                          reader_source: str = None) -> dict:
+    """Compact record of the label content used for revision comparison.
+    `reader_source` ('vision' / 'ocr') is stored with the reader version as the
+    baseline's provenance."""
     tl = (text or '').lower()
     stmt = _ingredient_statement(text)
     sf = []
@@ -3274,6 +3656,7 @@ def _build_label_snapshot(text: str, panel: dict, vision_nutrition: dict) -> dic
     vn = vision_nutrition or {}
     return {
         'ingredients_raw': stmt,
+        'ingredients_reader': {'version': INGREDIENT_READER_VERSION, 'source': reader_source},
         'ingredients': [_norm_ing(x) for x in _split_ingredients(stmt) if _norm_ing(x)],
         'has_less_than_2pct': bool(re.search(r'less\s+than\s+\d+\s*%', stmt.lower())),
         'front_callout': vn.get('front_callout', {}) or {},
@@ -4052,6 +4435,7 @@ def _recount_result(res: dict) -> None:
     res['review_count'] = len(review)
     res['info_count'] = len(infos)
     res['checks_run'], res['unverified_checks'] = _completeness(checks)
+    res['checks_not_applicable'] = _not_applicable_checks(checks)
     res['checks_skipped'] = res['unverified_checks']
     res['fully_verified'] = not res['unverified_checks']
     res['severity'] = _file_severity(crit, warns, suspect, review, infos, res['unverified_checks'])
@@ -4288,6 +4672,17 @@ def _check_ingredient_drift(current: dict, prior: dict) -> dict:
     if not cur:
         notes.append('Could not read an ingredient statement to compare against the prior version.')
         return {'issues': issues, 'notes': notes, 'compared': False}
+    # A baseline is only comparable when the same reader captured it.
+    _cr = (current or {}).get('ingredients_reader') or {}
+    _pr = (prior or {}).get('ingredients_reader') or {}
+    if _cr and _pr != _cr:
+        _desc = lambda r: (f'reader v{r.get("version")} ({r.get("source") or "unknown source"})'
+                           if r else 'an unrecorded (older) reader')
+        notes.append(
+            f'Could not evaluate — the prior baseline was captured by {_desc(_pr)}, this read by '
+            f'{_desc(_cr)}. A difference between them would describe the readers, not the '
+            'artwork, so ingredient drift was not compared. This proof becomes the new baseline.')
+        return {'issues': issues, 'notes': notes, 'compared': False}
 
     # 1. Headline order changes — an ingredient among the first three that moves.
     for i, ing in enumerate(old[:3]):
@@ -4406,6 +4801,16 @@ def _check_eyemark(img, is_film: bool = False, fname: str = '',
             'Include "stick", "sachet", "film", or "rollstock" in the filename to enable.'
         )
         return {'issues': issues, 'notes': notes, 'eyemark_color': None, 'skipped': True}
+
+    # A required colour must be black or white to compare against. Anything else
+    # is reported as unreadable — never echoed into a sentence that treats it as
+    # a colour ("spec requires NA ... pure NA (#000000)", run 142db86d).
+    _req_raw = (required_color or '').strip()
+    if _req_raw and _req_raw.lower() not in ('black', 'white'):
+        issues.append({'severity': 'review', 'message': (
+            f'Could not evaluate — the master list\'s eyemark colour "{_req_raw}" is not black or '
+            'white. Correct it in the master list (or mark it NA if this SKU carries no eyemark).')})
+        return {'issues': issues, 'notes': notes, 'eyemark_color': None, 'status': 'NOT_RUN'}
 
     # Claude Vision is the authoritative source for the eyemark when it could read
     # one: the registration square is small and often the same size as (or smaller
@@ -4803,12 +5208,111 @@ _FALCPA_SYNONYMS = {
     'wheat': ('wheat',),
     'soy': ('soy',),
     'peanut': ('peanut',),
+    # Not coconut: FDA's food allergen guidance (Q&A, 5th ed., Jan 2025) no
+    # longer lists it as a tree nut.
     'tree nut': ('tree nut', 'almond', 'cashew', 'walnut', 'pecan', 'hazelnut', 'pistachio',
-                 'macadamia', 'coconut'),
+                 'macadamia'),
     'fish': ('fish',),
     'shellfish': ('shellfish', 'crustacean', 'shrimp', 'crab', 'lobster'),
     'sesame': ('sesame',),
 }
+
+
+# ── Allergen presence: ingredient statement only, by source ──────────────────
+# FALCPA keys on an ingredient's SOURCE, and the source is usually the
+# modifier: wheat flour, whey protein isolate, soy lecithin, almond flour. So a
+# source word anywhere in an ingredient name counts — except in compounds where
+# that word names something else. "Coconut milk" is coconut, "cocoa butter" is
+# cocoa, "peanut butter" is peanut (not milk). Those are rewritten to their real
+# source before matching.
+_ALLERGEN_SOURCE_TERMS = {
+    'milk':      r'\b(?:milk|buttermilk|whey|caseins?|caseinates?|lactose|lactalbumin|butter(?:fat|milk)?|'
+                 r'cream|cheeses?|yog(?:h)?urt|ghee|curds?|dairy)\b',
+    'egg':       r'\b(?:eggs?|albumin|albumen|ovalbumin|meringue)\b',
+    'wheat':     r'\b(?:wheat|durum|semolina|spelt|farina|farro|einkorn|kamut|triticale)\b',
+    'soy':       r'\b(?:soy|soya|soybeans?|edamame|tofu)\b',
+    'peanut':    r'\b(?:peanuts?|groundnuts?)\b',
+    # Coconut is not a tree nut (FDA food allergen Q&A, 5th ed., 2025).
+    'tree nut':  r'\b(?:almonds?|cashews?|walnuts?|pecans?|hazelnuts?|filberts?|pistachios?|'
+                 r'macadamias?|brazil\s+nuts?|pine\s+nuts?|tree\s+nuts?)\b',
+    'fish':      r'\b(?:fish|anchov(?:y|ies)|salmon|tuna|pollock|cod|tilapia|sardines?|mackerel)\b',
+    'shellfish': r'\b(?:shellfish|crustaceans?|shrimp|crab|lobster|prawns?|crayfish|crawfish)\b',
+    'sesame':    r'\b(?:sesame|tahini)\b',
+}
+# Compound -> what it really is, applied before matching.
+_ALLERGEN_FALSE_FRIENDS = (
+    (r'\b(coconut|oat|rice|hemp|pea|flax)\s+(?:milk|cream|beverage)\b', r'\1'),
+    (r'\b(almond|cashew|soy|peanut)\s+(?:milk|butter|cream|beverage)\b', r'\1'),
+    (r'\b(cocoa|cacao|shea|apple|nut|seed|sunflower)\s+butter\b', r'\1'),
+    (r'\bcream\s+of\s+tartar\b', 'tartar'),
+    (r'\b(?:dairy|milk|egg|gluten|soy|nut)[\s-]+free\b', ''),
+    (r'\blactase\b', 'enzyme'),           # a microbial enzyme, not a milk ingredient
+    (r'\blact(?:ase|ose)\s*\d+\s*alu\b', 'enzyme'),  # OCR of "Lactase 20 ALU"
+)
+
+# "Ingredients:" — or the word opening a line, when OCR drops the colon. Not
+# "All Natural Ingredients" in a claim line.
+_INGREDIENTS_START = re.compile(r'\bingredients?\s*[:;]\s*|^[ \t]*ingredients?\b[ \t]*\.?[ \t]*', re.I | re.M)
+# Where an ingredient statement ends. "Contains less than 2% of:" is INSIDE the
+# statement; "Contains: Milk" and everything after it are not.
+_INGREDIENTS_END = re.compile(
+    r'\bcontains?\b(?!\s+(?:less|\d|<|up\s+to|2%))|\bmay\s+(?:also\s+)?contain|\ballergen|'
+    r'\b(?:manufactured|distributed|produced|packed|made)\s+(?:in|by|for|on)\b|'
+    r'\b(?:nutrition|supplement)\s+facts\b|\bdirections?\b|\bstep\s*\d|\bstore\b|\bstorage\b|'
+    r'\bbest\s+(?:by|before)\b|\bnet\s+wt\b|\bkeep\b|\bthese\s+statements\b|'
+    r'\.(?=\s|$)(?<!\d\.)', re.I)
+# A wrapped ingredient line nearly always carries a comma, bracket, colon or %;
+# six or more words with none of them is prose — the brand paragraph that sits
+# under the statement on the bottle back panels (run 142db86d, Double
+# Chocolate: the baseline had swept it in as part of the last ingredient).
+_PROSE_LINE = re.compile(r'^(?!.*[,():;%\[\]])\s*(?:\S+\s+){5,}\S+\s*$')
+
+
+def _ingredient_statements(text: str) -> list:
+    """The raw text of each ingredient statement on the label, located once —
+    used by the allergen scan and the revision snapshot alike, so neither can
+    read prep copy, advisories or marketing paragraphs as ingredients."""
+    out = []
+    for m in _INGREDIENTS_START.finditer(text or ''):
+        body = text[m.end(): m.end() + 1200]
+        e = _INGREDIENTS_END.search(body)
+        body = body[:e.start()] if e else body
+        kept = []
+        for i, line in enumerate(body.split('\n')):
+            if i and line.strip() and _PROSE_LINE.match(line):
+                break
+            kept.append(line)
+        stmt = re.sub(r'\s+', ' ', ' '.join(kept)).strip(' .')
+        if stmt:
+            out.append(stmt)
+    return out
+
+
+def _ingredient_list(text: str) -> list:
+    """The individual ingredients named in the label's ingredient statement(s),
+    lower-cased, sub-ingredients split out. Empty when no statement is found —
+    the caller must then say the scan did not run, not report no allergens."""
+    out = []
+    for body in _ingredient_statements(text):
+        for part in re.split(r'[,;()\[\]]|\band\b|&', body.lower()):
+            part = re.sub(r'^\s*(?:contains\s+)?(?:less\s+than|\d+%\s+or\s+less)[^:]*:\s*', '', part)
+            part = re.sub(r'\s+', ' ', part).strip(' .:*-')
+            if part:
+                out.append(part)
+    return out
+
+
+def _ingredient_allergens(ingredients: list) -> dict:
+    """{allergen: the ingredient that names its source} for ingredient names."""
+    hits = {}
+    for ing in ingredients or []:
+        src = ing
+        for pat, repl in _ALLERGEN_FALSE_FRIENDS:
+            src = re.sub(pat, repl, src)
+        for allergen, pat in _ALLERGEN_SOURCE_TERMS.items():
+            if allergen not in hits and re.search(pat, src):
+                hits[allergen] = ing
+    return hits
 
 
 def _canonical_allergen(name: str):
@@ -5013,96 +5517,47 @@ def _check_fda(ocr_text: str, fname: str, vision_allergens: dict = None) -> dict
     fname_tl = fname.lower() + ' ' + tl
 
     # Filename-based product-type signals (primary: filename is authoritative for product type)
-    is_whey_product     = bool(re.search(r'\bwhey\b', fname_tl))
+    # Product-type signals come from the FILENAME only. Read from the label text,
+    # an ingredient made the file "a tree-nut product", and Fallback 5 then took
+    # the allergen's presence as proof a Contains line existed — so an
+    # undeclared almond was never flagged.
+    is_whey_product     = bool(re.search(r'\bwhey\b', fname.lower()))
     is_non_dairy_milk   = bool(re.search(  # only suppresses the milk-specific check
         r'\bbeef\b|\bcollagen\b|\bbovine\b|\bplant\b|\bpea\s+protein\b|\brice\s+protein\b|\bvegan\b',
         fname_tl))
     is_wheat_product    = bool(re.search(r'\bpancake\b|\bflour\b|\bbreading\b', fname.lower()))
     is_peanut_product   = bool(re.search(r'\bpeanut\b|\bpb\b', fname.lower()))
     _TREE_NUTS = r'\balmond\b|\bcashew\b|\bwalnut\b|\bpecan\b|\bhazelnut\b|\bpistachio\b|\bmacadamia\b'
-    is_tree_nut_product = bool(re.search(_TREE_NUTS, fname_tl))
+    is_tree_nut_product = bool(re.search(_TREE_NUTS, fname.lower()))
 
-    # Strip segments that are NOT the ingredient list before scanning for allergen
-    # PRESENCE, so they can't fire a false "missing Contains:" critical:
-    #   • directions / serving suggestions — "Mix 1 scoop into water or milk"
-    #   • cross-contact advisories — "manufactured in a facility that also processes
-    #     milk, egg, soy, wheat, peanuts, tree nuts" / "may contain ...". These are
-    #     NOT ingredient allergens; FALCPA "Contains:" applies only to ingredients.
-    # (Contains:/advisory *declaration* detection below still scans the full text.)
-    # NB: avoid bare "blend" — it matches the ingredient "Digestive Enzyme Blend".
-    #
-    # The strip anchors PER-LINE (`[^.\n]*` stops at a newline), so a STEP-style
-    # single-serve-bottle direction block leaves milk exposed:
-    #   DIRECTIONS
-    #   STEP 1 Add water or milk to dotted line (7oz).
-    #   STEP 2 Shake well. Do not top off.
-    # "DIRECTIONS" sits on its own line and strips only that line; "milk" on the
-    # STEP 1 line survives, and on a beef/plant SKU with no Contains: statement
-    # (correctly — beef and plant carry no milk) that reads as an undeclared
-    # allergen. Extending the verb list to the STEP-copy vocabulary itself closes
-    # this without needing every possible line boundary.
-    _PREP_VERBS = (
-        r'directions?|serving\s+suggestion|shake|stir|dissolve|scoop|'
-        r'mix(?:es|ed)?\s+\d|step\s*\d|add\s+(?:water|milk)|dotted\s+line|'
-        r'top\s+off|enjoy\s+your|'
-        r'may\s+(?:also\s+)?contain|facility|shared\s+(?:equipment|lines?)'
-    )
-    _alg_text = re.sub(r'[^.\n]*\b(?:' + _PREP_VERBS + r')\b[^.\n]*', ' ', tl)
+    # Allergen PRESENCE is read from the ingredient statement only — never the
+    # whole page. Prep copy ("Add water or milk"), cross-contact advisories and
+    # marketing paragraphs are not ingredients, and stripping them one pattern
+    # at a time never ends (run 142db86d: "milk" from the STEP copy and from
+    # "Coconut Milk Powder" on every beef bottle). See _ingredient_allergens.
+    # (Contains:/advisory *declaration* detection above still scans the full text.)
+    _ingredients = _ingredient_list(ocr_text)
+    _ingredients_located = bool(_ingredients)
+    if not _ingredients_located:
+        notes.append('Ingredient statement not located in the label text — the undeclared-'
+                     'allergen scan did not run (the approved-record Contains check still does).')
+    _ALLERGEN_HITS = _ingredient_allergens(_ingredients)
+    # Joined ingredient text, for the vision cross-check below.
+    _alg_text = ', '.join(_ingredients)
 
-    # Belt and braces. A phrase naming a liquid to reconstitute with is a
-    # preparation instruction, never an ingredient declaration — and on a beef or
-    # plant bottle it is the only occurrence of "milk" anywhere on the label.
-    _alg_text = re.sub(
-        r'\b(?:water\s+or\s+milk|milk\s+or\s+water|with\s+milk|in\s+milk|to\s+milk)\b',
-        ' ', _alg_text)
+    _milk_in_ocr      = 'milk' in _ALLERGEN_HITS
+    _peanut_in_ocr    = 'peanut' in _ALLERGEN_HITS
+    _tree_nut_in_ocr  = 'tree nut' in _ALLERGEN_HITS
+    _soy_in_ocr       = 'soy' in _ALLERGEN_HITS
+    _egg_in_ocr       = 'egg' in _ALLERGEN_HITS
+    _fish_in_ocr      = 'fish' in _ALLERGEN_HITS
+    _shellfish_in_ocr = 'shellfish' in _ALLERGEN_HITS
+    _sesame_in_ocr    = 'sesame' in _ALLERGEN_HITS
+    _wheat_in_ocr     = 'wheat' in _ALLERGEN_HITS
 
-    # "Lactase" is a fungal/microbial digestive enzyme, not a milk ingredient.
-    # Tesseract reads it as "lactose" often enough to matter, and "lactose" IS a
-    # milk term — so remove the enzyme (with or without its activity units, e.g.
-    # "Lactase 20 ALU") before the milk presence test runs.
-    _alg_text = re.sub(r'\blact(?:ase|ose)\s*\d*\s*alu\b', ' ', _alg_text)
-    _alg_text = re.sub(r'\blactase\b', ' ', _alg_text)
-
-    # Per-allergen ingredient presence (directions/advisory text removed). Each
-    # hit records the matched TEXT, not just a bool — the finding this feeds can
-    # then show its own evidence instead of asking the reader to take it on faith.
-    _ALLERGEN_HITS = {}
-
-    def _hit(name, pattern):
-        m = re.search(pattern, _alg_text)
-        if m:
-            _ALLERGEN_HITS[name] = m.group(0).strip()
-        return bool(m)
-
-    _milk_in_ocr      = _hit('milk', r'\bmilk\b|\bnon.fat\s+milk\b|\bmilk\s+powder\b|\bskim\s+milk\b|\bdairy\b|\bcasein\b|\bwhey\b|\blactose\b')
-    _peanut_in_ocr    = _hit('peanut', r'\bpeanut\b')
-    _tree_nut_in_ocr  = _hit('tree nut', _TREE_NUTS + r'|\btree\s+nut\b|\bcoconut\b')
-    _soy_in_ocr       = _hit('soy', r'\bsoy(?:bean)?\b|\bsoy\s+lecithin\b')
-    _egg_in_ocr       = _hit('egg', r'\begg\b|\begg\s+white\b|\balbumin\b')
-    _fish_in_ocr      = _hit('fish', r'\bfish\b|\bsalmon\b|\btuna\b|\bpollock\b|\bcod\b|\btilapia\b')
-    _shellfish_in_ocr = _hit('shellfish', r'\bshrimp\b|\bcrab\b|\blobster\b|\bscallop\b|\bclam\b|\bshellfish\b')
-    _sesame_in_ocr    = _hit('sesame', r'\bsesame\b|\btahini\b')
-    _wheat_in_ocr     = _hit('wheat', r'\bwheat\b|\bgluten\b')
-
-    # Cross-validate Claude Vision's structured allergen read against the actual
-    # ingredient text. Vision sometimes over-reports — it lists allergens from a
-    # facility cross-contact advisory (or defensively), e.g. flagging all 6 majors
-    # on a pea/rice plant protein. Since the FDA check now reads the clean vision
-    # label text, the per-allergen regexes above already scan it; we only let a
-    # vision-detected allergen reinforce a flag when its source actually appears in
-    # the (directions/advisory-stripped) ingredient text — never invent one.
-    _vd = ' '.join(_va_detected)
-    if _va_detected:
-        if 'milk' in _vd and re.search(r'milk|dairy|whey|casein|lactose', _alg_text):
-            _milk_in_ocr = True
-        if 'peanut' in _vd and 'peanut' in _alg_text:        _peanut_in_ocr = True
-        if re.search(r'tree\s*nut|coconut|almond|cashew|walnut|pecan|hazelnut|pistachio|macadamia', _vd) \
-           and re.search(_TREE_NUTS + r'|\btree\s+nut\b|\bcoconut\b', _alg_text):
-            _tree_nut_in_ocr = True
-        if 'soy' in _vd and re.search(r'\bsoy', _alg_text):  _soy_in_ocr = True
-        if 'egg' in _vd and 'egg' in _alg_text:              _egg_in_ocr = True
-        if 'wheat' in _vd and re.search(r'wheat|gluten', _alg_text): _wheat_in_ocr = True
-        if 'sesame' in _vd and re.search(r'sesame|tahini', _alg_text): _sesame_in_ocr = True
+    # Vision's structured allergen list (_va_detected) is not used for presence:
+    # it over-reports (facility advisories, defensive lists), and the ingredient
+    # statement it would have to be confirmed against is what is scanned above.
     # Vision read the printed "Contains:" declaration directly.
     if _va_contains and re.search(_ALLERGEN_WORDS, _va_contains.lower()):
         has_contains_stmt = True
@@ -5146,7 +5601,11 @@ def _check_fda(ocr_text: str, fname: str, vision_allergens: dict = None) -> dict
     # When the filename identifies a known allergen product but OCR can't find
     # the corresponding allergen ingredient — flag that as a critical miss.
     specific_allergen_flagged = False
-    if is_whey_product and not is_non_dairy_milk and not _milk_in_ocr and 'whey' not in tl:
+    # Only when the ingredient statement was located: "no wheat in a pancake's
+    # ingredients" is a finding; "no ingredient statement read" is not.
+    if not _ingredients_located:
+        pass
+    elif is_whey_product and not is_non_dairy_milk and not _milk_in_ocr and 'whey' not in tl:
         specific_allergen_flagged = True
         issues.append({
             'severity': 'critical',
@@ -5383,12 +5842,21 @@ def _check_fda(ocr_text: str, fname: str, vision_allergens: dict = None) -> dict
 
     # ── Gluten-Free claim ─────────────────────────────────────────────────────
     if re.search(r'gluten[\s\-]?free', tl):
-        if any(w in tl for w in ['wheat', 'barley', 'rye', 'triticale']):
+        # Grains named in the ingredient statement, as whole words — never a
+        # substring anywhere on the page ("rye" in "dryer"; CI run 38312701844
+        # filed this CRITICAL on a gluten-free pancake with no such grain).
+        _gluten_grains = sorted({m.group(0) for ing in _ingredients for m in re.finditer(
+            r'\b(?:wheat|durum|semolina|spelt|farro|einkorn|kamut|barley|rye|triticale|malt)\b', ing)})
+        if not _ingredients_located:
+            notes.append('"Gluten-Free" claim detected, but the ingredient statement was not located — '
+                         'gluten-containing grains could not be checked. Verify manually.')
+        elif _gluten_grains:
             issues.append({
                 'severity': 'critical',
                 'message': (
-                    '"Gluten-Free" claim detected alongside wheat/barley/rye in OCR text. '
-                    'If the product contains these ingredients, the GF claim is prohibited (21 CFR 101.91).'
+                    f'"Gluten-Free" claim alongside {", ".join(_gluten_grains)} in the ingredient '
+                    'statement. A gluten-free claim is prohibited on a food made with a '
+                    'gluten-containing grain unless it is processed to remove gluten (21 CFR 101.91).'
                 ),
             })
         else:

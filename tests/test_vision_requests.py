@@ -67,7 +67,9 @@ def _run():
         for name, call in (
                 ('full-page read (_claude_vision_ocr)', lambda: pe._claude_vision_ocr(tmp)),
                 ('NFP crop (_read_nfp_panel)', lambda: pe._read_nfp_panel(tmp, [0.3, 0.3, 0.6, 0.7])),
-                ('Contains crop (_read_contains_crop)', lambda: pe._read_contains_crop(tmp, [0.3, 0.3, 0.6, 0.7]))):
+                ('Contains crop (_read_contains_crop)', lambda: pe._read_contains_crop(tmp, [0.3, 0.3, 0.6, 0.7])),
+                ('front rings (_read_front_callouts)',
+                 lambda: pe._read_front_callouts(tmp, [0.1, 0.2, 0.4, 0.8]))):
             n = len(bodies)
             out = call()
             sent = bodies[n:]
@@ -79,6 +81,55 @@ def _run():
                   bool(sent) and all(b.get('temperature') == 0 for b in sent))
             check(f'{name}: model is claude-sonnet-4-6',
                   bool(sent) and all(b.get('model') == 'claude-sonnet-4-6' for b in sent))
+        # An empty crop read says why, per step (run 142db86d: silent on one of four).
+        diag = []
+        out = pe._read_nfp_panel(tmp, [0.3, 0.3, 0.6, 0.7], diag=diag)
+        check(f'NFP crop: an empty read records why ({diag})',
+              out == {} and diag and diag[0].startswith('panel located by vision')
+              and any('B sent' in d and '0 fields read' in d for d in diag))
+        # The panel mask never paints over the rings. Vision's panel box is
+        # approximate and reaches into the ring column on the bottle sleeves (CI
+        # runs 38305043657, 38308802272); only a geometrically located panel is
+        # masked, and white background is not a panel.
+        import base64 as _b64, io as _io
+        from PIL import ImageDraw as _D
+        ring_img = os.path.join(os.path.dirname(tmp), 'rings.png')
+        im = Image.new('RGB', (1600, 1200), 'white')
+        _D.Draw(im).ellipse((int(0.46 * 1600), int(0.30 * 1200), int(0.49 * 1600), int(0.34 * 1200)), fill='black')
+        im.save(ring_img)
+        n = len(bodies)
+        pe._read_front_callouts(ring_img, [0.20, 0.20, 0.50, 0.80])
+        sent = [c for b in bodies[n:] for m in b['messages'] for c in m['content'] if c.get('type') == 'image']
+        dark = (Image.open(_io.BytesIO(_b64.b64decode(sent[0]['source']['data']))).convert('L').getextrema()[0]
+                if sent else 255)
+        check(f'front rings: a ring inside vision\'s panel box survives the mask (min px {dark})',
+              dark < 60)
+        # ...while a real panel (white rectangle on printed artwork) IS masked.
+        im = Image.new('RGB', (1600, 1200), (190, 140, 90))
+        d_ = _D.Draw(im)
+        d_.rectangle((400, 300, 700, 900), fill='white')
+        d_.text((420, 320), 'Calories 130', fill='black')
+        d_.ellipse((1000, 400, 1100, 500), fill='black')
+        im.save(ring_img)
+        n = len(bodies)
+        diag = []
+        pe._read_front_callouts(ring_img, [0.25, 0.25, 0.4375, 0.75], diag=diag)
+        sent = [c for b in bodies[n:] for m in b['messages'] for c in m['content'] if c.get('type') == 'image']
+        got = Image.open(_io.BytesIO(_b64.b64decode(sent[0]['source']['data']))).convert('L') if sent else None
+        check(f'front rings: a located panel is masked and the ring beside it kept ({diag[:1]})',
+              got is not None and 'panel masked at' in diag[0]
+              and got.crop((int(got.width * 0.27), int(got.height * 0.27), int(got.width * 0.42),
+                            int(got.height * 0.7))).getextrema()[0] > 200
+              and got.getextrema()[0] < 60)
+        diag = []
+        pe._read_front_callouts(tmp, [0.1, 0.2, 0.4, 0.8], diag=diag)
+        check(f'front rings: the read records the artwork size, masking and what came back ({diag})',
+              diag and diag[0].startswith('artwork ') and 'panel NOT masked' in diag[0]
+              and any('rings:' in d or 'no usable JSON' in d for d in diag))
+        diag = []
+        pe._read_nfp_panel(tmp, None, diag=diag)
+        check('NFP crop: no panel box is recorded as "panel NOT located"',
+              diag and diag[0].startswith('panel NOT located by vision'))
     finally:
         pe.ANTHROPIC_AVAILABLE, pe.PIL_AVAILABLE, pe._anthropic = prev
 
