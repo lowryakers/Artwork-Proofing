@@ -1,5 +1,5 @@
 {
-  "note": "CSG and DCH hand-verified from the artwork on 9 Oct against the approved panels (8 Oct), decoded barcodes and the master SKU list. Toffee Cream and Frosted Vanilla are the corrected files of 12 Oct, re-verified by Claude against the same reference values (not yet hand-verified); see README.md. The pre-correction Toffee Cream is the defect fixture in defects.json.",
+  "note": "CSG and DCH hand-verified from the artwork on 9 Oct against the approved panels (8 Oct), decoded barcodes and the master SKU list. Toffee Cream and Frosted Vanilla are the corrected files of 12 Oct, re-verified by Claude against the same reference values (not yet hand-verified); see README.md. The pre-correction Toffee Cream is the defect fixture in defects.json. overall_status is REVIEW, not CLEAN: every beef bottle prints \"supports digestion\" and the DSHEA disclaimer, and the claims check correctly asks a person to review both on a conventional food (run 142db86d). Zero CRITICAL / WARNING is the clean-file bar.",
   "files": [
     {
       "file": "PD_beef_bottle_cinnamon_sugar.pdf",
@@ -10,9 +10,12 @@
         "servings_per_container": 1.0,
         "declared_net_weight_g": 35.0,
         "fill_weight_g": 34.503,
-        "overall_status": "CLEAN",
+        "overall_status": "REVIEW",
         "critical_count": 0,
-        "warning_count": 0
+        "warning_count": 0,
+        "reviews_only_from": [
+          "claims"
+        ]
       }
     },
     {
@@ -24,9 +27,12 @@
         "servings_per_container": 1.0,
         "declared_net_weight_g": 35.0,
         "fill_weight_g": 34.955,
-        "overall_status": "CLEAN",
+        "overall_status": "REVIEW",
         "critical_count": 0,
-        "warning_count": 0
+        "warning_count": 0,
+        "reviews_only_from": [
+          "claims"
+        ]
       }
     },
     {
@@ -38,9 +44,12 @@
         "servings_per_container": 1.0,
         "declared_net_weight_g": 33.0,
         "fill_weight_g": 32.988,
-        "overall_status": "CLEAN",
+        "overall_status": "REVIEW",
         "critical_count": 0,
-        "warning_count": 0
+        "warning_count": 0,
+        "reviews_only_from": [
+          "claims"
+        ]
       }
     },
     {
@@ -52,9 +61,12 @@
         "servings_per_container": 1.0,
         "declared_net_weight_g": 31.0,
         "fill_weight_g": 31.4,
-        "overall_status": "CLEAN",
+        "overall_status": "REVIEW",
         "critical_count": 0,
-        "warning_count": 0
+        "warning_count": 0,
+        "reviews_only_from": [
+          "claims"
+        ]
       }
     }
   ]

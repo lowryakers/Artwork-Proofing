@@ -64,6 +64,12 @@ CHECK_KEY = {'gtin': 'gtin', 'net_weight': 'netwt', 'spot_color': 'specs',
              'fda_falcpa': 'fda', 'approved_panel': 'panel', 'item_reference': 'item_reference',
              'front_callout': 'nfp'}
 NFP_FIELDS = ('serving_size_g', 'serving_size_cups', 'servings_per_container', 'serving_size_desc')
+
+
+def _nfp_fields(expect):
+    """The panel fields a file's crop must supply: a bottle declares no cup
+    measure, so serving_size_cups is required only where the file expects one."""
+    return tuple(f for f in NFP_FIELDS if f != 'serving_size_cups' or 'serving_size_cups' in expect)
 MASTER_URL = 'https://app.powder-ops.com/api/products/master.csv?token=e2e'
 # Sets whose separations are Lab-defined, so the spot-colour check can run.
 SPOT_COLOR_SETS = {'pancake'}
@@ -395,8 +401,8 @@ def _run():
                     and vals.get('servings_per_container') == exp['servings_per_container'],
                     needs_vision=True)
             S.check(f'{key}: every nutrition-panel field sourced from nfp_crop '
-                    f'(got {[prov.get(k) for k in NFP_FIELDS]})',
-                    all(prov.get(k) == 'nfp_crop' for k in NFP_FIELDS), needs_vision=True)
+                    f'(got {[prov.get(k) for k in _nfp_fields(exp)]})',
+                    all(prov.get(k) == 'nfp_crop' for k in _nfp_fields(exp)), needs_vision=True)
         if 'serving_size_desc' in exp:
             want_desc = exp['serving_size_desc'].split('(')[0].strip().lower()
             S.check(f'{key}: serving size description reads "{want_desc}" (got {vals.get("serving_size_desc")!r})',
@@ -413,6 +419,9 @@ def _run():
                     f'skipped {res.get("checks_skipped")})',
                     res.get('severity') == exp['overall_status'].lower() and not res.get('checks_skipped'),
                     needs_vision=True)
+        if 'reviews_only_from' in exp:
+            stray = [(k, i['message'][:60]) for k, i in _reviews(res) if k not in exp['reviews_only_from']]
+            S.check(f'{key}: review findings only from {exp["reviews_only_from"]} (stray: {stray})', not stray)
 
     # ── Score: defects ──────────────────────────────────────────────────────
     planted = caught = 0
@@ -467,16 +476,16 @@ def _run():
            'summary': pe._build_summary(clean_results), 'results': clean_results}
     wb = openpyxl.load_workbook(io.BytesIO(A._generate_report(job).getvalue()))
     S.check('workbook carries a Reader Provenance sheet', 'Reader Provenance' in wb.sheetnames)
-    with_panel = [i for i, r in enumerate(clean_results)
-                  if 'serving_size_g' in expected[next(k for k, e in expected.items()
-                                                       if os.path.basename(k) == r['filename'])]['expect']]
+    _exp_of = lambda r: expected[next(k for k in expected if os.path.basename(k) == r['filename'])]['expect']
+    with_panel = [i for i, r in enumerate(clean_results) if 'serving_size_g' in _exp_of(r)]
     if 'Reader Provenance' in wb.sheetnames and with_panel:
         ws = wb['Reader Provenance']
         hdr = {ws.cell(row=4, column=c).value: c for c in range(1, ws.max_column + 1)}
-        cells = [str(ws.cell(row=5 + i, column=hdr[f]).value) for i in with_panel for f in NFP_FIELDS if f in hdr]
+        want = [(i, f) for i in with_panel for f in _nfp_fields(_exp_of(clean_results[i]))]
+        cells = [str(ws.cell(row=5 + i, column=hdr[f]).value) for i, f in want if f in hdr]
         S.check(f'Reader Provenance sheet shows nfp_crop for every nutrition-panel field on the '
                 f'{len(with_panel)} files with verified panel values',
-                len(cells) == len(with_panel) * len(NFP_FIELDS) and all('nfp_crop' in c for c in cells),
+                len(cells) == len(want) and all('nfp_crop' in c for c in cells),
                 needs_vision=True)
 
     # ── Score line ───────────────────────────────────────────────────────────
