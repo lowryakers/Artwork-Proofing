@@ -91,9 +91,11 @@ def _run():
           pe._check_net_weight({'declared_net_weight_g': 454}, fill_weight_g=None)['status'] == 'UNVERIFIED')
     check('prep block with an empty panel -> NOT_RUN',
           pe._check_prep_block('Instructions\n1. Mix\n2. Cook', {})['status'] == 'NOT_RUN')
-    check('prep block with a serving declaration but no classifiable signal -> UNKNOWN (unchanged)',
+    check('prep block with a serving declaration but no classifiable signal -> UNCLASSIFIED '
+          '(a completed advisory read, not a skip)',
           pe._check_prep_block('Instructions\n1. Mix\n2. Cook',
-                               {'serving_size_desc': '3/4 Cup'})['status'] == 'UNKNOWN')
+                               {'serving_size_desc': '3/4 Cup'})['status'] == 'UNCLASSIFIED'
+          and 'UNCLASSIFIED' not in pe._NOT_VERIFIED_STATUSES)
     check('NOT_RUN is a not-verified status for completeness accounting',
           'NOT_RUN' in pe._NOT_VERIFIED_STATUSES)
     import readydoc as rd

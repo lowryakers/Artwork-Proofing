@@ -396,7 +396,7 @@
    plus UNVERIFIED/UNKNOWN for net weight / prep block) must never render like
    a clean pass — but a CRITICAL diff always wins the visual over "not yet
    approved," since a known-wrong panel is the stronger signal. #}
-{% set not_verified = status in ('UNVERIFIED','UNKNOWN','PANEL_MISSING','PANEL_NOT_APPROVED','PANEL_SUPERSEDED','PANEL_UNAVAILABLE') and not crits and not warns %}
+{% set not_verified = status in ('UNVERIFIED','UNKNOWN','UNCLASSIFIED','PANEL_MISSING','PANEL_NOT_APPROVED','PANEL_SUPERSEDED','PANEL_UNAVAILABLE') and not crits and not warns %}
 
 <div class="card mb-2 check-card
   {% if crits %}border-danger check-has-issues check-has-critical{% if warns %} check-has-warning{% endif %}
@@ -1039,7 +1039,7 @@ function noteRows(notes) {
 // approved-nutrition-panel gate; UNVERIFIED/UNKNOWN cover net weight / prep
 // block when their own inputs were incomplete. None of these say the artwork
 // is wrong — only that nothing has confirmed it yet.
-const NOT_VERIFIED_STATUSES = ['UNVERIFIED', 'UNKNOWN', 'PANEL_MISSING',
+const NOT_VERIFIED_STATUSES = ['UNVERIFIED', 'UNKNOWN', 'UNCLASSIFIED', 'PANEL_MISSING',
                                'PANEL_NOT_APPROVED', 'PANEL_SUPERSEDED', 'PANEL_UNAVAILABLE'];
 
 function checkCard(num, title, icon, check, uid, filename, checkKey, alwaysOpen) {
