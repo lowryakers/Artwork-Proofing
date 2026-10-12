@@ -285,6 +285,10 @@ def _fetch_sheet_rows(csv_url: str) -> list:
     return _parse_master_csv(content)
 
 
+# Spec-column values that mean "does not apply to this SKU".
+_NA_SENTINELS = frozenset({'na', 'n/a', 'n.a.', 'none', 'not applicable', '-', '—', '–'})
+
+
 def _parse_master_csv(content: str) -> list:
     """Validate and parse a master-list CSV body into unified rows. Split from
     the download so a test can stub the fetch with a local file and still run
@@ -315,18 +319,34 @@ def _parse_master_csv(content: str) -> list:
         def _get(*keys):
             for k in keys:
                 v = d.get(k, '')
-                if v and v.lower() not in ('nan', 'none'):
+                if v and v.lower() != 'nan':
                     return v
             return ''
+
+        # "NA" in a spec column is a positive statement — this check does not
+        # apply to the SKU (a shrink sleeve has no eyemark) — not a value and
+        # not a gap. Read as a value it became a colour: "spec requires NA ...
+        # change the eyemark fill to pure NA (#000000)" on every sleeve (run
+        # 142db86d). Each such field is recorded and the engine marks the
+        # check NOT_APPLICABLE. A blank is NOT a sentinel: for a required
+        # value like fill weight it means missing data.
+        not_applicable = set()
+
+        def _spec(field, *keys):
+            v = _get(*keys)
+            if v.strip().lower() in _NA_SENTINELS:
+                not_applicable.add(field)
+                return ''
+            return v
 
         flavor   = _get('flavor', 'product name', 'name', 'updated naming', 'product title')
         sku      = _get('sku', 'variant sku')
         gtin_raw = _get('gtin/barcode', 'gtin/barcode#', 'gtin / upc', 'gtin/upc',
                         'gtin', 'upc', 'barcode')
         pkg      = _get('packaging type', 'package', 'type')
-        mat      = _get('material', 'material order', 'substrate')
-        zipper   = _get('zipper')
-        print_p  = _get('print', 'print process')
+        mat      = _spec('material', 'material', 'material order', 'substrate')
+        zipper   = _spec('zipper', 'zipper')
+        print_p  = _spec('print_process', 'print', 'print process')
 
         # A spec value that is present but cannot be parsed must never vanish
         # into None — downstream that reads exactly like "not on file", and a
@@ -343,26 +363,30 @@ def _parse_master_csv(content: str) -> list:
             try:
                 return float(v_clean) if v_clean else None
             except (ValueError, TypeError):
-                if field and str(v).strip() not in ('—', '-', '–', 'n/a', 'N/A', 'tbd', 'TBD'):
+                # NA sentinels never reach here (_spec); "TBD" is not "not
+                # applicable", it is a value nobody has supplied yet.
+                if field:
                     unparseable[field] = str(v).strip()
                 return None
 
         # The live master list heads these "Trim length (mm)" / "Trim width (mm)";
         # without those spellings the trim columns were never read at all.
-        trim_length = _to_float(_get('trim length (mm)', 'trim length', 'length mm', 'trim l',
+        trim_length = _to_float(_spec('trim_length_mm', 'trim length (mm)', 'trim length', 'length mm', 'trim l',
                                      'height mm', 'trim h'), 'trim_length_mm')
-        trim_width  = _to_float(_get('trim width (mm)', 'trim width', 'width mm', 'trim w', 'w mm'),
+        trim_width  = _to_float(_spec('trim_width_mm', 'trim width (mm)', 'trim width', 'width mm', 'trim w', 'w mm'),
                                 'trim_width_mm')
-        gusset      = _to_float(_get('gusset dimension', 'gusset'), 'gusset_mm')
-        front_panel = _to_float(_get('front panel dimension', 'front panel'), 'front_panel_mm')
+        gusset      = _to_float(_spec('gusset_mm', 'gusset dimension', 'gusset'), 'gusset_mm')
+        front_panel = _to_float(_spec('front_panel_mm', 'front panel dimension', 'front panel'), 'front_panel_mm')
 
-        wind_raw    = _get('wind direction', 'wind', 'winding')
+        wind_raw    = _spec('wind_direction', 'wind direction', 'wind', 'winding')
         wind        = re.sub(r'[^\d]', '', wind_raw)[:1]
 
         # Actual fill weight per the production formula — the external truth the
         # nutrition-panel-vs-net-weight check reconciles against. Not on the
         # artwork; it belongs here in the master list next to the rest of the SKU
         # data. Absent for a SKU → that check degrades to UNVERIFIED.
+        # Not a _spec field: every food SKU has a fill weight, so "NA" here is a
+        # bad value (could not evaluate), never "does not apply".
         fill_weight = _to_float(_get('fill weight (g)', 'fill weight', 'fill weight g',
                                      'fill wt (g)', 'fill wt', 'fill_weight_g',
                                      'net fill weight', 'net fill (g)'), 'fill_weight_g')
@@ -374,11 +398,14 @@ def _parse_master_csv(content: str) -> list:
                                            'servings per container (approved)'),
                                       'approved_servings_per_container')
 
-        pms_colors  = _get('pms spot colors', 'pms colors', 'spot colors', 'pantone')
-        hex_colors  = _get('hex spot colors', 'hex colors')
-        eye_mark    = _get('eye mark color', 'eye mark', 'eyemark color', 'eyemark')
+        pms_colors  = _spec('pms_spot_colors', 'pms spot colors', 'pms colors', 'spot colors', 'pantone')
+        hex_colors  = _spec('hex_spot_colors', 'hex spot colors', 'hex colors')
+        eye_mark    = _spec('eye_mark_color', 'eye mark color', 'eye mark', 'eyemark color', 'eyemark')
+        # Blank eyemark = no eyemark requirement for this SKU (78 of 156 rows).
+        if not eye_mark:
+            not_applicable.add('eye_mark_color')
 
-        die_raw      = _get('die line required', 'die line', 'die lines').strip().lower()
+        die_raw      = _spec('die_line_required', 'die line required', 'die line', 'die lines').strip().lower()
         die_required = die_raw in ('yes', 'y', 'true', '1')
 
         # Normalize GTIN — Excel stores long integers as floats (e.g. 850012345678.0)
@@ -421,6 +448,7 @@ def _parse_master_csv(content: str) -> list:
             'eye_mark_color':    eye_mark,
             'die_line_required': die_required,
             '_unparseable':      unparseable,
+            '_not_applicable':   sorted(not_applicable),
         })
     return rows
 
@@ -1076,7 +1104,7 @@ def _generate_report(job: dict, brand_name: str = 'ProDough') -> io.BytesIO:
     else:
         ws1.append([])
     for col, hdr in enumerate(['File', 'Overall Status', 'Critical', 'Warnings', 'Notes',
-                               'Checks run', 'Checks skipped', 'Checks disabled'], 1):
+                               'Checks run', 'Checks skipped', 'Checks disabled / not applicable'], 1):
         c = ws1.cell(row=4, column=col, value=hdr)
         c.font = hdr_font
         c.fill = hdr_blue
@@ -1087,11 +1115,14 @@ def _generate_report(job: dict, brand_name: str = 'ProDough') -> io.BytesIO:
         _run = r.get('checks_run') or []
         _skipped = r.get('checks_skipped') or r.get('unverified_checks') or []
         _disabled = r.get('checks_disabled') or []
+        _na = r.get('checks_not_applicable') or []
         ws1.append([r['filename'], r.get('severity', 'error').upper(),
                     r.get('critical_count', 0), r.get('warning_count', 0), r.get('info_count', 0),
                     f'{len(_run)}: ' + ', '.join(_run) if _run else '0',
                     f'{len(_skipped)}: ' + ', '.join(_skipped) if _skipped else '0',
-                    ', '.join(_disabled) + ' (by configuration)' if _disabled else ''])
+                    '; '.join(x for x in (
+                        ', '.join(_disabled) + ' (by configuration)' if _disabled else '',
+                        ', '.join(_na) + ' (not applicable to this SKU)' if _na else '') if x)])
         sev = r.get('severity', 'error')
         f = (fill_crit if sev == 'critical' else fill_warn if sev == 'warning'
              else fill_ok if sev == 'clean' else fill_incomplete if sev == 'incomplete' else None)
@@ -1132,7 +1163,7 @@ def _generate_report(job: dict, brand_name: str = 'ProDough') -> io.BytesIO:
     wsp.row_dimensions[2].height = 45
     _FRONT_FIELDS = ('declared_net_weight_g', 'unit_count')
     _hdrs = (['File'] + [f'{k} (front panel)' if k in _FRONT_FIELDS else k for k in _PROV_FIELDS]
-             + ['Unused candidates (page regex; vision without crop)'])
+             + ['Unused candidates (page regex; vision without crop)', 'Panel crop read (why)'])
     for col, hdr in enumerate(_hdrs, 1):
         c = wsp.cell(row=4, column=col, value=hdr)
         c.font = hdr_font
@@ -1158,6 +1189,8 @@ def _generate_report(job: dict, brand_name: str = 'ProDough') -> io.BytesIO:
                 c.fill = fill_prov_absent
         pr = r.get('panel_page_regex') or {}
         vu = r.get('panel_vision_unconfirmed') or {}
+        wsp.cell(row=ridx, column=len(_PROV_FIELDS) + 3,
+                 value=' | '.join(r.get('nfp_crop_diag') or [])).alignment = wrap
         c = wsp.cell(row=ridx, column=len(_PROV_FIELDS) + 2,
                      value='; '.join(x for x in (
                          ', '.join(f'{k}={v}' for k, v in pr.items()),

@@ -66,7 +66,7 @@ def _run():
     ws = wb['Summary']
     check('Summary sheet has both Checks skipped and Checks disabled columns',
           ws.cell(row=4, column=7).value == 'Checks skipped'
-          and ws.cell(row=4, column=8).value == 'Checks disabled')
+          and ws.cell(row=4, column=8).value == 'Checks disabled / not applicable')
     check('Checks disabled names both and says why; status stays CLEAN',
           'spot_color, trim_dimension (by configuration)' == ws.cell(row=5, column=8).value
           and ws.cell(row=5, column=2).value == 'CLEAN')

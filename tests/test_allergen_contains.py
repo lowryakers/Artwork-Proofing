@@ -75,8 +75,34 @@ def _run():
           not any(re.search(r'allergen|tree nut|\bmilk\b', i['message'].lower()) for i in out['issues']))
     out = pe._check_fda(beef.replace('coconut milk powder', 'nonfat dry milk'),
                         'PD_beef_bottle_cinnamon_sugar.pdf')
-    check('...while a dairy milk on the same label still reads as milk',
-          any('"milk" (milk)' in i['message'].lower() for i in out['issues']))
+    check('...while a dairy milk on the same label still reads as milk, quoting the ingredient',
+          any('"nonfat dry milk" (milk)' in i['message'].lower() for i in out['issues']))
+    out = pe._check_fda(beef.replace('coconut milk powder', 'almond flour'), 'PD_beef_bottle_cinnamon_sugar.pdf')
+    check('an undeclared almond is flagged (product type comes from the filename, not the label)',
+          any('(tree nut)' in i['message'] for i in out['issues']))
+    out = pe._check_fda(beef + 'directions step 1 add water or milk to dotted line (7oz).\n'
+                        'made in a facility that also processes milk, egg, wheat and peanuts.\n',
+                        'PD_beef_bottle_cinnamon_sugar.pdf')
+    check('prep copy and facility advisories outside the ingredient statement match nothing',
+          not any('undeclared allergen' in i['message'].lower() for i in out['issues']))
+
+    # Ingredient statement: located, split, matched by source.
+    ings = pe._ingredient_list('Ingredients: Oat Flour, Wheat Flour, Whey Protein Isolate, Soy Lecithin, '
+                               'Cocoa Butter, Peanut Butter, Cream of Tartar. Contains: Milk, Wheat, Soy, Peanut.')
+    check('the statement ends at "Contains:"', 'milk' not in ings and ings[-1] == 'cream of tartar')
+    hits = pe._ingredient_allergens(ings)
+    check('a source named as the modifier counts (wheat flour, whey protein isolate, soy lecithin)',
+          hits.get('wheat') == 'wheat flour' and hits.get('milk') == 'whey protein isolate'
+          and hits.get('soy') == 'soy lecithin')
+    check('cocoa butter, peanut butter and cream of tartar are not milk; peanut butter is peanut',
+          hits.get('peanut') == 'peanut butter' and set(hits) == {'wheat', 'milk', 'soy', 'peanut'})
+    check('"contains less than 2% of:" stays inside the statement',
+          pe._ingredient_list('Ingredients: Beef, contains less than 2% of: Salt, Guar Gum.')
+          == ['beef', 'salt', 'guar gum'])
+    out = pe._check_fda(beef.replace('ingredients:', 'ingr3dients'), 'PD_pancake_buttermilk.pdf')
+    check('no ingredient statement located -> a note, and no "wheat not detected" CRITICAL on a pancake',
+          not any(i['severity'] == 'critical' for i in out['issues'])
+          and any('Ingredient statement not located' in n for n in out['notes']))
     check('a Contains line naming only coconut no longer satisfies a tree-nut declaration',
           pe._canonical_allergen('coconut') != 'tree nut')
 

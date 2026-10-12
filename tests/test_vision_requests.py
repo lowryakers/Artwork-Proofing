@@ -79,6 +79,16 @@ def _run():
                   bool(sent) and all(b.get('temperature') == 0 for b in sent))
             check(f'{name}: model is claude-sonnet-4-6',
                   bool(sent) and all(b.get('model') == 'claude-sonnet-4-6' for b in sent))
+        # An empty crop read says why, per step (run 142db86d: silent on one of four).
+        diag = []
+        out = pe._read_nfp_panel(tmp, [0.3, 0.3, 0.6, 0.7], diag=diag)
+        check(f'NFP crop: an empty read records why ({diag})',
+              out == {} and diag and diag[0].startswith('panel located by vision')
+              and any('B sent' in d and '0 fields read' in d for d in diag))
+        diag = []
+        pe._read_nfp_panel(tmp, None, diag=diag)
+        check('NFP crop: no panel box is recorded as "panel NOT located"',
+              diag and diag[0].startswith('panel NOT located by vision'))
     finally:
         pe.ANTHROPIC_AVAILABLE, pe.PIL_AVAILABLE, pe._anthropic = prev
 
