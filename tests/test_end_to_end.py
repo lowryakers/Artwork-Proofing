@@ -199,14 +199,21 @@ def _install_engine_stubs(pe):
     cache, locks, glock = {}, {}, threading.Lock()
 
     def _memo(fn, kind):
-        def wrapped(img_path, *args):
+        def wrapped(img_path, *args, diag=None):
+            # `diag` is an out-parameter (see _read_nfp_panel): cached with the
+            # result and replayed into the caller's list on every hit.
             key = (kind, os.path.basename(img_path).split('_', 1)[-1], repr(args))
             with glock:
                 lk = locks.setdefault(key, threading.Lock())
             with lk:
                 if key not in cache:
-                    cache[key] = fn(img_path, *args)
-                return copy.deepcopy(cache[key])
+                    d = []
+                    out = fn(img_path, *args, diag=d) if diag is not None else fn(img_path, *args)
+                    cache[key] = (out, d)
+                out, d = cache[key]
+                if diag is not None:
+                    diag.extend(d)
+                return copy.deepcopy(out)
         return wrapped
     pe._claude_vision_ocr = _memo(pe._claude_vision_ocr, 'vision')
     pe._read_nfp_panel = _memo(pe._read_nfp_panel, 'nfp_crop')
