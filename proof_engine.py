@@ -815,9 +815,6 @@ def _claude_vision_ocr(img_path: str) -> dict:
             '(or Supplement Facts) panel in the FIRST image, as fractions of width/height in '
             '[0,1] (top-left origin): x0,y0 = top-left corner, x1,y1 = bottom-right. null if no '
             'panel is visible.\n'
-            '  "front_callout_bbox": [<x0>, <y0>, <x1>, <y1>],  // bounding box, same convention, '
-            'around ALL the front call-out badges together (the circular number + caption rings), '
-            'or null if the pack has none.\n'
             '  "dshea_disclaimer": <true or false>  // true if the pack prints the FDA/DSHEA '
             'disclaimer "These statements have not been evaluated by the Food and Drug '
             'Administration. This product is not intended to diagnose, treat, cure, or prevent any '
@@ -1001,7 +998,6 @@ def _parse_vision_json(txt: str) -> dict:
             'eyemark': _clean_eyemark(_data.get('eyemark', {})),
             'panel': _clean_panel(_data.get('panel', {})),
             'nfp_bbox': _clean_bbox(_data.get('nfp_bbox')),
-            'front_callout_bbox': _clean_bbox(_data.get('front_callout_bbox')),
             'dshea_disclaimer': bool(_data.get('dshea_disclaimer')),
             '_parsed': True,
         }
@@ -1025,9 +1021,9 @@ _NFP_CROP_FIELDS = (
 )
 
 _FRONT_CROP_PROMPT = (
-    'This image is a crop of the FRONT of a food package: its call-out badges, each a big number '
-    'with a short caption printed with it (e.g. "130" with "Calories Per Serving"). Transcribe '
-    'every badge EXACTLY as printed. Return ONLY this JSON object:\n'
+    'This image is a food package artwork. Find the call-out badges on its FRONT panel: each is a '
+    'big number with a short caption printed with it (e.g. "130" with "Calories Per Serving"), '
+    'usually in circles. Transcribe every badge EXACTLY as printed, and nothing else on the pack. Return ONLY this JSON object:\n'
     '{"rings": [{"number": "<the big number exactly as printed, with any unit or % sign, e.g. '
     '\\"130\\", \\"26G\\", \\"100%\\">", "caption": "<the caption printed with that number, '
     'e.g. \\"Calories Per Serving\\", or null if you cannot read it>"}]}\n'
@@ -1066,51 +1062,43 @@ def _bind_rings(rings: list) -> dict:
     return {'values': values, 'unbound': unbound}
 
 
-def _read_front_callouts(img_path: str, bbox, nfp_bbox=None, diag: list = None) -> dict:
-    """Front call-out rings read from an isolated crop of the front badges, with
-    the Nutrition Facts panel masked out, transcribed number + caption together.
-    The full-page pass reads the rings next to the panel and can report a ring
-    as the panel's value: run 142db86d read Toffee Cream's "100 Calories" ring
-    as 130, the NFP value, and the mismatch went unreported. Returns
-    {'rings': [...], 'values': {...}, 'unbound': [...]} or {} on failure, and
-    records why in `diag`. Never raises."""
+def _read_front_callouts(img_path: str, nfp_bbox=None, diag: list = None) -> dict:
+    """Front call-out rings, transcribed number + caption together, from the
+    artwork with the Nutrition Facts panel masked out. The full-page pass reads
+    the rings next to the panel and can report a ring as the panel's value:
+    run 142db86d read Toffee Cream's "100 Calories" ring as 130, the NFP value,
+    and the mismatch went unreported.
+
+    The panel is masked by its exact white rectangle (_locate_nfp_rect), and
+    the whole artwork is read — never a vision-estimated ring box: on the
+    bottle sleeves that box landed half on the back panel, and masking with
+    vision's rough panel box erased the left ring column (CI runs 38305043657,
+    38308802272). Returns {'rings': [...], 'values': {...}, 'unbound': [...]}
+    or {} on failure, and records why in `diag`. Never raises."""
     diag = diag if diag is not None else []
     if not (ANTHROPIC_AVAILABLE and PIL_AVAILABLE):
         diag.append('not attempted: vision unavailable')
         return {}
     try:
         import base64, io
-        from PIL import ImageDraw as _Draw
+        from PIL import ImageDraw as _Draw, ImageChops as _Chops
         im = Image.open(img_path).convert('RGB')
         W, H = im.size
-        _ring_px = None
-        if bbox:
-            x0, y0, x1, y1 = bbox
-            pw, ph = (x1 - x0) * 0.25, (y1 - y0) * 0.25
-            box = (max(0, int((x0 - pw) * W)), max(0, int((y0 - ph) * H)),
-                   min(W, int((x1 + pw) * W)), min(H, int((y1 + ph) * H)))
-            _ring_px = (int(x0 * W), int(y0 * H), int(x1 * W), int(y1 * H))
-        if nfp_bbox:
-            # Mask the panel so there is nothing to reconcile a ring against —
-            # but never over the rings themselves: both boxes are approximate,
-            # and on the bottle sleeves the panel box reaches into the left
-            # ring column (CI run 38305043657: Calories and Protein masked out).
-            _keep = im.crop(_ring_px) if _ring_px else None
-            nx0, ny0, nx1, ny1 = nfp_bbox
-            _Draw.Draw(im).rectangle((int(nx0 * W), int(ny0 * H), int(nx1 * W), int(ny1 * H)), fill='white')
-            if _keep is not None:
-                im.paste(_keep, _ring_px[:2])
-        if bbox:
-            if box[2] - box[0] < 8 or box[3] - box[1] < 8:
-                diag.append(f'ring box {bbox} too small to crop')
-                return {}
-            crop = im.crop(box)
-            diag.append(f'rings located by vision {[round(v, 3) for v in bbox]}; crop {crop.width}x{crop.height}px'
-                        + ('; panel masked' if nfp_bbox else ''))
-        else:
-            crop = im
-            diag.append(f'rings NOT located by vision — reading the whole page {W}x{H}px'
-                        + ('; panel masked' if nfp_bbox else ''))
+        # Masked only where the panel's exact rectangle is found. A guessed
+        # region is worse than none: it can erase the rings themselves. The
+        # read's main guard is its prompt — badges only, transcribed — where
+        # the full-page pass asked for ring and panel values in one answer.
+        rect = _locate_nfp_rect(im, nfp_bbox)
+        if rect:
+            _Draw.Draw(im).rectangle(rect, fill='white')
+        # Drop the white page margins so the rings keep their size after the
+        # resize to the API's pixel budget.
+        content = _Chops.difference(im.convert('L'), Image.new('L', im.size, 255)).point(
+            lambda p: 255 if p > 24 else 0).getbbox()
+        crop = im.crop(content) if content else im
+        diag.append(f'artwork {crop.width}x{crop.height}px of {W}x{H}; '
+                    + (f'panel masked at {rect}' if rect else
+                       'panel NOT masked (not located)' if nfp_bbox else 'no panel box from vision'))
         _long = max(crop.width, crop.height)
         if _long < 1600:
             sc = min(3.0, 1600.0 / _long)
@@ -1326,6 +1314,33 @@ def _upright(im):
     except Exception as _e:
         print(f'[vision] orientation detection skipped: {_e}')
     return im
+
+
+def _locate_nfp_rect(im, bbox):
+    """The Nutrition Facts panel's own white rectangle in `im`, in pixels
+    (x0, y0, x1, y1), from vision's approximate box padded 15% and tightened
+    geometrically to the white-filled panel. None without a usable box. The
+    same geometry the panel crop reads from — vision's box alone is too rough
+    to mask with (CI run 38308802272)."""
+    if not bbox:
+        return None
+    W, H = im.size
+    x0, y0, x1, y1 = bbox
+    pw, ph = (x1 - x0) * 0.15, (y1 - y0) * 0.15
+    px0, py0 = max(0, int((x0 - pw) * W)), max(0, int((y0 - ph) * H))
+    px1, py1 = min(W, int((x1 + pw) * W)), min(H, int((y1 + ph) * H))
+    if px1 - px0 < 8 or py1 - py0 < 8:
+        return None
+    refined = _largest_white_region_bbox_frac(im.crop((px0, py0, px1, py1)))
+    if not refined:
+        return None
+    rx0, ry0, rx1, ry1 = refined
+    # A white region filling the padded box is not a panel found — it is white
+    # background, and masking it could erase whatever else is in the box.
+    if (rx1 - rx0) * (ry1 - ry0) > 0.75:
+        return None
+    cw, ch = px1 - px0, py1 - py0
+    return (px0 + int(rx0 * cw), py0 + int(ry0 * ch), px0 + int(rx1 * cw), py0 + int(ry1 * ch))
 
 
 def _grams_in_serving_text(text) -> float:
@@ -1856,8 +1871,7 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
         # Front call-out rings: only the isolated read (panel masked) may supply
         # them. The full-page values are kept as unconfirmed — reported, never
         # compared (run 142db86d: the full page read a 100-cal ring as 130).
-        _front_read = _read_front_callouts(img_path, _vision.get('front_callout_bbox'), vision_nfp_bbox,
-                                           diag=_front_crop_diag)
+        _front_read = _read_front_callouts(img_path, vision_nfp_bbox, diag=_front_crop_diag)
         print(f'[front-crop] {fname} ' + ('OK ' if _front_read else 'NOTHING READ ')
               + ' | '.join(_front_crop_diag) + f' | full-page front={_vision.get("front_callout", {})}')
         _full_front = dict(vision_nutrition.get('front_callout') or {})
