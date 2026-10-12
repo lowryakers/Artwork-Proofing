@@ -385,6 +385,11 @@ def _parse_master_csv(content: str) -> list:
         # nutrition-panel-vs-net-weight check reconciles against. Not on the
         # artwork; it belongs here in the master list next to the rest of the SKU
         # data. Absent for a SKU → that check degrades to UNVERIFIED.
+        # Which formula the fill weight belongs to. Compared with the approved
+        # panel's formula before the fill weight is trusted (formula provenance).
+        formula_ref     = _get('formula ref', 'formula reference', 'formula', 'formula id')
+        formula_version = _get('formula version', 'formula ver', 'formula rev')
+
         # Not a _spec field: every food SKU has a fill weight, so "NA" here is a
         # bad value (could not evaluate), never "does not apply".
         fill_weight = _to_float(_get('fill weight (g)', 'fill weight', 'fill weight g',
@@ -441,6 +446,8 @@ def _parse_master_csv(content: str) -> list:
             'gusset_mm':         gusset,
             'front_panel_mm':    front_panel,
             'fill_weight_g':     fill_weight,
+            'formula_ref':       formula_ref,
+            'formula_version':   formula_version,
             'approved_servings_per_container': approved_servings,
             'wind_direction':    wind,
             'pms_spot_colors':   pms_colors,

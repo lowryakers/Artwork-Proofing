@@ -230,7 +230,12 @@ def _approved(expect, mutate=None):
     panel = {'serving_size_g': expect['serving_size_g'],
              'servings_per_container': expect['servings_per_container']}
     panel.update(mutate or {})
-    return {'version': 1, 'status': 'approved', 'panel': panel, 'front_callouts': {}}, 'ok'
+    rec = {'version': 1, 'status': 'approved', 'panel': panel, 'front_callouts': {}}
+    # The formula the panel was approved against, where the set records it.
+    for k in ('formula_ref', 'formula_version'):
+        if expect.get(k):
+            rec[k] = expect[k]
+    return rec, 'ok'
 
 
 def _graded(res):
@@ -428,7 +433,8 @@ def _run():
                     needs_vision=True)
         if 'reviews_only_from' in exp:
             stray = [(k, i['message'][:60]) for k, i in _reviews(res) if k not in exp['reviews_only_from']]
-            S.check(f'{key}: review findings only from {exp["reviews_only_from"]} (stray: {stray})', not stray)
+            S.check(f'{key}: review findings only from {exp["reviews_only_from"]} (stray: {stray})', not stray,
+                    needs_vision=True)
 
     # ── Score: defects ──────────────────────────────────────────────────────
     planted = caught = 0
@@ -454,6 +460,22 @@ def _run():
         (_, key, res, _), = runs
         crits = _criticals(res)
         vision_dep = exp.get('check') in ('approved_panel', 'fda_falcpa', 'front_callout')
+        if 'status' in exp:
+            # A planted defect the tool must refuse to evaluate, not flag: the
+            # check reports exp['status'] with the reason in its notes, and no
+            # CRITICAL/WARNING is raised from data it could not trust.
+            planted += 1
+            ck = CHECK_KEY[exp['check']]
+            c = (res.get('checks') or {}).get(ck) or {}
+            notes = ' '.join(str(n) for n in c.get('notes', []))
+            hit = (str(c.get('status', '')).upper() == exp['status'] and exp['note_contains'] in notes
+                   and ck in (res.get('checks_skipped') or []) and res.get('severity') != 'clean'
+                   and not _graded(res))
+            caught += hit
+            S.check(f'{d["id"]}: {exp["check"]} {exp["status"]} with "{exp["note_contains"]}", '
+                    f'not CLEAN, no graded finding (got {c.get("status")}, {res.get("severity")}, '
+                    f'{notes[:90]!r}, graded {[(k, i["message"][:50]) for k, i in _graded(res)]})', hit)
+            continue
         if exp['critical_count'] == 0:
             g = _graded(res)
             negative_ok = not g

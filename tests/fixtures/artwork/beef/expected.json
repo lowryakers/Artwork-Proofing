@@ -15,7 +15,9 @@
         "warning_count": 0,
         "reviews_only_from": [
           "claims"
-        ]
+        ],
+        "formula_ref": "F-00069",
+        "formula_version": "1.2"
       }
     },
     {
@@ -32,7 +34,9 @@
         "warning_count": 0,
         "reviews_only_from": [
           "claims"
-        ]
+        ],
+        "formula_ref": "F-00065",
+        "formula_version": "1.2"
       }
     },
     {
@@ -49,7 +53,9 @@
         "warning_count": 0,
         "reviews_only_from": [
           "claims"
-        ]
+        ],
+        "formula_ref": "F-00068",
+        "formula_version": "1.0"
       }
     },
     {
@@ -66,7 +72,9 @@
         "warning_count": 0,
         "reviews_only_from": [
           "claims"
-        ]
+        ],
+        "formula_ref": "F-00064",
+        "formula_version": "1.1"
       }
     }
   ]

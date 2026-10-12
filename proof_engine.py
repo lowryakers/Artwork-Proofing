@@ -1623,6 +1623,9 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
     _gtin_lookup = barcode_gtins[0] if (barcode_gtins and len(set(barcode_gtins)) == 1) else None
     _sku_lookup = matched_spec.get('sku') if matched_spec else None
     _approved_panel, _panel_fetch_reason = _fetch_approved_panel(_gtin_lookup, _sku_lookup)
+    # Is the master fill weight for the approved formula? Withheld if not.
+    _formula_prov = _formula_provenance(matched_spec, _approved_panel) if matched_spec else None
+    _fill_for_netwt = None if (_formula_prov or {}).get('state') == 'mismatch' else _fill_weight
     _prior_panel_version = _fetch_prior_panel_version(_gtin_lookup, _sku_lookup)
 
     ocr_claude = ''
@@ -1861,7 +1864,7 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
         brand_name = brand_config.get('brand_name', '')
         checks = {
             'gtin':     _check_gtin(combined_text, fname, gtin_rows, barcode_gtins),
-            'netwt':    _check_net_weight(_panel, fill_weight_g=_fill_weight, fname=fname, serving_vision_backed=_netwt_vision_backed, prior_snapshot=_prior_snapshot),
+            'netwt':    _check_net_weight(_panel, fill_weight_g=_fill_for_netwt, fname=fname, serving_vision_backed=_netwt_vision_backed, prior_snapshot=_prior_snapshot),
             'eyemark':  _check_eyemark(img, is_film, fname, required_eyemark, vision_eyemark=vision_eyemark),
             'spelling': _check_spelling_generic(label_text, brand_name),
             'fda':      _check_fda_light(label_text, fname),
@@ -1878,7 +1881,7 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
         checks = {
             'gtin':     _check_gtin(combined_text, fname, gtin_rows, barcode_gtins),
             'panel':    _panel_check,
-            'netwt':    _check_net_weight(_panel, fill_weight_g=_fill_weight, fname=fname, serving_vision_backed=_netwt_vision_backed, prior_snapshot=_prior_snapshot),
+            'netwt':    _check_net_weight(_panel, fill_weight_g=_fill_for_netwt, fname=fname, serving_vision_backed=_netwt_vision_backed, prior_snapshot=_prior_snapshot),
             'nfp':      _check_nfp(label_text, front_text=_nfp_front_text, vision_nutrition=vision_nutrition),
             'eyemark':  _check_eyemark(img, is_film, fname, required_eyemark, vision_eyemark=vision_eyemark),
             'spelling': _check_spelling(label_text, fname),
@@ -1920,6 +1923,7 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
         _check_gtin_vs_spec_row(checks['gtin'], matched_spec)
         _apply_unparseable_spec(checks, matched_spec)
         _apply_not_applicable_spec(checks, matched_spec)
+        _apply_formula_provenance(checks.get('netwt'), _formula_prov)
 
     # Converter's item reference vs the SKU the artwork's own barcode resolves to.
     _item_ref_check = _check_item_reference(combined_text, barcode_gtins, gtin_rows)
@@ -2244,6 +2248,67 @@ def _apply_unparseable_spec(checks: dict, matched_spec: dict) -> None:
         if key == 'netwt':
             chk['status'] = 'NOT_RUN'
             chk['notes'] = [n for n in chk.get('notes', []) if not str(n).startswith('NOT VERIFIED')]
+
+
+def _norm_formula(ref, ver) -> tuple:
+    """(REF, version) normalised for comparison: case and whitespace off the
+    ref, a leading "v" off the version, "1.20" == "1.2"."""
+    r = re.sub(r'\s+', '', str(ref or '')).upper()
+    v = re.sub(r'^[vV]\s*', '', str(ver or '').strip())
+    try:
+        v = repr(float(v)) if v else ''
+    except ValueError:
+        pass
+    return r, v
+
+
+def _formula_provenance(matched_spec: dict, approved: dict) -> dict:
+    """Does the master-list fill weight belong to the formula the artwork was
+    approved against? A fill weight from a superseded formula reads like a
+    real one: the beef bottles' live export still carried pre-reformulation
+    fill weights, four false net-weight CRITICALs.
+
+      match         approved record and master row name the same formula
+      mismatch      the approved record names a formula; the master row names
+                    a different one, or none — the fill weight cannot be used
+      not_recorded  the approved record names no formula (ReadyDoc does not
+                    carry the field yet) — compared as before, and said so
+
+    Enforcement is per SKU and automatic: a SKU becomes binding as soon as its
+    approved record carries a formula ref. No flag, no flag day."""
+    approved = approved or {}
+    a_ref = approved.get('formula_ref') or (approved.get('panel') or {}).get('formula_ref')
+    a_ver = approved.get('formula_version') or (approved.get('panel') or {}).get('formula_version')
+    m_ref, m_ver = (matched_spec or {}).get('formula_ref'), (matched_spec or {}).get('formula_version')
+    _fmt = lambda r, v: (f'{r} v{re.sub(r"^[vV]", "", str(v))}' if v else str(r)) if r else 'no formula recorded'
+    if not a_ref:
+        return {'state': 'not_recorded', 'note': (
+            'Fill-weight provenance not recorded — the approved panel record names no formula, so '
+            f'the master-list fill weight ({_fmt(m_ref, m_ver)}) could not be confirmed to belong '
+            'to the approved formula. Compared as supplied.')}
+    if _norm_formula(a_ref, a_ver) == _norm_formula(m_ref, m_ver):
+        return {'state': 'match', 'note': (
+            f'Fill-weight provenance: master list and approved panel both name {_fmt(a_ref, a_ver)}.')}
+    return {'state': 'mismatch', 'note': (
+        f'Could not evaluate — reference data predates the formula: the master-list fill weight '
+        f'is recorded against {_fmt(m_ref, m_ver)}, but the artwork was approved against '
+        f'{_fmt(a_ref, a_ver)}. A fill weight from another formula proves nothing about this '
+        'label. Update the master row\'s formula and fill weight, then re-proof.')}
+
+
+def _apply_formula_provenance(netwt: dict, prov: dict) -> None:
+    """Record the provenance on the net-weight check. On a mismatch the fill
+    weight was withheld from the comparison; the check is NOT_RUN (blocks
+    CLEAN) and says why, instead of "no fill weight supplied"."""
+    if not isinstance(netwt, dict) or not prov:
+        return
+    netwt['formula_provenance'] = prov['state']
+    if prov['state'] == 'mismatch':
+        netwt['status'] = 'NOT_RUN'
+        netwt['notes'] = [prov['note']] + [n for n in netwt.get('notes', [])
+                                           if not str(n).startswith('NOT VERIFIED')]
+    else:
+        netwt.setdefault('notes', []).append(prov['note'])
 
 
 _ITEM_REF_RE = re.compile(r'cust(?:omer)?\.?\s*item\s*ref(?:erence)?\.?\s*[:#]?\s*([A-Z0-9][A-Z0-9_\-]{2,})',
