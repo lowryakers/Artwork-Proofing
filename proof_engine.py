@@ -1146,7 +1146,9 @@ _NFP_CROP_PROMPT = (
     'strip entirely; it is not the Nutrition Facts panel, even if it shares the crop. Read '
     'protein_g, and every other field, only from the bordered Nutrition/Supplement Facts '
     'table itself. Return ONLY this JSON object:\n'
-    '{"serving_size_g": <grams in the Serving size line, e.g. 98 from "3/4 Cup (98g)", or '
+    '{"serving_size_text": "<the Serving size line copied character for character as printed, '
+    'e.g. \\"3/4 Cup (98g)\\", or null>", '
+    '"serving_size_g": <grams in the Serving size line, e.g. 98 from "3/4 Cup (98g)", or '
     'null>, "serving_size_desc": "<unit portion, e.g. \\"3/4 Cup\\", \\"4 Cupcakes\\", or '
     'null>", "serving_size_cups": <cup quantity as a decimal if given in cups, else null>, '
     '"servings_per_container": <the number on the line that literally reads "servings per '
@@ -1317,6 +1319,50 @@ def _upright(im):
     return im
 
 
+def _grams_in_serving_text(text) -> float:
+    """Grams declared in a transcribed serving line: "1 bottle (37g)" -> 37.0.
+    The gram figure is the one followed by "g" (preferring a parenthesised
+    one); None when the line declares no grams."""
+    if not isinstance(text, str):
+        return None
+    t = text.replace(',', '.')
+    m = (re.search(r'\(\s*(\d+(?:\.\d+)?)\s*g\b[^)]*\)', t, re.I)
+         or re.search(r'(\d+(?:\.\d+)?)\s*g(?:rams?)?\b', t, re.I))
+    return float(m.group(1)) if m else None
+
+
+def _settle_serving_g(first: dict, reread, diag: list) -> dict:
+    """The serving size the crop read gives as a number (the model's own
+    extraction) is checked against the grams parsed from its verbatim copy of
+    the serving line. Agree -> kept. Disagree -> one independent re-read of
+    the same crop, and a value is accepted only where two readings agree;
+    otherwise serving_size_g is left unread (dependent checks say NOT RUN) and
+    the conflict is recorded. CI run 38294631493: the crop returned 370 for a
+    panel that prints "1 bottle (37g)".
+
+    `reread` is a zero-argument callable returning another read dict."""
+    num, txt = first.get('serving_size_g'), _grams_in_serving_text(first.get('serving_size_text'))
+    if txt is None or num is None or _num_or_none(num) == txt:
+        if num is None and txt is not None:
+            first = dict(first, serving_size_g=txt)
+        return first
+    second = reread() or {}
+    num2 = second.get('serving_size_g')
+    txt2 = _grams_in_serving_text(second.get('serving_size_text'))
+    readings = [_num_or_none(num), txt, _num_or_none(num2), txt2]
+    agreed = [v for v in readings if v is not None and readings.count(v) >= 2]
+    choice = agreed[0] if agreed and len(set(agreed)) == 1 else None
+    diag.append(f'serving size readings disagreed — number {num}, text "{first.get("serving_size_text")}"; '
+                f're-read number {num2}, text "{second.get("serving_size_text")}" -> '
+                + (f'{choice:g}g (two readings agree)' if choice is not None else 'left unread (no two agree)'))
+    out = dict(first)
+    if choice is None:
+        out.pop('serving_size_g', None)
+    else:
+        out['serving_size_g'] = choice
+    return out
+
+
 def _read_nfp_panel(img_path: str, bbox, diag: list = None) -> dict:
     """Durable NFP read: crop the Nutrition/Supplement Facts panel to its own image
     (using the bbox from the first vision pass) and read that rectangle in isolation.
@@ -1419,6 +1465,9 @@ def _read_nfp_panel(img_path: str, bbox, diag: list = None) -> dict:
             d = data.get('serving_size_desc')
             if isinstance(d, str) and d.strip() and d.strip().lower() not in ('null', 'none'):
                 out['serving_size_desc'] = d.strip()
+            st = data.get('serving_size_text')
+            if isinstance(st, str) and st.strip() and st.strip().lower() not in ('null', 'none'):
+                out['serving_size_text'] = st.strip()
             diag.append(f'{label}: {pim.width}x{pim.height}px {_sent}B sent; stop={_stop}, '
                         f'reply {len(_txt)} chars, {len(out)} fields read'
                         + ('' if out else ' (model returned the panel as unreadable)'))
@@ -1431,14 +1480,17 @@ def _read_nfp_panel(img_path: str, bbox, diag: list = None) -> dict:
 
         # Straight read first; only try flipped/rotated orientations if it is sparse,
         # to keep the call count down. Mirror (left-right) is the common film case.
-        best = _read_crop(crop, 'straight')
+        best, best_img = _read_crop(crop, 'straight'), crop
         if _score(best) < 3:
             for _t, _lbl in ((Image.FLIP_LEFT_RIGHT, 'mirrored'), (Image.ROTATE_180, 'rotated 180')):
-                alt = _read_crop(crop.transpose(_t), _lbl)
+                alt_img = crop.transpose(_t)
+                alt = _read_crop(alt_img, _lbl)
                 if _score(alt) > _score(best):
-                    best = alt
+                    best, best_img = alt, alt_img
                 if _score(best) >= 3:
                     break
+        best = _settle_serving_g(best, lambda: _read_crop(best_img, 're-read'), diag)
+        best.pop('serving_size_text', None)
         return best
     except Exception as _e:
         diag.append(f'error: {type(_e).__name__}: {_e}')

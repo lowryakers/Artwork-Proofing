@@ -168,6 +168,56 @@ def _run():
           pe._check_nfp('', '', {'front_callout': {'calories': 230, 'protein_g': 19},
                                  'nfp': {'calories': 230, 'protein_g': 19}})['status'] == 'OK')
 
+    # ── 3b2. Serving size: the crop's number vs its own verbatim serving line ─
+    # CI run 38294631493: the crop returned serving_size_g=370 for a panel that
+    # prints "1 bottle (37g)" (whey Chocolate Peanut Butter).
+    check('grams parsed from the transcribed serving line',
+          [pe._grams_in_serving_text(x) for x in ('1 bottle (37g)', '3/4 Cup (98g)', '2 scoops (31.5 g)', '1 bottle')]
+          == [37.0, 98.0, 31.5, None])
+    calls = []
+    agree = pe._settle_serving_g({'serving_size_g': 98, 'serving_size_text': '3/4 Cup (98g)'},
+                                 lambda: calls.append(1), [])
+    check('number and text agree -> kept, no re-read', agree['serving_size_g'] == 98 and not calls)
+    d = []
+    fixed = pe._settle_serving_g({'serving_size_g': 370, 'serving_size_text': '1 bottle (37g)'},
+                                 lambda: {'serving_size_g': 37, 'serving_size_text': '1 bottle (37g)'}, d)
+    check('370 vs "(37g)" -> one re-read; two readings agree on 37', fixed['serving_size_g'] == 37.0
+          and 'two readings agree' in d[0])
+    d = []
+    unread = pe._settle_serving_g({'serving_size_g': 370, 'serving_size_text': '1 bottle (37g)'},
+                                  lambda: {'serving_size_g': 360, 'serving_size_text': '1 bottle (36g)'}, d)
+    check('no two readings agree -> left unread (NOT RUN downstream), conflict recorded',
+          'serving_size_g' not in unread and 'no two agree' in d[0])
+    split = pe._settle_serving_g({'serving_size_g': 370, 'serving_size_text': '1 bottle (37g)'},
+                                 lambda: {'serving_size_g': 370, 'serving_size_text': '1 bottle (37g)'}, [])
+    check('a 2-2 split is not a decision -> left unread', 'serving_size_g' not in split)
+
+    # Through the real crop reader, API mocked: first reply carries the misread.
+    import types
+    from PIL import Image as _Img
+    _tmp = os.path.join(tempfile.mkdtemp(), 'p.png')
+    _Img.new('RGB', (1200, 1600), 'white').save(_tmp)
+    _full = {'servings_per_container': 1, 'calories': 130, 'protein_g': 26, 'total_carbohydrate_g': 5}
+    _replies = iter([json.dumps(dict(_full, serving_size_g=370, serving_size_text='1 bottle (37g)')),
+                     json.dumps(dict(_full, serving_size_g=37, serving_size_text='1 bottle (37g)'))])
+
+    class _R:
+        def __init__(s, t):
+            s.content, s.stop_reason = [types.SimpleNamespace(text=t)], 'end_turn'
+    _prev = (pe.ANTHROPIC_AVAILABLE, pe._anthropic)
+    os.environ.setdefault('ANTHROPIC_API_KEY', 'test')
+    pe.ANTHROPIC_AVAILABLE = True
+    pe._anthropic = types.SimpleNamespace(Anthropic=lambda api_key=None: types.SimpleNamespace(
+        messages=types.SimpleNamespace(create=lambda **k: _R(next(_replies)))))
+    try:
+        d = []
+        got = pe._read_nfp_panel(_tmp, [0.2, 0.2, 0.8, 0.8], diag=d)
+        check(f'crop reader: a 370 misread settles to 37 on re-read ({got.get("serving_size_g")})',
+              got.get('serving_size_g') == 37.0 and 'serving_size_text' not in got
+              and any('two readings agree' in x for x in d))
+    finally:
+        pe.ANTHROPIC_AVAILABLE, pe._anthropic = _prev
+
     # ── 3c. Master-list fetch retries transient failures with backoff ───────
     _orig_fetch, _orig_sleep = A._fetch_sheet_rows, A.time.sleep
     calls = []
