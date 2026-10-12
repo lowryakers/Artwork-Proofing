@@ -87,6 +87,21 @@ def _run():
         check(f'NFP crop: an empty read records why ({diag})',
               out == {} and diag and diag[0].startswith('panel located by vision')
               and any('B sent' in d and '0 fields read' in d for d in diag))
+        # The panel mask never paints over the rings: both boxes are approximate
+        # and overlap on the bottle sleeves (CI run 38305043657).
+        import base64 as _b64, io as _io
+        from PIL import ImageDraw as _D
+        ring_img = os.path.join(os.path.dirname(tmp), 'rings.png')
+        im = Image.new('RGB', (1600, 1200), 'white')
+        _D.Draw(im).ellipse((int(0.46 * 1600), int(0.30 * 1200), int(0.49 * 1600), int(0.34 * 1200)), fill='black')
+        im.save(ring_img)
+        n = len(bodies)
+        pe._read_front_callouts(ring_img, [0.45, 0.25, 0.65, 0.60], [0.20, 0.20, 0.50, 0.80])
+        sent = [c for b in bodies[n:] for m in b['messages'] for c in m['content'] if c.get('type') == 'image']
+        dark = (Image.open(_io.BytesIO(_b64.b64decode(sent[0]['source']['data']))).convert('L').getextrema()[0]
+                if sent else 255)
+        check(f'front rings: a ring inside the overlap of panel box and ring box survives the mask (min px {dark})',
+              dark < 60)
         diag = []
         pe._read_front_callouts(tmp, [0.5, 0.2, 0.9, 0.6], [0.1, 0.2, 0.4, 0.8], diag=diag)
         check(f'front rings: the read records crop, panel masking and what came back ({diag})',

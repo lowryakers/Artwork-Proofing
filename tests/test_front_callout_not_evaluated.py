@@ -100,7 +100,19 @@ def _run():
           and 'only the full-page read saw it (100 cal)' in not_eval(out, 'calorie')[0]['message'])
     out = pe._check_nfp(toffee, '', {'front_callout': {}, 'front_unconfirmed': {'calories': 130},
                                      'nfp': {'calories': 130}})
-    check('...and silent when it agrees with the NFP', not not_eval(out, 'calorie'))
+    check('...even when it agrees with the NFP (the full page is what reported 100 as 130)',
+          not crit(out) and len(not_eval(out, 'calorie')) == 1)
+    # CI run 38305043657: the crop missed the Calories ring and OCR bound a stray
+    # "269" to "Calories" -> a false CRITICAL. Where vision read the front, a
+    # text-found ring value can only mark NOT EVALUATED.
+    out = pe._check_nfp(toffee, '269\nCalories\nPer Serving',
+                        {'front_callout': {'added_sugar_g': 0}, 'front_unconfirmed': {'calories': 130},
+                         'front_read_by_vision': True, 'nfp': {'calories': 130}})
+    check('vision read the front: a text-bound "269 Calories" is not compared (no CRITICAL)',
+          not crit(out) and len(not_eval(out, 'calorie')) == 1)
+    out = pe._check_nfp(toffee, '100\nCalories\nPer Serving', {'nfp': {'calories': 130}})
+    check('...while without vision a caption-bound text ring still decides (CRITICAL)',
+          any('front call-out shows 100' in i['message'] for i in crit(out)))
     out = pe._check_nfp(toffee, '', {'front_callout': {'calories': 130}, 'front_unbound': ['120'],
                                      'nfp': {'calories': 130}})
     check('a ring with no readable caption -> NOT EVALUATED for that ring only',

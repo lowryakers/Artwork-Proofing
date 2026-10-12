@@ -1083,15 +1083,24 @@ def _read_front_callouts(img_path: str, bbox, nfp_bbox=None, diag: list = None) 
         from PIL import ImageDraw as _Draw
         im = Image.open(img_path).convert('RGB')
         W, H = im.size
-        if nfp_bbox:
-            # Mask the panel so there is nothing to reconcile a ring against.
-            x0, y0, x1, y1 = nfp_bbox
-            _Draw.Draw(im).rectangle((int(x0 * W), int(y0 * H), int(x1 * W), int(y1 * H)), fill='white')
+        _ring_px = None
         if bbox:
             x0, y0, x1, y1 = bbox
-            pw, ph = (x1 - x0) * 0.10, (y1 - y0) * 0.10
+            pw, ph = (x1 - x0) * 0.25, (y1 - y0) * 0.25
             box = (max(0, int((x0 - pw) * W)), max(0, int((y0 - ph) * H)),
                    min(W, int((x1 + pw) * W)), min(H, int((y1 + ph) * H)))
+            _ring_px = (int(x0 * W), int(y0 * H), int(x1 * W), int(y1 * H))
+        if nfp_bbox:
+            # Mask the panel so there is nothing to reconcile a ring against —
+            # but never over the rings themselves: both boxes are approximate,
+            # and on the bottle sleeves the panel box reaches into the left
+            # ring column (CI run 38305043657: Calories and Protein masked out).
+            _keep = im.crop(_ring_px) if _ring_px else None
+            nx0, ny0, nx1, ny1 = nfp_bbox
+            _Draw.Draw(im).rectangle((int(nx0 * W), int(ny0 * H), int(nx1 * W), int(ny1 * H)), fill='white')
+            if _keep is not None:
+                im.paste(_keep, _ring_px[:2])
+        if bbox:
             if box[2] - box[0] < 8 or box[3] - box[1] < 8:
                 diag.append(f'ring box {bbox} too small to crop')
                 return {}
@@ -1851,12 +1860,15 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
                                            diag=_front_crop_diag)
         print(f'[front-crop] {fname} ' + ('OK ' if _front_read else 'NOTHING READ ')
               + ' | '.join(_front_crop_diag) + f' | full-page front={_vision.get("front_callout", {})}')
-        if _front_read.get('rings'):
-            vision_nutrition['front_callout'] = dict(_front_read.get('values') or {})
-            vision_nutrition['front_unbound'] = list(_front_read.get('unbound') or [])
-        else:
-            vision_nutrition['front_unconfirmed'] = dict(vision_nutrition.get('front_callout') or {})
-            vision_nutrition['front_callout'] = {}
+        _full_front = dict(vision_nutrition.get('front_callout') or {})
+        _crop_vals = dict(_front_read.get('values') or {}) if _front_read.get('rings') else {}
+        vision_nutrition['front_callout'] = _crop_vals
+        vision_nutrition['front_unbound'] = list(_front_read.get('unbound') or [])
+        # Per field: a ring the full page saw but the crop did not read is
+        # unconfirmed (NOT EVALUATED), never silently absent.
+        vision_nutrition['front_unconfirmed'] = {k: v for k, v in _full_front.items()
+                                                 if v is not None and k not in _crop_vals}
+        vision_nutrition['front_read_by_vision'] = True
         # No Contains line from the full-page pass, and an approved record that
         # declares allergens to check it against: re-read it from a crop.
         if not (vision_allergens or {}).get('contains_statement') and _approved_allergens(_approved_panel):
@@ -2573,6 +2585,7 @@ def _check_nfp(ocr_text: str, front_text: str = '', vision_nutrition: dict = Non
     # whose caption could not be read: reported NOT EVALUATED, never compared.
     _vunconf = (vision_nutrition or {}).get('front_unconfirmed') or {}
     _vunbound = (vision_nutrition or {}).get('front_unbound') or []
+    _vision_read_front = bool((vision_nutrition or {}).get('front_read_by_vision'))
     _vnfp = (vision_nutrition or {}).get('nfp') or {}
     _vision_has_nfp = _vnfp.get('calories') is not None or _vnfp.get('protein_g') is not None
 
@@ -2686,6 +2699,13 @@ def _check_nfp(ocr_text: str, front_text: str = '', vision_nutrition: dict = Non
                     continue
                 _fc_prots_loose.add(_vi)
 
+    # Where vision read the front, a text-found ring value is evidence of
+    # nothing on its own (CI run 38305043657: OCR bound a stray "269" to
+    # "Calories" and filed a CRITICAL): it can only mark NOT EVALUATED.
+    if _vision_read_front:
+        _fc_cals_loose |= _fc_cals
+        _fc_prots_loose |= _fc_prots
+        _fc_cals, _fc_prots = set(), set()
     front_calories  = sorted(_fc_cals)
     front_proteins  = sorted(_fc_prots)
     front_zero_sugar = bool(re.search(r'\b0\s*g\s*\n?\s*added\s+sugar|\b0\s+added\s+sugar', fl))
@@ -2739,14 +2759,18 @@ def _check_nfp(ocr_text: str, front_text: str = '', vision_nutrition: dict = Non
     # comparison. When it is all there is and it doesn't simply repeat the NFP
     # value, say the comparison was not evaluated and send it to a person.
     _unconfirmed_front = {}
-    if not has_dual_column and not front_calories and _fc_cals_loose and nfp_calories and _fc_cals_loose != set(nfp_calories):
+    # (Skipped where the full-page vision value for the field is reported as
+    # unconfirmed below — one NOT EVALUATED per ring, not two.)
+    if not has_dual_column and not front_calories and _fc_cals_loose and nfp_calories and _fc_cals_loose != set(nfp_calories) \
+            and _vunconf.get('calories') is None:
         _unconfirmed_front['calories'] = sorted(_fc_cals_loose)
         issues.append({'severity': 'review', 'message': (
             f'NOT EVALUATED — front calorie call-out: the only front value read '
             f'({", ".join(str(v) for v in sorted(_fc_cals_loose))}) was a number near the word '
             f'"calories", not a call-out bound to it, so it was not compared with the NFP '
             f'({", ".join(str(v) for v in nfp_calories)} cal). Check the front call-out by eye.')})
-    if not has_dual_column and not front_proteins and _fc_prots_loose and nfp_proteins and _fc_prots_loose != set(nfp_proteins):
+    if not has_dual_column and not front_proteins and _fc_prots_loose and nfp_proteins and _fc_prots_loose != set(nfp_proteins) \
+            and _vunconf.get('protein_g') is None:
         _unconfirmed_front['protein_g'] = sorted(_fc_prots_loose)
         issues.append({'severity': 'review', 'message': (
             f'NOT EVALUATED — front protein call-out: the only front value read '
@@ -2756,8 +2780,10 @@ def _check_nfp(ocr_text: str, front_text: str = '', vision_nutrition: dict = Non
 
     for _fld, _have, _nfpv, _lbl, _u in (('calories', front_calories, nfp_calories, 'calorie', ' cal'),
                                          ('protein_g', front_proteins, nfp_proteins, 'protein', 'g')):
+        # Agreement with the NFP is not evidence here: the full-page pass is
+        # the reader that reports a ring as the panel's value (run 142db86d).
         _uv = _num_or_none(_vunconf.get(_fld))
-        if not has_dual_column and not _have and _uv is not None and _nfpv and _uv not in _nfpv:
+        if not has_dual_column and not _have and _uv is not None and _nfpv:
             _unconfirmed_front[_fld] = [_uv]
             issues.append({'severity': 'review', 'message': (
                 f'NOT EVALUATED — front {_lbl} call-out: only the full-page read saw it ({_uv:g}{_u}); '
