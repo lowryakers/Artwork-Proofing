@@ -161,12 +161,11 @@ def _run():
           pe._substrate_layers('PET / LLDPE') != pe._substrate_layers('PET / MET-PET / LLDPE'))
     check('an unreadable ply never guesses a structure', pe._substrate_layers('Soft Touch / ???') == [])
 
-    # ── Front vs NFP: comparing nothing is NOT RUN ──────────────────────────
-    check('_check_nfp with no calorie/protein read on either side -> NOT_RUN',
-          pe._check_nfp('', '', None)['status'] == 'NOT_RUN')
+    # ── NFP: reading nothing is NOT RUN ─────────────────────────────────────
+    check('_check_nfp with no calorie/protein read -> NOT_RUN',
+          pe._check_nfp('', None)['status'] == 'NOT_RUN')
     check('_check_nfp with values read -> OK',
-          pe._check_nfp('', '', {'front_callout': {'calories': 230, 'protein_g': 19},
-                                 'nfp': {'calories': 230, 'protein_g': 19}})['status'] == 'OK')
+          pe._check_nfp('', {'nfp': {'calories': 230, 'protein_g': 19}})['status'] == 'OK')
 
     # ── 3b2. Serving size: the crop's number vs its own verbatim serving line ─
     # CI run 38294631493: the crop returned serving_size_g=370 for a panel that

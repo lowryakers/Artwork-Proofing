@@ -259,7 +259,7 @@ def get_feedback_patterns() -> list:
     dismissed = Counter(e['check'] for e in entries if e.get('action') == 'dismissed')
     confirmed = Counter(e['check'] for e in entries if e.get('action') == 'confirmed')
     _labels = {
-        'gtin': 'GTIN / Barcode', 'nfp': 'NFP', 'eyemark': 'Eyemark',
+        'gtin': 'GTIN / Barcode', 'nfp': 'NFP', 'front_callout': 'Front Call-Outs', 'eyemark': 'Eyemark',
         'spelling': 'Spelling', 'fda': 'FDA Audit Risk',
         'wind': 'Wind Direction', 'specs': 'Print Specs',
     }
@@ -635,29 +635,6 @@ def _tesseract_text(pil_img, psm: int = 6) -> str:
                 pass
 
 
-def _read_front_panel(img_path: str, fraction) -> str:
-    """OCR just the FRONT panel of a flat sleeve layout.
-
-    A shrink-sleeve flat is 3 panels wide (wrap | FRONT layflat | wrap), so the
-    stick-style left-half split reads the seam, not the front. Cropping the
-    template's FRONT fraction puts the front call-outs where the front-vs-NFP
-    check expects them. Best-effort: any failure returns '' and the caller keeps
-    the existing whole-panel bundle."""
-    if not (PIL_AVAILABLE and fraction):
-        return ''
-    try:
-        im = Image.open(img_path).convert('RGB')
-        w, h = im.size
-        x0 = max(0, int(round(fraction[0] * w)))
-        x1 = min(w, int(round(fraction[1] * w)))
-        if x1 - x0 < 20:
-            return ''
-        crop = im.crop((x0, 0, x1, h))
-        return _tesseract_text(crop, psm=6)
-    except Exception:
-        return ''
-
-
 # The serving-size line, anchored on the literal phrase and requiring the gram
 # figure to sit inside the parentheses that follow the measure ("3/4 Cup (83g)",
 # "4 Cupcakes (63g)"). A lazy 50-character window used to take the first
@@ -1021,45 +998,184 @@ _NFP_CROP_FIELDS = (
 )
 
 _FRONT_CROP_PROMPT = (
-    'This image is a food package artwork. Find the call-out badges on its FRONT panel: each is a '
-    'big number with a short caption printed with it (e.g. "130" with "Calories Per Serving"), '
-    'usually in circles. Transcribe every badge EXACTLY as printed, and nothing else on the pack. Return ONLY this JSON object:\n'
-    '{"rings": [{"number": "<the big number exactly as printed, with any unit or % sign, e.g. '
-    '\\"130\\", \\"26G\\", \\"100%\\">", "caption": "<the caption printed with that number, '
-    'e.g. \\"Calories Per Serving\\", or null if you cannot read it>"}]}\n'
+    'These images are overlapping tiles of ONE food package artwork. Find the call-out badges on '
+    'its FRONT panel: each is a big number with a short caption printed with it, inside the same '
+    'ring or circle (e.g. "130" with "Calories Per Serving"). For each badge, read the number and '
+    'the caption from that same badge as one unit, and report each badge ONCE, from the tile '
+    'where it is fully visible. Return ONLY this JSON object:\n'
+    '{"rings": [{"position": "<where the badge sits among the badges, e.g. \\"top-left\\">", '
+    '"number": "<the big number exactly as printed, with any unit or % sign, e.g. \\"130\\", '
+    '\\"26G\\", \\"100%\\"; null if you cannot read it>", "caption": "<the caption printed in '
+    'that same badge, exactly as printed, e.g. \\"Calories Per Serving\\"; null if you cannot read '
+    'it>"}]}\n'
     'Transcribe only. Do NOT correct, infer or reconcile any number against anything else on the '
-    'package: a badge that prints 100 is "100" even if you believe it should be something else. '
-    'Return {"rings": []} if there are no badges.')
+    'package (including the Nutrition Facts panel): a badge that prints 100 is "100" even if you '
+    'believe it should be something else. Return {"rings": []} if there are no badges.')
 
-# Caption -> the NFP field it declares. Anything else (100% Grass-Fed, All
-# Natural) is a claim, not a nutrient call-out, and is not compared.
+# Ring caption -> the NFP field it declares. "Sugar" alone does not say added
+# or total, so it binds to nothing (NOT EVALUATED) rather than to a guess.
 _RING_FIELDS = (('calories', r'\bcal(?:orie)?s?\b'), ('protein_g', r'\bprotein\b'),
-                ('added_sugar_g', r'\badded\s+sugars?\b|\bsugars?\b'))
+                ('added_sugar_g', r'\badded\s+sugars?\b'))
+_RING_FIELD_LABEL = {'calories': 'Calories', 'protein_g': 'Protein', 'added_sugar_g': 'Added Sugars'}
+_NUTRIENT_WORDS = r'\b(?:cal(?:orie)?s?|protein|sugars?|fat|carb(?:ohydrate)?s?|fiber|sodium)\b'
 
 
-def _bind_rings(rings: list) -> dict:
-    """{'values': {field: number}, 'unbound': [number, ...]} from transcribed
-    rings. A ring binds to a field only through its own caption; a ring with
-    a number but no readable caption is unbound (NOT EVALUATED), never guessed."""
-    values, unbound = {}, []
-    for r in rings or []:
-        if not isinstance(r, dict):
+def _parse_ring(r: dict) -> dict:
+    """One transcribed badge -> a ring record: the number and caption as
+    printed, the NFP field its OWN caption binds it to, and its value.
+
+      kind 'nutrient'  caption names an NFP field; number read -> compared
+      kind 'claim'     not a nutrient call-out ("100% Grass-Fed") -> not compared
+      kind 'no_caption' / 'no_number' / 'ambiguous' -> NOT EVALUATED"""
+    num = str(r.get('number') or '').strip()
+    cap = str(r.get('caption') or '').strip()
+    if num.lower() in ('null', 'none'):
+        num = ''
+    if cap.lower() in ('null', 'none'):
+        cap = ''
+    rec = {'position': str(r.get('position') or '').strip(), 'number': num, 'caption': cap,
+           'field': None, 'value': None, 'kind': None}
+    m = re.match(r'^(<)?\s*(\d+(?:\.\d+)?)\s*(%|g|mg|cal)?\b', num, re.I)
+    if m and m.group(3) == '%':
+        rec['kind'] = 'claim'                     # "100% Grass-Fed", "50% Less Sugar"
+        return rec
+    field = next((f for f, pat in _RING_FIELDS if re.search(pat, cap, re.I)), None)
+    if not cap:
+        rec['kind'] = 'no_caption'
+    elif field is None:
+        rec['kind'] = 'ambiguous' if re.search(_NUTRIENT_WORDS, cap, re.I) else 'claim'
+    elif not m:
+        rec.update(field=field, kind='no_number')
+    else:
+        rec.update(field=field, kind='nutrient',
+                   value=('<' + m.group(2)) if m.group(1) else float(m.group(2)))
+    return rec
+
+
+def _same_amount(a, b) -> bool:
+    """Ring vs NFP amount. "<1" equals only "<1"; numbers compare as numbers."""
+    if isinstance(a, str) or isinstance(b, str):
+        return str(a).replace(' ', '') == str(b).replace(' ', '')
+    return _num_or_none(a) == _num_or_none(b)
+
+
+def _check_front_callout(front_read, full_page_front: dict, nfp_vals: dict,
+                         vision_ran: bool, diag: list = None) -> dict:
+    """Front call-out rings vs the Nutrition Facts panel, ring by ring.
+
+    Each ring is read as a unit (number + caption from the same badge) and is
+    compared only with the NFP field its own caption names — never by position
+    or by order of appearance, never against a field another ring names.
+
+      caption + number read, values differ  -> CRITICAL
+      caption + number read, values match  -> pass
+      number unreadable / caption unreadable / caption ambiguous / NFP field
+        unread                              -> NOT EVALUATED for that ring
+      no rings on the artwork               -> NOT_APPLICABLE
+      ring read did not run or failed       -> NOT_RUN
+
+    Calories is a do-not-exceed nutrient (21 CFR 101.9(g)(5)); a front call-out
+    is a declaration. Run 142db86d / eccfd9c9: Toffee Cream's "100 Calories"
+    ring against NFP 130."""
+    nfp_vals = nfp_vals or {}
+    full = {k: v for k, v in (full_page_front or {}).items() if v is not None}
+    notes, issues = [], []
+    why = ' | '.join(diag or [])
+    if not vision_ran:
+        return {'status': 'NOT_RUN', 'issues': [], 'rings': [], 'notes': [
+            'NOT RUN — the front call-out rings are read by vision, which did not run on this file.']}
+    if not front_read:
+        return {'status': 'NOT_RUN', 'issues': [], 'rings': [], 'notes': [
+            f'NOT RUN — the front ring read returned nothing ({why or "no reason recorded"}).'
+            + (f' The full-page pass saw call-outs {full}; they are not compared.' if full else '')]}
+    rings = [_parse_ring(r) for r in (front_read.get('rings') or []) if isinstance(r, dict)]
+    if not rings:
+        if full:
+            return {'status': 'NOT_RUN', 'issues': [], 'rings': [], 'notes': [
+                f'NOT RUN — the ring read found no badges, but the full-page pass saw call-outs {full}. '
+                'Not compared; check the front call-outs by eye.']}
+        return {'status': 'NOT_APPLICABLE', 'issues': [], 'rings': [], 'notes': [
+            'Not applicable — no front call-out rings on this artwork.']}
+
+    # The same field read twice with different numbers is a conflict, not a choice.
+    by_field = {}
+    for rec in rings:
+        if rec['kind'] == 'nutrient':
+            by_field.setdefault(rec['field'], set()).add(str(rec['value']))
+    unevaluated = 0
+    for rec in rings:
+        label = f'"{rec["number"] or "?"}" / "{rec["caption"] or "?"}"'
+        f = rec['field']
+        if rec['kind'] == 'claim':
+            rec['verdict'] = 'not compared (claim)'
             continue
-        num = str(r.get('number') or '').strip()
-        cap = str(r.get('caption') or '').strip().lower()
-        m = re.match(r'^<?\s*(\d+(?:\.\d+)?)\s*(%|g|mg|cal)?\b', num, re.I)
-        if not m:
+        if rec['kind'] in ('no_caption', 'no_number', 'ambiguous'):
+            reason = {'no_caption': 'its caption could not be read',
+                      'no_number': 'its number could not be read',
+                      'ambiguous': 'its caption does not name one Nutrition Facts field'}[rec['kind']]
+            rec['verdict'] = 'NOT EVALUATED'
+            unevaluated += 1
+            issues.append({'severity': 'review', 'message': (
+                f'NOT EVALUATED — front ring {label}: {reason}, so it was not compared with the '
+                'Nutrition Facts panel. Check this ring by eye.')})
             continue
-        if not cap or cap in ('null', 'none'):
-            unbound.append(num)
+        if len(by_field.get(f, ())) > 1:
+            rec['verdict'] = 'NOT EVALUATED'
+            unevaluated += 1
+            issues.append({'severity': 'review', 'message': (
+                f'NOT EVALUATED — front ring {label}: the ring read returned more than one number for '
+                f'{_RING_FIELD_LABEL[f]} ({", ".join(sorted(by_field[f]))}). Check the ring by eye.')})
             continue
-        if m.group(2) == '%':
-            continue                      # "100% Grass-Fed" is a claim
-        for field, pat in _RING_FIELDS:
-            if re.search(pat, cap):
-                values.setdefault(field, float(m.group(1)))
-                break
-    return {'values': values, 'unbound': unbound}
+        nv = nfp_vals.get(f)
+        rec['nfp_value'] = nv
+        if nv is None:
+            rec['verdict'] = 'NOT EVALUATED'
+            unevaluated += 1
+            issues.append({'severity': 'review', 'message': (
+                f'NOT EVALUATED — front ring {label}: the Nutrition Facts {_RING_FIELD_LABEL[f]} value '
+                'was not read, so there is nothing to compare it with.')})
+            continue
+        if _same_amount(rec['value'], nv):
+            rec['verdict'] = 'match'
+            continue
+        rec['verdict'] = 'MISMATCH'
+        _rv = rec['value'] if isinstance(rec['value'], str) else f'{rec["value"]:g}'
+        _nv = nv if isinstance(nv, str) else f'{_num_or_none(nv):g}'
+        if f == 'calories':
+            msg = (f'Front call-out calories do not match the Nutrition Facts panel: the "{rec["caption"]}" '
+                   f'ring reads {_rv}, the panel declares {_nv} calories. A front call-out is a '
+                   'declaration, and calories are a do-not-exceed nutrient (21 CFR 101.9(g)(5)). '
+                   'Correct the ring or the panel before print.')
+        elif f == 'protein_g':
+            msg = (f'Front call-out protein does not match the Nutrition Facts panel: the "{rec["caption"]}" '
+                   f'ring reads {_rv}g, the panel declares {_nv}g protein. Correct the ring or the '
+                   'panel before print.')
+        else:
+            msg = (f'Front call-out added sugars do not match the Nutrition Facts panel: the '
+                   f'"{rec["caption"]}" ring reads {_rv}g, the panel declares {_nv}g Added Sugars. FDA '
+                   'permits rounding to 0g only below 0.5g, so a panel printing a non-zero or "<1g" value '
+                   'contradicts a 0g claim.')
+        issues.append({'severity': 'critical', 'message': msg})
+
+    # A nutrient call-out the full page saw and the ring read did not.
+    seen = {rec['field'] for rec in rings if rec['field']}
+    for f, v in full.items():
+        if f in _RING_FIELD_LABEL and f not in seen:
+            unevaluated += 1
+            rings.append({'position': '', 'number': f'{v}', 'caption': '', 'field': f, 'value': None,
+                          'kind': 'unconfirmed', 'verdict': 'NOT EVALUATED', 'reader': 'vision_struct'})
+            issues.append({'severity': 'review', 'message': (
+                f'NOT EVALUATED — front {_RING_FIELD_LABEL[f]} call-out: only the full-page pass saw it '
+                f'({v}); the ring read did not, so it was not compared. Check it by eye.')})
+    for rec in rings:
+        rec.setdefault('reader', 'front_ring_read')
+    notes.append(f'{len(rings)} front ring(s) read; '
+                 + '; '.join(f'{r["number"] or "?"} / {r["caption"] or "?"} -> '
+                             f'{_RING_FIELD_LABEL.get(r["field"], "not compared")}: {r["verdict"]}'
+                             for r in rings))
+    mismatched = any(r.get('verdict') == 'MISMATCH' for r in rings)
+    return {'status': 'UNVERIFIED' if unevaluated else 'FAIL' if mismatched else 'OK',
+            'issues': issues, 'notes': notes, 'rings': rings}
 
 
 def _read_front_callouts(img_path: str, nfp_bbox=None, diag: list = None) -> dict:
@@ -1073,8 +1189,9 @@ def _read_front_callouts(img_path: str, nfp_bbox=None, diag: list = None) -> dic
     the whole artwork is read — never a vision-estimated ring box: on the
     bottle sleeves that box landed half on the back panel, and masking with
     vision's rough panel box erased the left ring column (CI runs 38305043657,
-    38308802272). Returns {'rings': [...], 'values': {...}, 'unbound': [...]}
-    or {} on failure, and records why in `diag`. Never raises."""
+    38308802272). Returns {'rings': [<badge as transcribed>, ...]} (exact
+    duplicates from overlapping tiles removed) or {} on failure, and records
+    why in `diag`. Never raises. _check_front_callout binds and compares."""
     diag = diag if diag is not None else []
     if not (ANTHROPIC_AVAILABLE and PIL_AVAILABLE):
         diag.append('not attempted: vision unavailable')
@@ -1099,35 +1216,51 @@ def _read_front_callouts(img_path: str, nfp_bbox=None, diag: list = None) -> dic
         diag.append(f'artwork {crop.width}x{crop.height}px of {W}x{H}; '
                     + (f'panel masked at {rect}' if rect else
                        'panel NOT masked (not located)' if nfp_bbox else 'no panel box from vision'))
-        _long = max(crop.width, crop.height)
-        if _long < 1600:
-            sc = min(3.0, 1600.0 / _long)
-            crop = crop.resize((int(crop.width * sc), int(crop.height * sc)))
+        # 2x2 overlapping tiles: one image of a 14,000 px pouch, shrunk to the
+        # API's pixel budget, left ring captions a few pixels tall (CI run
+        # 38312701844: "0G / Sugar", "100% / Gluten Free Flour").
         _cap = 1_140_000
-        if crop.width * crop.height > _cap:
-            sc = (_cap / float(crop.width * crop.height)) ** 0.5
-            crop = crop.resize((max(1, int(crop.width * sc)), max(1, int(crop.height * sc))))
-        _b = io.BytesIO()
-        crop.save(_b, format='JPEG', quality=95)
+        tiles, ov = [], 0.15
+        cw, ch = crop.size
+        for ty in (0, 1):
+            for tx in (0, 1):
+                x0 = max(0, int((tx * 0.5 - ov / 2) * cw)); x1 = min(cw, int(((tx + 1) * 0.5 + ov / 2) * cw))
+                y0 = max(0, int((ty * 0.5 - ov / 2) * ch)); y1 = min(ch, int(((ty + 1) * 0.5 + ov / 2) * ch))
+                t = crop.crop((x0, y0, x1, y1))
+                if t.width * t.height > _cap:
+                    sc = (_cap / float(t.width * t.height)) ** 0.5
+                    t = t.resize((max(1, int(t.width * sc)), max(1, int(t.height * sc))))
+                _tb = io.BytesIO()
+                t.save(_tb, format='JPEG', quality=92)
+                tiles.append(_tb.getvalue())
         _client = _anthropic.Anthropic(api_key=os.environ['ANTHROPIC_API_KEY'])
         _msg = _client.messages.create(
-            model='claude-sonnet-4-6', max_tokens=600, extra_body={'temperature': 0},
+            model='claude-sonnet-4-6', max_tokens=800, extra_body={'temperature': 0},
             messages=[{'role': 'user', 'content': [
                 {'type': 'image', 'source': {'type': 'base64', 'media_type': 'image/jpeg',
-                                             'data': base64.standard_b64encode(_b.getvalue()).decode('utf-8')}},
-                {'type': 'text', 'text': _FRONT_CROP_PROMPT}]}])
+                                             'data': base64.standard_b64encode(tb).decode('utf-8')}}
+                for tb in tiles] + [{'type': 'text', 'text': _FRONT_CROP_PROMPT}]}])
+        _sent = sum(len(tb) for tb in tiles)
         _stop = getattr(_msg, 'stop_reason', None)
         _txt = next((blk.text for blk in (_msg.content or []) if getattr(blk, 'text', None)), '')
         _start = _txt.find('{')
         if _stop == 'max_tokens' or _start < 0:
-            diag.append(f'{len(_b.getvalue())}B sent; stop={_stop}, reply {len(_txt)} chars, no usable JSON')
+            diag.append(f'{len(tiles)} tiles {_sent}B sent; stop={_stop}, reply {len(_txt)} chars, no usable JSON')
             return {}
         data, _ = json.JSONDecoder().raw_decode(_txt[_start:])
-        rings = [r for r in (data.get('rings') or []) if isinstance(r, dict)]
-        bound = _bind_rings(rings)
-        diag.append(f'{len(_b.getvalue())}B sent; stop={_stop}; {len(rings)} rings: '
-                    + ', '.join(f'{r.get("number")} / {r.get("caption")}' for r in rings))
-        return dict(bound, rings=rings)
+        rings, seen = [], set()
+        for r in (data.get('rings') or []):
+            if not isinstance(r, dict):
+                continue
+            key = (str(r.get('number')).strip().lower(), str(r.get('caption')).strip().lower())
+            if key in seen:                  # the same badge reported from two tiles
+                continue
+            seen.add(key)
+            rings.append(r)
+        diag.append(f'{len(tiles)} tiles {_sent}B sent; stop={_stop}; {len(rings)} rings: '
+                    + ', '.join(f'{r.get("position") or "?"}: {r.get("number")} / {r.get("caption")}'
+                                for r in rings))
+        return {'rings': rings}
     except Exception as _e:
         diag.append(f'error: {type(_e).__name__}: {_e}')
         print(f'[vision] front-callout crop read failed: {_e}')
@@ -1831,6 +1964,7 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
     nfp_read = {}
     _nfp_crop_diag = []
     _front_crop_diag = []
+    _front_read, _full_front = None, {}
     _vision_diag = ''
     # Gate Claude Vision on whether the nutrition content actually came through —
     # not raw word count. Outlined-text PDFs yield garbage; reverse/mirror-printed
@@ -1875,14 +2009,11 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
         print(f'[front-crop] {fname} ' + ('OK ' if _front_read else 'NOTHING READ ')
               + ' | '.join(_front_crop_diag) + f' | full-page front={_vision.get("front_callout", {})}')
         _full_front = dict(vision_nutrition.get('front_callout') or {})
-        _crop_vals = dict(_front_read.get('values') or {}) if _front_read.get('rings') else {}
-        vision_nutrition['front_callout'] = _crop_vals
-        vision_nutrition['front_unbound'] = list(_front_read.get('unbound') or [])
-        # Per field: a ring the full page saw but the crop did not read is
-        # unconfirmed (NOT EVALUATED), never silently absent.
-        vision_nutrition['front_unconfirmed'] = {k: v for k, v in _full_front.items()
-                                                 if v is not None and k not in _crop_vals}
-        vision_nutrition['front_read_by_vision'] = True
+        # Downstream consumers (approved-panel diff, snapshot) see only values a
+        # ring read bound through its own caption.
+        vision_nutrition['front_callout'] = {
+            r['field']: r['value'] for r in map(_parse_ring, _front_read.get('rings') or [])
+            if r['kind'] == 'nutrient'}
         # No Contains line from the full-page pass, and an approved record that
         # declares allergens to check it against: re-read it from a crop.
         if not (vision_allergens or {}).get('contains_statement') and _approved_allergens(_approved_panel):
@@ -2058,16 +2189,6 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
     # -BTL- token, sleeve keywords, a matching spec row, or a format=Bottle picker.
     _die_template = _select_die_template(fname, combined_text, matched_spec, brand_config)
 
-    # Panel-aware front read: a sleeve flat is wrap|FRONT|wrap, so the stick-style
-    # left-half is the seam, not the front. With a die locked, OCR its FRONT panel
-    # and fold it into the front-vs-NFP text — additive, so it never loses signal.
-    _front_panel_text = ''
-    if _die_template and DIE_TEMPLATES_AVAILABLE:
-        _front_panel_text = _read_front_panel(
-            img_path, _die_templates.front_panel_fraction(_die_template))
-    _nfp_front_text = '\n'.join(t for t in
-                                (_front_panel_text, ocr_left, ocr_inv_left, ocr_inv_right) if t)
-
     if brand_mode == 'generic':
         is_film = brand_config.get('packaging_type', 'other') == 'stick'
         brand_name = brand_config.get('brand_name', '')
@@ -2091,7 +2212,7 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
             'gtin':     _check_gtin(combined_text, fname, gtin_rows, barcode_gtins),
             'panel':    _panel_check,
             'netwt':    _check_net_weight(_panel, fill_weight_g=_fill_for_netwt, fname=fname, serving_vision_backed=_netwt_vision_backed, prior_snapshot=_prior_snapshot),
-            'nfp':      _check_nfp(label_text, front_text=_nfp_front_text, vision_nutrition=vision_nutrition),
+            'nfp':      _check_nfp(label_text, vision_nutrition=vision_nutrition),
             'eyemark':  _check_eyemark(img, is_film, fname, required_eyemark, vision_eyemark=vision_eyemark),
             'spelling': _check_spelling(label_text, fname),
             'fda':      _check_fda(label_text, fname, vision_allergens=vision_allergens),
@@ -2104,6 +2225,19 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
             checks['specs'] = _check_print_specs(pdf_path, brand_config, matched_spec, template=_die_template, img_path=img_path)
             if effective_wind:
                 checks['wind'] = _check_wind_direction(combined_text, effective_wind)
+
+    # Front call-out rings vs the NFP — its own check, on every file, so the
+    # report always says whether it ran (run eccfd9c9 could not tell).
+    checks['front_callout'] = _check_front_callout(
+        _front_read, _full_front, (vision_nutrition or {}).get('nfp'),
+        vision_ran=_front_read is not None, diag=_front_crop_diag)
+    for _r in checks['front_callout'].get('rings', []):
+        print(f'[front-callout] {fname} ring {_r.get("position") or "?"}: "{_r.get("number")}" bound to '
+              f'"{_r.get("caption")}" -> {_r.get("field") or "not compared"}; NFP {_r.get("nfp_value")} '
+              f'-> {_r.get("verdict")}')
+    if not checks['front_callout'].get('rings'):
+        print(f'[front-callout] {fname} {checks["front_callout"]["status"]}: '
+              + ' '.join(checks['front_callout'].get('notes', [])))
 
     # Front-callout traceability (net carbs, Check D), superseded-NFP (Fix 7a),
     # and whole-label protein claims (Check I) attach to the front-vs-NFP check
@@ -2240,6 +2374,9 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
         # Why the isolated panel-crop read returned what it did (see _read_nfp_panel).
         'nfp_crop_diag': _nfp_crop_diag,
         'front_crop_diag': _front_crop_diag,
+        # Every front ring as read: number, the caption it was bound to, the NFP
+        # field and value it was compared with, the verdict, and the reader.
+        'front_rings': (checks.get('front_callout') or {}).get('rings', []),
         'panel_page_regex': dict(_panel.get('_page_regex') or {}),
         # Full-page vision serving reads set aside because the panel crop did
         # not confirm them — likewise deliberately NOT used.
@@ -2574,12 +2711,13 @@ def _check_item_reference(text: str, barcode_gtins: list, gtin_rows: list):
 
 # ── Check 2: Front call-outs vs NFP ──────────────────────────────────────────
 
-def _check_nfp(ocr_text: str, front_text: str = '', vision_nutrition: dict = None) -> dict:
+def _check_nfp(ocr_text: str, vision_nutrition: dict = None) -> dict:
+    """The Nutrition Facts panel: present, and its calorie / protein / added
+    sugar values as read (isolated crop > full-page vision > page regex). The
+    front call-out rings are compared with these in their own check,
+    _check_front_callout."""
     issues, notes = [], []
     tl = ocr_text.lower()
-    # For front callout badge detection, use left-half OCR if provided (more
-    # accurate than full combined text which mixes front + back panel).
-    fl = front_text.lower() if front_text.strip() else tl
 
     # Use multi-signal detection — outlined-text PDFs often OCR row labels/numbers
     # even when the "Nutrition Facts" header text doesn't render. Avoid false flags
@@ -2594,12 +2732,6 @@ def _check_nfp(ocr_text: str, front_text: str = '', vision_nutrition: dict = Non
 
     # Claude Vision structured read (set when Tesseract couldn't parse outlined /
     # reverse-printed art). Normalize up-front so it feeds NFP-presence detection.
-    _vfc = (vision_nutrition or {}).get('front_callout') or {}
-    # Full-page ring values the isolated front read did not confirm, and rings
-    # whose caption could not be read: reported NOT EVALUATED, never compared.
-    _vunconf = (vision_nutrition or {}).get('front_unconfirmed') or {}
-    _vunbound = (vision_nutrition or {}).get('front_unbound') or []
-    _vision_read_front = bool((vision_nutrition or {}).get('front_read_by_vision'))
     _vnfp = (vision_nutrition or {}).get('nfp') or {}
     _vision_has_nfp = _vnfp.get('calories') is not None or _vnfp.get('protein_g') is not None
 
@@ -2631,270 +2763,20 @@ def _check_nfp(ocr_text: str, front_text: str = '', vision_nutrition: dict = Non
     nfp_proteins  = sorted({int(p) for p in nfp_prot_hits if 0 < int(p) < 120})
     nfp_zero_sugar = bool(re.search(r'added\s+sugars?\s+0\s*g|added\s+sugars?\s*\n?\s*0', tl))
 
-    # Front callout format — circular badge callouts show the number on one line
-    # and the label on the next, so we need multi-strategy detection.
-    _fc_cals, _fc_prots = set(), set()
-    _fc_cals_loose, _fc_prots_loose = set(), set()
-
-    # Strategy 1: inline "117 cal/calories" or "25g protein" on same line
-    # Run on fl (left-half / front-panel text) for accuracy
-    # Same line only ([ \t], not \s): a number and caption on separate lines
-    # is a badge, and Strategy 2 decides whether the caption is its own.
-    for _v in re.findall(r'\b(\d{2,3})[ \t]*cal(?:ories?)?\b(?!\s*\d)', fl):
-        if 30 <= int(_v) <= 800: _fc_cals.add(int(_v))
-    for _v in re.findall(r'\b(\d+)\s*g\s+protein\b', fl):
-        if 0 < int(_v) < 120: _fc_prots.add(int(_v))
-
-    # Strategy 2: multi-line badge format — standalone number on its own line
-    # followed within 6 lines by the keyword ("117\nCalories\nPer Serving")
-    _lines = fl.split('\n')
-    for _i, _line in enumerate(_lines):
-        _s = _line.strip()
-        _ctx_fwd = ' '.join(l.strip() for l in _lines[_i + 1: _i + 7])
-        # Standalone number (e.g. "117") — but skip "100" if next lines show "%"
-        # (catches "100% Grass-Fed Whey" badges being misread as 100 calories)
-        _m = re.match(r'^(\d{2,3})$', _s)
-        if _m:
-            _v = int(_m.group(1))
-            _next_few = ' '.join(l.strip() for l in _lines[_i + 1: _i + 3])
-            _is_pct = '%' in _next_few or 'percent' in _next_few.lower()
-            if not _is_pct and 30 <= _v <= 800 and re.search(r'\bcal(?:ories?)?\b', _ctx_fwd):
-                # Side-by-side rings interleave in OCR: on the beef bottles the
-                # "100%" ring loses its superscript % and reads "100 / Calories
-                # Per / Grass-F", taking the neighbouring ring's caption. A number
-                # whose caption lines also carry another ring's caption is not
-                # bound to calories — keep it loose (NOT EVALUATED at most).
-                _caption = ' '.join([l.strip() for l in _lines[_i + 1: _i + 8] if l.strip()][:3]).lower()
-                if re.search(r'grass|\bfed\b|%|protein|sugar', _caption):
-                    _fc_cals_loose.add(_v)
-                else:
-                    _fc_cals.add(_v)
-        # Standalone "NNg" or "NN" followed by "g" on next line (e.g. "25g" or "25G")
-        _mg = re.match(r'^(\d+)g$', _s)
-        if _mg:
-            _v = int(_mg.group(1))
-            if 0 < _v < 120 and re.search(r'\bprotein\b', _ctx_fwd):
-                _fc_prots.add(_v)
-        # "25" on one line, "g" or "grams" on next — OCR sometimes splits the unit
-        _mn = re.match(r'^(\d{1,2})$', _s)
-        if _mn:
-            _v = int(_mn.group(1))
-            _next = _lines[_i + 1].strip().lower() if _i + 1 < len(_lines) else ''
-            if _next in ('g', 'grams') and 0 < _v < 120:
-                if re.search(r'\bprotein\b', _ctx_fwd):
-                    _fc_prots.add(_v)
-
-    # Strategy 3: reverse window — "calories" keyword with a number in the 120
-    # chars BEFORE it; protein keyword with number in 60 chars before it.
-    # This window is not bound to the keyword: on the whey bottles it took the
-    # dieline's "95.00 mm Layflat" as a 95-calorie call-out and filed a false
-    # CRITICAL on 22 of 30 correct labels. Its values are kept apart and can
-    # only mark the comparison NOT EVALUATED, never decide it.
-    for _km in re.finditer(r'\bcal(?:ories?)?\b', fl):
-        _before = fl[max(0, _km.start() - 120): _km.start()]
-        for _vm in re.finditer(r'\b(\d{2,3})\b', _before):
-            _vi = int(_vm.group(1))
-            if 30 <= _vi <= 800:
-                # Skip if this number is immediately followed by "%" (percentage claim)
-                _trail = _before[_vm.end(): _vm.end() + 4].lstrip()
-                if _trail.startswith('%'):
-                    continue
-                _fc_cals_loose.add(_vi)
-    for _km in re.finditer(r'\bprotein\b', fl):
-        _before = fl[max(0, _km.start() - 60): _km.start()]
-        for _vm in re.finditer(r'\b(\d{1,2})\b', _before):
-            _vi = int(_vm.group(1))
-            if 5 < _vi < 120:
-                # Skip percentages (e.g. "50%", "%DV") — same guard the calorie
-                # window uses. Without it a stray %DV digit becomes a phantom
-                # front-panel protein value and fires a false mismatch.
-                _trail = _before[_vm.end(): _vm.end() + 4].lstrip()
-                if _trail.startswith('%'):
-                    continue
-                _fc_prots_loose.add(_vi)
-
-    # Where vision read the front, a text-found ring value is evidence of
-    # nothing on its own (CI run 38305043657: OCR bound a stray "269" to
-    # "Calories" and filed a CRITICAL): it can only mark NOT EVALUATED.
-    if _vision_read_front:
-        _fc_cals_loose |= _fc_cals
-        _fc_prots_loose |= _fc_prots
-        _fc_cals, _fc_prots = set(), set()
-    front_calories  = sorted(_fc_cals)
-    front_proteins  = sorted(_fc_prots)
-    front_zero_sugar = bool(re.search(r'\b0\s*g\s*\n?\s*added\s+sugar|\b0\s+added\s+sugar', fl))
-
-    # When Claude Vision read this file (outlined / reverse-printed art that
-    # Tesseract can't parse), its structured per-panel values are authoritative —
-    # they cleanly separate the front callout from the NFP, which regex on a mixed
-    # text blob cannot. Override the Tesseract-derived values with them.
-    if _vfc.get('calories') is not None:
-        front_calories = [_num_or_none(_vfc['calories'])]
-    if _vfc.get('protein_g') is not None:
-        front_proteins = [_num_or_none(_vfc['protein_g'])]
-    if _vfc.get('added_sugar_g') is not None:
-        _as_front = _vfc['added_sugar_g']
-        # "<1g" is NOT zero — FDA permits declaring 0g only below 0.5g, so a
-        # panel that prints "<1g" is stating the value is at or above that.
-        # Treat it as non-zero so a front "0G Added Sugar" claim is still
-        # tested against it, instead of silently agreeing with it.
-        front_zero_sugar = (_num_or_none(_as_front) == 0 and not _is_below(_as_front))
-    if _vnfp.get('calories') is not None:
-        nfp_calories = [_num_or_none(_vnfp['calories'])]
+    _vnfp_cal = _vnfp.get('calories')
+    if _vnfp_cal is not None:
+        nfp_calories = [_num_or_none(_vnfp_cal)]
     if _vnfp.get('protein_g') is not None:
         nfp_proteins = [_num_or_none(_vnfp['protein_g'])]
     if _vnfp.get('added_sugar_g') is not None:
         _as_nfp = _vnfp['added_sugar_g']
         nfp_zero_sugar = (_num_or_none(_as_nfp) == 0 and not _is_below(_as_nfp))
 
-    # Combined lists — used by the mismatch checks below
-    calories = sorted(set(nfp_calories) | set(front_calories))
-    proteins = sorted(set(nfp_proteins) | set(front_proteins))
-
-    nw_hits = re.findall(r'net\s*wt\.?\s*([\d.]+)\s*g', tl)
-
-    # Dual-column NFPs ("Amount per serving" + "As Prepared") legitimately show
-    # two different calorie/protein values — don't flag those as a mismatch.
-    # Only a genuine prepared-column NFP qualifies; plain "Directions: mix with
-    # water" text does NOT (it was over-suppressing real front-vs-NFP mismatches).
-    # And when Claude Vision supplied canonical values for BOTH panels, the
-    # dual-column ambiguity is resolved (it reports one value per panel), so the
-    # suppression can be turned off. If vision only read one panel, keep the
-    # "as prepared" suppression — otherwise a one-sided vision value compared
-    # against a legitimately dual-valued Tesseract NFP fires a false mismatch.
-    _vision_both_panels = bool(_vfc) and bool(_vnfp)
-    has_dual_column = (not _vision_both_panels) and bool(re.search(
-        r'as\s+prepared|when\s+prepared|as\s+packaged|prepared\s+product|'
-        r'per\s+serving\s+prepared',
-        tl
-    ))
-
-    # A front value found only by the loose window cannot decide the front-vs-NFP
-    # comparison. When it is all there is and it doesn't simply repeat the NFP
-    # value, say the comparison was not evaluated and send it to a person.
-    _unconfirmed_front = {}
-    # (Skipped where the full-page vision value for the field is reported as
-    # unconfirmed below — one NOT EVALUATED per ring, not two.)
-    if not has_dual_column and not front_calories and _fc_cals_loose and nfp_calories and _fc_cals_loose != set(nfp_calories) \
-            and _vunconf.get('calories') is None:
-        _unconfirmed_front['calories'] = sorted(_fc_cals_loose)
-        issues.append({'severity': 'review', 'message': (
-            f'NOT EVALUATED — front calorie call-out: the only front value read '
-            f'({", ".join(str(v) for v in sorted(_fc_cals_loose))}) was a number near the word '
-            f'"calories", not a call-out bound to it, so it was not compared with the NFP '
-            f'({", ".join(str(v) for v in nfp_calories)} cal). Check the front call-out by eye.')})
-    if not has_dual_column and not front_proteins and _fc_prots_loose and nfp_proteins and _fc_prots_loose != set(nfp_proteins) \
-            and _vunconf.get('protein_g') is None:
-        _unconfirmed_front['protein_g'] = sorted(_fc_prots_loose)
-        issues.append({'severity': 'review', 'message': (
-            f'NOT EVALUATED — front protein call-out: the only front value read '
-            f'({", ".join(str(v) for v in sorted(_fc_prots_loose))}g) was a number near the word '
-            f'"protein", not a call-out bound to it, so it was not compared with the NFP '
-            f'({", ".join(str(v) for v in nfp_proteins)}g). Check the front call-out by eye.')})
-
-    for _fld, _have, _nfpv, _lbl, _u in (('calories', front_calories, nfp_calories, 'calorie', ' cal'),
-                                         ('protein_g', front_proteins, nfp_proteins, 'protein', 'g')):
-        # Agreement with the NFP is not evidence here: the full-page pass is
-        # the reader that reports a ring as the panel's value (run 142db86d).
-        _uv = _num_or_none(_vunconf.get(_fld))
-        if not has_dual_column and not _have and _uv is not None and _nfpv:
-            _unconfirmed_front[_fld] = [_uv]
-            issues.append({'severity': 'review', 'message': (
-                f'NOT EVALUATED — front {_lbl} call-out: only the full-page read saw it ({_uv:g}{_u}); '
-                f'the isolated read of the front rings did not confirm it, so it was not compared with '
-                f'the NFP ({", ".join(f"{v:g}" for v in _nfpv)}{_u}). Check the front call-out by eye.')})
-    if _vunbound and not has_dual_column:
-        issues.append({'severity': 'review', 'message': (
-            f'NOT EVALUATED — front ring(s) {", ".join(_vunbound)}: the caption printed with the '
-            'number could not be read, so the ring was not compared with any NFP field. Check it by eye.')})
-
-    # Calorie mismatch — prefer a direct front-callout vs NFP comparison (most
-    # accurate). Fall back to a pooled range check when only one source read.
-    if not has_dual_column:
-        if front_calories and nfp_calories:
-            _fc = front_calories[0] if len(front_calories) == 1 else None
-            _nc = nfp_calories[0] if len(nfp_calories) == 1 else None
-            if _fc is not None and _nc is not None and _fc != _nc:
-                issues.append({
-                    # A front call-out contradicting its own NFP is an FDA labeling
-                    # violation — not a warning that sits next to a color note.
-                    'severity': 'critical',
-                    'message': (
-                        f'Calorie mismatch: front call-out shows {_fc} cal but NFP shows {_nc} cal. '
-                        'Front panel and NFP must declare identical calorie counts (FDA labeling requirement).'
-                    ),
-                })
-        elif len(set(calories)) > 1 and max(calories) - min(calories) > 1:
-            issues.append({
-                'severity': 'warning',
-                'message': (
-                    f'Calorie mismatch: values {", ".join(str(c) for c in calories)} cal detected. '
-                    'Front panel and NFP must declare identical calorie counts (FDA labeling requirement).'
-                ),
-            })
-
-    # Protein mismatch — a 1g difference (e.g. 25g front vs 26g NFP) is exactly
-    # the error we need to catch, so any difference counts when both sources read.
-    if not has_dual_column:
-        if front_proteins and nfp_proteins:
-            _fp = front_proteins[0] if len(front_proteins) == 1 else None
-            _np = nfp_proteins[0] if len(nfp_proteins) == 1 else None
-            if _fp is not None and _np is not None and _fp != _np:
-                issues.append({
-                    # Front call-out contradicting its own NFP = FDA labeling violation.
-                    'severity': 'critical',
-                    'message': (
-                        f'Protein mismatch: front call-out shows {_fp}g but NFP shows {_np}g. '
-                        'Front call-out must match the NFP protein grams.'
-                    ),
-                })
-        elif len(set(proteins)) > 1 and max(proteins) - min(proteins) > 1:
-            issues.append({
-                'severity': 'warning',
-                'message': (
-                    f'Multiple protein values detected ({", ".join(str(p) for p in proteins)}g). '
-                    'Front call-out must match the NFP protein grams.'
-                ),
-            })
-
-    # Added-sugar mismatch — a front "0G Added Sugar" claim contradicts an NFP
-    # that reads anything else, including "<1g": FDA permits rounding to 0g
-    # only below 0.5g, so a panel printing the threshold form is stating the
-    # true value is NOT confirmed zero. The structured vision reads settle
-    # this precisely when both sides were actually read; a text-only front
-    # claim with no NFP read at all still degrades to the old advisory note
-    # rather than asserting a mismatch it can't confirm.
-    if not has_dual_column and _vfc.get('added_sugar_g') is not None and _vnfp.get('added_sugar_g') is not None:
-        if front_zero_sugar and not nfp_zero_sugar:
-            issues.append({
-                'severity': 'critical',
-                'message': (
-                    f'Added sugar mismatch: front call-out declares "0G Added Sugar" but the NFP '
-                    f'reads {_vnfp["added_sugar_g"]}g. FDA permits rounding to 0g only below 0.5g — '
-                    'a panel printing a non-zero or "<1g" value states the opposite of the front '
-                    'claim. Front call-out must match the NFP added sugars declaration.'
-                ),
-            })
-    elif re.search(r'0\s*g\s+added\s+sugar', tl):
-        if not re.search(r'added\s+sugars?\s+0\s*g|added\s+sugars?\s*\n?\s*0', tl):
-            notes.append(
-                '"0G Added Sugar" front claim detected. '
-                'Verify the NFP shows 0g for Added Sugars.'
-            )
-
     return {
         'has_nfp': has_nfp,
         'has_nfp_header': has_nfp_header,
-        'calories': calories,
-        'proteins': proteins,
-        'net_weights': nw_hits,
-        'front_callout': {
-            'calories': front_calories,
-            'proteins': front_proteins,
-            'zero_sugar': front_zero_sugar,
-            # Loose-window values set aside, not compared (see NOT EVALUATED).
-            'unconfirmed': _unconfirmed_front,
-        },
+        'calories': nfp_calories,
+        'proteins': nfp_proteins,
         'nfp_data': {
             'calories': nfp_calories,
             'proteins': nfp_proteins,
@@ -2902,12 +2784,10 @@ def _check_nfp(ocr_text: str, front_text: str = '', vision_nutrition: dict = Non
         },
         'issues': issues,
         'notes': notes + ([
-            'NOT RUN — no calorie or protein value was read from either the front call-outs or '
-            'the Nutrition Facts panel, so there was nothing to compare.']
-            if not (front_calories or front_proteins or nfp_calories or nfp_proteins) else []),
-        # Zero findings from a comparison that compared nothing is not a pass.
-        'status': ('NOT_RUN' if not (front_calories or front_proteins or nfp_calories or nfp_proteins)
-                   else 'OK'),
+            'NOT RUN — no calorie or protein value was read from the Nutrition Facts panel.']
+            if not (nfp_calories or nfp_proteins) else []),
+        # Zero findings from a panel that read nothing is not a pass.
+        'status': 'NOT_RUN' if not (nfp_calories or nfp_proteins) else 'OK',
     }
 
 
@@ -3654,10 +3534,19 @@ def _build_label_snapshot(text: str, panel: dict, vision_nutrition: dict,
                 continue
             comp.append(phrase)
     vn = vision_nutrition or {}
+    _ings, _minor_from = [], None
+    for x in _split_ingredients(stmt):
+        if _norm_ing(x):
+            if _minor_from is None and re.search(r'less\s+than\s+\d+\s*%', x, re.I):
+                _minor_from = len(_ings)
+            _ings.append(_norm_ing(x))
     return {
         'ingredients_raw': stmt,
         'ingredients_reader': {'version': INGREDIENT_READER_VERSION, 'source': reader_source},
-        'ingredients': [_norm_ing(x) for x in _split_ingredients(stmt) if _norm_ing(x)],
+        'ingredients': _ings,
+        # Index in `ingredients` where the "contains less than 2% of:" group
+        # starts (None without one). Crossing that line is a formula change.
+        'ingredients_minor_from': _minor_from,
         'has_less_than_2pct': bool(re.search(r'less\s+than\s+\d+\s*%', stmt.lower())),
         'front_callout': vn.get('front_callout', {}) or {},
         'nfp': vn.get('nfp', {}) or {},
@@ -4371,6 +4260,10 @@ def _fetch_prior_panel_version(gtin=None, sku=None):
 # values against each other or against a reference — the same channel a
 # SUSPECT READ in _check_net_weight is doubting. A spelling, eyemark, or
 # allergen-text finding doesn't share that failure mode, so it's left alone.
+# Not front_callout: a ring read and the panel read are independent reads, and
+# a front calorie call-out that contradicts the panel is a declaration error
+# (21 CFR 101.9(g)(5)) — a doubtful number elsewhere on the file must not
+# soften it (runs 142db86d / eccfd9c9).
 _VALUE_COMPARISON_CHECKS = {'netwt', 'nfp', 'panel'}
 # Tag on FALCPA allergen findings: exempt from the suspect downgrade by issue,
 # whatever check key carries them.
@@ -4595,7 +4488,14 @@ def _flag_duplicate_ingredients(results: list) -> None:
     suggest it — that stays a WARNING and names the ingredient. A shared
     statement whose only difference from a sibling is flavor-descriptor
     wording or ingredient order, with no such named-ingredient anomaly,
-    downgrades to INFO."""
+    downgrades to INFO.
+
+    Order is part of the statement: ingredients are listed by predominance
+    (21 CFR 101.4(a)(1)), so the same ingredients in a different order are a
+    different formula, not a duplicate (run eccfd9c9: Toffee Cream and Double
+    Chocolate, Cocoa Powder third in one and in the sub-2% group of the other,
+    were reported "identical apart from ingredient order"). Only statements
+    whose shared ingredients run in the same order are compared."""
     entries = []
     for res in results or []:
         snap = res.get('snapshot') or {}
@@ -4610,12 +4510,12 @@ def _flag_duplicate_ingredients(results: list) -> None:
                 continue
             sa, sb = set(a), set(b)
             overlap = len(sa & sb) / max(1, len(sa | sb))
-            # Identical sets, or same items in a different order → flag.
             if overlap < 0.92:
                 continue
-            same_order = a == b
-            detail = ('identical' if same_order else
-                      'identical apart from ingredient order')
+            # Same ingredients in a different order = a different formula.
+            if [x for x in a if x in sb] != [x for x in b if x in sa]:
+                continue
+            detail = 'identical' if a == b else 'nearly identical'
 
             # The named-flavor check runs on what each SKU actually carries —
             # the question is whether THIS SKU's own flavor name explains
@@ -4631,22 +4531,20 @@ def _flag_duplicate_ingredients(results: list) -> None:
             ):
                 chk = res.setdefault('checks', {}).setdefault(
                     'ingredients', {'issues': [], 'notes': []})
-                if mismatches_self:
-                    for ing in mismatches_self:
-                        if ing not in mismatches_other:
-                            # The sibling's flavor DOES explain this
-                            # ingredient — the strongest form of the signal:
-                            # this is probably where it belongs, and this
-                            # SKU's statement was probably copied from there.
-                            tail = (f'{ing.title()} is expected in a flavor like '
-                                    f'{other.get("filename")}; confirm it belongs in this '
-                                    f'{flavor_self or "flavor"}.')
-                        else:
-                            tail = (f'{ing.title()} is not obviously expected in either '
-                                    'flavor — confirm the ingredient statement.')
+                # The signal is an ingredient the SIBLING's flavor explains and
+                # this one's does not: the statement was probably copied from
+                # there. An ingredient neither flavor names (Coconut Milk
+                # Powder, the fat and creamer base of the whole beef line) is a
+                # functional ingredient, and asking whether it matches the
+                # flavor name would fire on every one of them, forever.
+                copied = [ing for ing in mismatches_self if ing not in mismatches_other]
+                if copied:
+                    for ing in copied:
                         chk.setdefault('issues', []).append({'severity': 'warning', 'message': (
                             f'{res.get("filename")} and {other.get("filename")} carry {detail} '
-                            f'ingredient statements, both including {ing.title()}. {tail}')})
+                            f'ingredient statements, both including {ing.title()}. {ing.title()} is '
+                            f'expected in a flavor like {other.get("filename")}; confirm it belongs '
+                            f'in this {flavor_self or "flavor"}.')})
                 else:
                     chk.setdefault('issues', []).append({'severity': 'info', 'message': (
                         f'Ingredient statement is {detail} to {other.get("filename")}. Expected '
@@ -4719,6 +4617,24 @@ def _check_ingredient_drift(current: dict, prior: dict) -> dict:
                    'printing elsewhere on-pack — resolve before print.'
                    if is_claim else
                    'Either the ingredient changed or a qualifier was lost. Verify.'))})
+
+    # 2b. An ingredient crossing the "less than 2%" line. Order is predominance
+    #     (21 CFR 101.4(a)(1)); moving into or out of the sub-2% group is the
+    #     boundary that means the amount changed materially. Only where both
+    #     snapshots recorded the group (older baselines did not).
+    if 'ingredients_minor_from' in (current or {}) and 'ingredients_minor_from' in (prior or {}):
+        def _minor(lst, k, ing):
+            return k is not None and lst.index(ing) >= k
+        for ing in old:
+            if ing in cur:
+                was = _minor(old, prior['ingredients_minor_from'], ing)
+                now = _minor(cur, current['ingredients_minor_from'], ing)
+                if was != now:
+                    issues.append({'severity': 'warning', 'message': (
+                        f'"{ing}" moved {"into" if now else "out of"} the "contains less than 2% of" '
+                        'group versus the prior proofed version. Ingredients are listed by '
+                        'predominance — that is a formulation change, or one of the two statements '
+                        'is wrong. Verify against the formula.')})
 
     # 3. Format change — introduction/removal of "contains less than 2% of".
     if bool(current.get('has_less_than_2pct')) != bool(prior.get('has_less_than_2pct')):

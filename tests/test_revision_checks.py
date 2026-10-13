@@ -68,6 +68,17 @@ def _run():
     check('7.2b dropped Dried is warning',
           any(i['severity'] == 'warning' and 'dried' in i['message'].lower() for i in r['issues']))
 
+    # 7.3b — an ingredient crossing the "less than 2%" line between revisions.
+    old = pe._build_label_snapshot('Ingredients: Beef Isolate, Cocoa Powder, Natural Flavor, contains less '
+                                   'than 2% of: Salt, Guar Gum', {}, {}, reader_source='vision')
+    new = pe._build_label_snapshot('Ingredients: Beef Isolate, Natural Flavor, contains less than 2% of: '
+                                   'Cocoa Powder, Salt, Guar Gum', {}, {}, reader_source='vision')
+    r = pe._check_ingredient_drift(new, old)
+    check('7.3b cocoa moving into the sub-2% group is a WARNING naming it',
+          any(i['severity'] == 'warning' and '"cocoa powder" moved into' in i['message'] for i in r['issues']))
+    r = pe._check_ingredient_drift(old, dict(old))
+    check('7.3b the same statement raises nothing', not r['issues'])
+
     # 7.4 — identical ingredient statements across two SKUs flag both.
     a = {'filename': 'cinnamon.pdf', 'checks': {},
          'snapshot': _snap('Ingredients: Pea Protein, Rice Protein, Cocoa, Salt, Stevia')}

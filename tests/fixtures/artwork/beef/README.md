@@ -31,12 +31,13 @@ yet hand-verified**:
   pre-reformulation weights, which produce four false net-weight CRITICALs. Formula
   ref / version are populated here and empty in the live export.
 - `expected.json` — the four clean files: serving = net weight, 1 serving. Expected
-  CLEAN with zero CRITICAL and zero WARNING (spot colour and trim disabled).
+  zero CRITICAL and zero WARNING (spot colour and trim disabled), and REVIEW only from
+  the claims check ("supports digestion", DSHEA disclaimer).
 - `defects.json` — `DEFECT_front_callout_calories`: a **file-level** defect, the real
   Toffee Cream artwork unmodified (nothing planted). Its front ring reads "100
   Calories Per Serving"; its own NFP and approved F-00068 v1.0 read 130. Expect
-  exactly one CRITICAL — the calorie mismatch, reported under the `nfp` check — and no
-  other finding. Three of the four rings are correct, so a reader that binds a ring
+  exactly one CRITICAL — on the `front_callout` check, naming calories, 100 and 130 — and
+  no other finding. Three of the four rings are correct, so a reader that binds a ring
   to the wrong value either misses this or fires on a correct ring.
 
 Things that are correct on these labels and must never produce a finding:

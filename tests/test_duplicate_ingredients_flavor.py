@@ -80,16 +80,30 @@ def _run():
           all(i['severity'] == 'info' for i in _issues(dchoc))
           and all(i['severity'] == 'info' for i in _issues(neap2)))
 
-    # ── Ingredient order alone (no wording difference) is still the expected case ──
-    ordered_a = _mk('PD_bottle_sugar_cookie.pdf',
-                    ['whey protein isolate', 'natural flavors', 'sea salt', 'guar gum'])
-    ordered_b = _mk('PD_bottle_salted_caramel.pdf',
-                    ['whey protein isolate', 'sea salt', 'natural flavors', 'guar gum'])
-    pe._flag_duplicate_ingredients([ordered_a, ordered_b])
-    check('a reordered-but-otherwise-identical statement is still INFO',
-          all(i['severity'] == 'info' for i in _issues(ordered_a)))
-    check('the "identical apart from order" wording is used, not "identical"',
-          any('apart from ingredient order' in i['message'] for i in _issues(ordered_a)))
+    # ── Same ingredients, different order = a different formula (run eccfd9c9) ──
+    # Order is predominance (21 CFR 101.4(a)(1)). Toffee Cream and Double
+    # Chocolate share all ten ingredients; Cocoa Powder is third in one and in
+    # the sub-2% group of the other. Not "identical apart from order".
+    dch = ['grass fed beef protein isolate', 'bovine collagen peptides', 'cocoa powder', 'natural flavor',
+           'coconut milk powder', 'mct oil powder', 'himalayan pink salt', 'stevia leaf extract',
+           'xanthan gum', 'guar gum']
+    tfc = ['grass fed beef protein isolate', 'bovine collagen peptides', 'coconut milk powder',
+           'natural flavor', 'mct oil powder', 'cocoa powder', 'himalayan pink salt', 'stevia leaf extract',
+           'xanthan gum', 'guar gum']
+    a_ = _mk('PD_beef_bottle_double_chocolate.pdf', dch)
+    b_ = _mk('PD_beef_bottle_toffee_cream.pdf', tfc)
+    pe._flag_duplicate_ingredients([a_, b_])
+    check('same set, different order -> no duplicate finding at all (different formulas)',
+          'ingredients' not in a_['checks'] and 'ingredients' not in b_['checks'])
+
+    # ── A functional ingredient neither flavor names is not a flavor anomaly ──
+    beef_ings = ['grass fed beef protein isolate', 'coconut milk powder', 'bovine collagen peptides',
+                 'natural flavors', 'himalayan pink salt', 'guar gum']
+    cs = _mk('PD_beef_bottle_cinnamon_sugar.pdf', list(beef_ings))
+    fv = _mk('PD_beef_bottle_frosted_vanilla.pdf', list(beef_ings))
+    pe._flag_duplicate_ingredients([cs, fv])
+    check('identical statements sharing Coconut Milk Powder (neither flavor names it) -> INFO, no WARNING',
+          _issues(cs) and all(i['severity'] == 'info' for i in _issues(cs) + _issues(fv)))
 
     # ── Two genuinely different SKUs (below the overlap threshold) — no finding ──
     different_a = _mk('PD_bottle_vanilla.pdf',

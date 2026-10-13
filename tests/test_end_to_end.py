@@ -62,7 +62,7 @@ REQUIRED = bool(os.environ.get('ARTPROOF_E2E_REQUIRED'))
 BRAND = {'brand_mode': 'prodough', 'proof_type': 'press', 'wind_direction': ''}
 CHECK_KEY = {'gtin': 'gtin', 'net_weight': 'netwt', 'spot_color': 'specs',
              'fda_falcpa': 'fda', 'approved_panel': 'panel', 'item_reference': 'item_reference',
-             'front_callout': 'nfp'}
+             'front_callout': 'front_callout'}
 NFP_FIELDS = ('serving_size_g', 'serving_size_cups', 'servings_per_container', 'serving_size_desc')
 
 
@@ -239,6 +239,11 @@ def _approved(expect, mutate=None):
     return rec, 'ok'
 
 
+def _phrases(m):
+    """message_contains: one phrase, or a list that must all appear."""
+    return m if isinstance(m, list) else [m]
+
+
 def _graded(res):
     return [(k, i) for k, c in (res.get('checks') or {}).items() if isinstance(c, dict)
             for i in c.get('issues', []) if i.get('severity') in ('critical', 'warning', 'suspect')]
@@ -386,6 +391,15 @@ def _run():
         S.check(f'vision reads succeed (errored on {len(_errored)} of {len(_attempted)} runs)',
                 len(_errored) * 2 < max(1, len(_attempted)))
 
+    # ── Every file says whether the front call-out check ran ────────────────
+    # Run eccfd9c9 could not tell: front_callout must sit in exactly one of
+    # run / skipped / not applicable, on every file, clean or defect.
+    for sid, key, res, _ in results:
+        where = [col for col in ('checks_run', 'checks_skipped', 'checks_not_applicable')
+                 if 'front_callout' in (res.get(col) or [])]
+        S.check(f'{sid} {key}: front_callout reported in exactly one status column (got {where})',
+                len(where) == 1)
+
     # ── Score: clean files ──────────────────────────────────────────────────
     clean_fp = {}
     clean_results = []
@@ -486,7 +500,7 @@ def _run():
         planted += 1
         ck = CHECK_KEY[exp['check']]
         hit = (len(crits) == 1 and crits[0][0] == ck
-               and exp['message_contains'].lower() in crits[0][1]['message'].lower())
+               and all(m.lower() in crits[0][1]['message'].lower() for m in _phrases(exp['message_contains'])))
         if exp.get('no_other_findings'):
             others = [(k, i['message'][:70]) for k, i in _graded(res) if i['severity'] != 'critical']
             hit = hit and not others
@@ -495,7 +509,7 @@ def _run():
         if hit:
             caught += 1
         S.check(f'{d["id"]}: exactly one CRITICAL, on check={exp["check"]}, containing '
-                f'"{exp["message_contains"]}"' + (', and no other finding' if others is not None else '')
+                f'{_phrases(exp["message_contains"])}' + (', and no other finding' if others is not None else '')
                 + f' (got {[(k, i["message"][:70]) for k, i in crits]}'
                 + (f', other findings {others}' if others else '') + ')',
                 hit, needs_vision=vision_dep)

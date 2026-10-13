@@ -97,7 +97,7 @@ def _run():
     # ── an unrecognized severity never disappears into a false pass ──────────
     r = _result({'nfp': {'status': 'FLAGGED', 'issues': [
         {'severity': 'some_future_severity', 'message': 'New severity the map does not know.'}]}})
-    rows = _only(rd._checks_from_result(r), 'front')
+    rows = _only(rd._checks_from_result(r), 'nutrition facts panel')
     check('unrecognized severity → warn (never dropped to a fake pass)',
           rows and rows[0]['result'] == 'warn')
 
@@ -105,6 +105,14 @@ def _run():
     r = _result({'wind': {'status': 'SKIPPED', 'issues': [], 'skipped': True}})
     rows = _only(rd._checks_from_result(r), 'wind')
     check('skipped block emits no row', rows == [])
+
+    # ── not applicable is no statement: no row, never "pass" ────────────────
+    r = _result({'eyemark': {'status': 'NOT_APPLICABLE', 'issues': [], 'notes': ['Not applicable']},
+                 'front_callout': {'status': 'NOT_APPLICABLE', 'issues': []}})
+    check('NOT_APPLICABLE emits no row (not a pass)', rd._checks_from_result(r) == [])
+    r = _result({'front_callout': {'status': 'NOT_RUN', 'issues': [], 'notes': ['NOT RUN — ring read failed']}})
+    rows = _only(rd._checks_from_result(r), 'front call-outs')
+    check('front_callout NOT_RUN -> warn, under its own name', rows and rows[0]['result'] == 'warn')
 
     # ── mixed block: one critical + one suspect → both rows present ──────────
     r = _result({'netwt': {'status': 'CRITICAL', 'issues': [

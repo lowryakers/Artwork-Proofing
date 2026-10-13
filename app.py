@@ -42,7 +42,8 @@ ALLOWED_EXTS = {'.pdf', '.ai', '.png', '.jpg', '.jpeg', '.tiff', '.tif', '.eps'}
 CHECK_LABELS = {
     'gtin':     'GTIN / Barcode',
     'netwt':    'Nutrition Panel vs Net Weight',
-    'nfp':      'Front Call-Out vs NFP',
+    'nfp':      'Nutrition Facts Panel',
+    'front_callout': 'Front Call-Outs vs NFP',
     'eyemark':  'Eyemark Contrast',
     'spelling': 'Spelling / Brand Name',
     'fda':      'FDA Audit Risk',
@@ -1169,8 +1170,13 @@ def _generate_report(job: dict, brand_name: str = 'ProDough') -> io.BytesIO:
     wsp.merge_cells('A2:H2')
     wsp.row_dimensions[2].height = 45
     _FRONT_FIELDS = ('declared_net_weight_g', 'unit_count')
+    # Front call-out rings, one column per NFP field a ring can declare: the
+    # number, the caption it was bound to, the reader, and the verdict.
+    _RING_COLS = (('calories', 'Calories'), ('protein_g', 'Protein'), ('added_sugar_g', 'Added Sugars'))
     _hdrs = (['File'] + [f'{k} (front panel)' if k in _FRONT_FIELDS else k for k in _PROV_FIELDS]
-             + ['Unused candidates (page regex; vision without crop)', 'Panel crop read (why)'])
+             + ['Unused candidates (page regex; vision without crop)', 'Panel crop read (why)']
+             + [f'Front ring: {lbl}' for _, lbl in _RING_COLS]
+             + ['Front rings not compared', 'Front ring read (why)'])
     for col, hdr in enumerate(_hdrs, 1):
         c = wsp.cell(row=4, column=col, value=hdr)
         c.font = hdr_font
@@ -1207,10 +1213,41 @@ def _generate_report(job: dict, brand_name: str = 'ProDough') -> io.BytesIO:
         c.alignment = wrap
         if pr:
             c.fill = fill_prov_warn
+        # Front rings. Each cell says what was read, from which ring, by which
+        # reader — or why nothing was (run eccfd9c9 could not tell).
+        rings = r.get('front_rings') or []
+        fc_check = (r.get('checks') or {}).get('front_callout') or {}
+        col0 = len(_PROV_FIELDS) + 4
+        for j, (field, _lbl) in enumerate(_RING_COLS):
+            mine = [x for x in rings if x.get('field') == field]
+            if mine:
+                val = '; '.join(
+                    f'{x.get("number") or "?"} — bound to "{x.get("caption") or "?"}" — {x.get("reader")} — '
+                    f'{x.get("verdict")}' + (f' (NFP {x.get("nfp_value")})' if x.get('nfp_value') is not None else '')
+                    for x in mine)
+            else:
+                val = ('no such ring' if fc_check.get('status') in ('OK', 'FAIL', 'UNVERIFIED', 'NOT_APPLICABLE')
+                       else f'not read — {fc_check.get("status") or "check absent"}')
+            c = wsp.cell(row=ridx, column=col0 + j, value=val)
+            c.alignment = wrap
+            if any(x.get('verdict') == 'MISMATCH' for x in mine):
+                c.fill = PatternFill('solid', fgColor='F8D7DA')
+                c.font = Font(bold=True, color='842029')
+            elif any(x.get('verdict') == 'NOT EVALUATED' for x in mine) or val.startswith('not read'):
+                c.fill = fill_prov_absent
+        others = [x for x in rings if not x.get('field')]
+        wsp.cell(row=ridx, column=col0 + len(_RING_COLS), value='; '.join(
+            f'{x.get("number") or "?"} / {x.get("caption") or "?"} — {x.get("verdict")}' for x in others
+        )).alignment = wrap
+        wsp.cell(row=ridx, column=col0 + len(_RING_COLS) + 1, value=' | '.join(
+            [f'status {fc_check.get("status") or "check absent"}'] + list(r.get('front_crop_diag') or [])
+        )).alignment = wrap
     wsp.column_dimensions['A'].width = 42
     for col in 'BCDEFG':
         wsp.column_dimensions[col].width = 30
     wsp.column_dimensions['H'].width = 44
+    for col in 'IJKLMN':
+        wsp.column_dimensions[col].width = 36
 
     # ── Errored files — their own section, never grey info rows ────────────────
     # A file that crashed produced no checks. It must not read like a clean file
