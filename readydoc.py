@@ -32,7 +32,8 @@ _TIMEOUT = 15
 _CHECK_LABEL = {
     'gtin': 'GTIN / barcode',
     'netwt': 'Nutrition panel vs net weight',
-    'nfp': 'Nutrition panel vs front',
+    'nfp': 'Nutrition Facts panel',
+    'front_callout': 'Front call-outs vs nutrition panel',
     'panel': 'Nutrition panel vs approved (ReadyDoc)',
     'eyemark': 'Eyemark',
     'spelling': 'Spelling & brand names',
@@ -336,6 +337,11 @@ def _checks_from_result(result: dict) -> list:
             continue
 
         if block.get('skipped'):
+            continue
+        # Not applicable to this SKU (eyemark "NA" on a sleeve, a pack with no
+        # front call-outs) is no statement about the artwork; "pass" would claim
+        # the check looked and found it fine.
+        if str(block.get('status', '')).upper() == 'NOT_APPLICABLE':
             continue
 
         status = str(block.get('status', '')).upper()

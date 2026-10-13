@@ -43,26 +43,22 @@ def _run():
     check('_is_below("1") is False (no "<")', not pe._is_below('1'))
 
     # The exact Apple Pie reproduction: vision NFP added_sugar_g == '<1' must
-    # not crash _check_nfp, and the front/NFP contradiction it was hiding
-    # (0G front vs <1g NFP) must now surface.
-    vn = {'front_callout': {'calories': 120, 'protein_g': 25, 'added_sugar_g': 0},
-         'nfp': {'calories': 120, 'protein_g': 25, 'added_sugar_g': '<1'}}
-    out = pe._check_nfp('Nutrition Facts Includes <1g Added Sugars 1%',
-                        front_text='120 Calories 25G Protein 0G Added Sugar', vision_nutrition=vn)
-    check('"<1" added-sugar value does not crash _check_nfp',
-          isinstance(out, dict))  # would have raised before reaching here
-    check('the front-0g-vs-NFP-<1g contradiction now surfaces as a real finding',
-          any('added sugar mismatch' in i['message'].lower() for i in out['issues']))
-    check('the surfaced finding correctly quotes the NFP value',
-          any('<1' in i['message'] for i in out['issues']))
+    # not crash, and the front/NFP contradiction it was hiding (0G front ring vs
+    # <1g NFP) must surface — compared ring to its own field (front_callout).
+    vn_nfp = {'calories': 120, 'protein_g': 25, 'added_sugar_g': '<1'}
+    out = pe._check_nfp('Nutrition Facts Includes <1g Added Sugars 1%', vision_nutrition={'nfp': vn_nfp})
+    check('"<1" added-sugar value does not crash _check_nfp', isinstance(out, dict))
+    rings = {'rings': [{'number': '120', 'caption': 'Calories Per Serving'},
+                       {'number': '25G', 'caption': 'Protein Per Serving'},
+                       {'number': '0G', 'caption': 'Added Sugar'}]}
+    out = pe._check_front_callout(rings, {}, vn_nfp, vision_ran=True)
+    crits = [i['message'] for i in out['issues'] if i['severity'] == 'critical']
+    check('the 0G-ring-vs-NFP-<1g contradiction surfaces as one CRITICAL, on added sugars, quoting <1',
+          len(crits) == 1 and 'added sugars' in crits[0].lower() and '<1' in crits[0])
 
-    # Matching 0g/0g must stay silent — this is not a blanket "always flag
-    # added sugar" rule, only a genuine contradiction.
-    vn_ok = {'front_callout': {'calories': 120, 'protein_g': 25, 'added_sugar_g': 0},
-            'nfp': {'calories': 120, 'protein_g': 25, 'added_sugar_g': 0}}
-    out_ok = pe._check_nfp('x', front_text='y', vision_nutrition=vn_ok)
-    check('matching 0g/0g added sugar stays silent',
-          not any('added sugar mismatch' in i['message'].lower() for i in out_ok['issues']))
+    # Matching 0g/0g must stay silent — not a blanket "always flag added sugar".
+    out_ok = pe._check_front_callout(rings, {}, dict(vn_nfp, added_sugar_g=0), vision_ran=True)
+    check('matching 0g/0g added sugar stays silent', out_ok['issues'] == [] and out_ok['status'] == 'OK')
 
     # ═══════════════════════════════════════════════════════════════════════
     # FIX 1 — FALCPA critical fired on all 8 beef/plant SKUs: the prep-copy

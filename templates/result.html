@@ -167,6 +167,7 @@
         <button type="button" class="btn btn-outline-dark" onclick="setCheckFilter('gtin')">GTIN</button>
         <button type="button" class="btn btn-outline-dark" onclick="setCheckFilter('netwt')">Net Wt</button>
         <button type="button" class="btn btn-outline-dark" onclick="setCheckFilter('nfp')">NFP</button>
+        <button type="button" class="btn btn-outline-dark" onclick="setCheckFilter('front_callout')">Call-Outs</button>
         <button type="button" class="btn btn-outline-dark" onclick="setCheckFilter('eyemark')">Eyemark</button>
         <button type="button" class="btn btn-outline-dark" onclick="setCheckFilter('spelling')">Spelling</button>
         <button type="button" class="btn btn-outline-dark" onclick="setCheckFilter('fda')">FDA</button>
@@ -301,7 +302,10 @@
     {{ _check_card('3','Nutrition Panel vs Net Weight', 'bi-calculator', r.checks.netwt,    idx, r.filename, 'netwt',    dismissals, confirmations, always_open=true) }}
     {% endif %}
     {% if r.checks.get('nfp') is not none %}
-    {{ _check_card('4','Front Call-Out vs NFP', 'bi-clipboard2-pulse',   r.checks.nfp,      idx, r.filename, 'nfp',      dismissals, confirmations) }}
+    {{ _check_card('4','Nutrition Facts Panel', 'bi-clipboard2-pulse',   r.checks.nfp,      idx, r.filename, 'nfp',      dismissals, confirmations) }}
+    {% endif %}
+    {% if r.checks.get('front_callout') is not none %}
+    {{ _check_card('4b','Front Call-Outs vs NFP', 'bi-bullseye',   r.checks.front_callout, idx, r.filename, 'front_callout', dismissals, confirmations, always_open=true) }}
     {% endif %}
     {{ _check_card('5','Eyemark Contrast',       'bi-eye',                r.checks.eyemark,  idx, r.filename, 'eyemark',  dismissals, confirmations) }}
     {{ _check_card('6','Spelling / Brand Name', 'bi-spellcheck',         r.checks.spelling, idx, r.filename, 'spelling', dismissals, confirmations) }}
@@ -396,7 +400,7 @@
    plus UNVERIFIED/UNKNOWN for net weight / prep block) must never render like
    a clean pass — but a CRITICAL diff always wins the visual over "not yet
    approved," since a known-wrong panel is the stronger signal. #}
-{% set not_verified = status in ('UNVERIFIED','UNKNOWN','UNCLASSIFIED','PANEL_MISSING','PANEL_NOT_APPROVED','PANEL_SUPERSEDED','PANEL_UNAVAILABLE') and not crits and not warns %}
+{% set not_verified = status in ('UNVERIFIED','UNKNOWN','UNCLASSIFIED','NOT_RUN','PANEL_MISSING','PANEL_NOT_APPROVED','PANEL_SUPERSEDED','PANEL_UNAVAILABLE','PANEL_NO_VALUES') and not crits and not warns %}
 
 <div class="card mb-2 check-card
   {% if crits %}border-danger check-has-issues check-has-critical{% if warns %} check-has-warning{% endif %}
@@ -416,6 +420,7 @@
     {% elif status == 'PANEL_MISSING' %}<span class="badge bg-secondary">NOT VERIFIED — no approved panel</span>
     {% elif status == 'PANEL_UNAVAILABLE' %}<span class="badge bg-secondary">NOT VERIFIED — ReadyDoc unavailable</span>
     {% elif status == 'PANEL_SUPERSEDED' %}<span class="badge bg-secondary">RE-PROOF — panel superseded</span>
+    {% elif status == 'NOT_RUN' and not crits and not warns %}<span class="badge bg-secondary">NOT RUN</span>
     {% elif status == 'NOT_APPLICABLE' %}<span class="badge bg-light text-secondary border">N/A for this SKU</span>
     {% elif status == 'VERIFIED' %}<span class="badge bg-success">Verified{% if check.get('panel_version') is not none %} v{{ check.get('panel_version') }}{% endif %}</span>
     {% elif not_verified %}<span class="badge bg-secondary">NOT VERIFIED</span>
@@ -509,47 +514,22 @@
       </div>
       {% endif %}
 
-      {# ── Check 2: Front call-out vs NFP comparison panel ── #}
-      {% if check_key == 'nfp' %}
-      {% set fc = check.get('front_callout', {}) %}
-      {% set nf = check.get('nfp_data', {}) %}
+      {# ── Front call-out rings, one row per ring as read ── #}
+      {% if check_key == 'front_callout' and check.get('rings') %}
       <div class="mt-2 border rounded overflow-hidden" style="font-size:.8rem">
-        <div class="row g-0">
-          <div class="col-6 p-2 border-end">
-            <div class="text-muted fw-semibold mb-1" style="font-size:.72rem;text-transform:uppercase;letter-spacing:.04em">Front Panel (call-out)</div>
-            {% if fc.get('calories') %}
-              <div>Calories: <strong>{{ fc.calories | join(', ') }}</strong></div>
-            {% else %}
-              <div class="text-muted">Calories: —</div>
-            {% endif %}
-            {% if fc.get('proteins') %}
-              <div>Protein: <strong>{{ fc.proteins | join(', ') }}g</strong></div>
-            {% else %}
-              <div class="text-muted">Protein: —</div>
-            {% endif %}
-            <div>0g Added Sugar:
-              {% if fc.get('zero_sugar') %}<i class="bi bi-check-circle-fill text-success ms-1"></i>
-              {% else %}<span class="text-muted">—</span>{% endif %}
-            </div>
-          </div>
-          <div class="col-6 p-2">
-            <div class="text-muted fw-semibold mb-1" style="font-size:.72rem;text-transform:uppercase;letter-spacing:.04em">Nutrition Facts Panel</div>
-            {% if nf.get('calories') %}
-              <div>Calories: <strong>{{ nf.calories | join(', ') }}</strong></div>
-            {% else %}
-              <div class="text-muted">Calories: —</div>
-            {% endif %}
-            {% if nf.get('proteins') %}
-              <div>Protein: <strong>{{ nf.proteins | join(', ') }}g</strong></div>
-            {% else %}
-              <div class="text-muted">Protein: —</div>
-            {% endif %}
-            <div>0g Added Sugars:
-              {% if nf.get('zero_sugar') %}<i class="bi bi-check-circle-fill text-success ms-1"></i>
-              {% else %}<span class="text-muted">—</span>{% endif %}
-            </div>
-          </div>
-        </div>
+        <table class="table table-sm mb-0">
+          <thead><tr class="text-muted" style="font-size:.72rem;text-transform:uppercase;letter-spacing:.04em">
+            <th>Ring</th><th>Number</th><th>Bound to caption</th><th>NFP</th><th>Verdict</th></tr></thead>
+          <tbody>
+          {% for ring in check.rings %}
+            <tr class="{% if ring.verdict == 'MISMATCH' %}table-danger{% elif ring.verdict == 'NOT EVALUATED' %}table-warning{% endif %}">
+              <td>{{ ring.position or '—' }}</td><td><strong>{{ ring.number or '?' }}</strong></td>
+              <td>{{ ring.caption or '?' }}</td>
+              <td>{% if ring.nfp_value is not none and ring.nfp_value != '' %}{{ ring.nfp_value }}{% else %}—{% endif %}</td>
+              <td>{{ ring.verdict }}</td></tr>
+          {% endfor %}
+          </tbody>
+        </table>
       </div>
       {% endif %}
 
@@ -685,6 +665,7 @@
   #reportRoot[data-check-filter="gtin"]     .check-card[data-check="gtin"]     { display:block!important; }
   #reportRoot[data-check-filter="netwt"]    .check-card[data-check="netwt"]    { display:block!important; }
   #reportRoot[data-check-filter="nfp"]      .check-card[data-check="nfp"]      { display:block!important; }
+  #reportRoot[data-check-filter="front_callout"] .check-card[data-check="front_callout"] { display:block!important; }
   #reportRoot[data-check-filter="eyemark"]  .check-card[data-check="eyemark"]  { display:block!important; }
   #reportRoot[data-check-filter="spelling"] .check-card[data-check="spelling"] { display:block!important; }
   #reportRoot[data-check-filter="fda"]      .check-card[data-check="fda"]      { display:block!important; }
@@ -1040,8 +1021,8 @@ function noteRows(notes) {
 // approved-nutrition-panel gate; UNVERIFIED/UNKNOWN cover net weight / prep
 // block when their own inputs were incomplete. None of these say the artwork
 // is wrong — only that nothing has confirmed it yet.
-const NOT_VERIFIED_STATUSES = ['UNVERIFIED', 'UNKNOWN', 'UNCLASSIFIED', 'PANEL_MISSING',
-                               'PANEL_NOT_APPROVED', 'PANEL_SUPERSEDED', 'PANEL_UNAVAILABLE'];
+const NOT_VERIFIED_STATUSES = ['UNVERIFIED', 'UNKNOWN', 'UNCLASSIFIED', 'NOT_RUN', 'PANEL_MISSING',
+                               'PANEL_NOT_APPROVED', 'PANEL_SUPERSEDED', 'PANEL_UNAVAILABLE', 'PANEL_NO_VALUES'];
 
 function checkCard(num, title, icon, check, uid, filename, checkKey, alwaysOpen) {
   check = check || {};
@@ -1074,6 +1055,7 @@ function checkCard(num, title, icon, check, uid, filename, checkKey, alwaysOpen)
   else if (status === 'PANEL_MISSING')      badge = `<span class="badge bg-secondary">NOT VERIFIED — no approved panel</span>`;
   else if (status === 'PANEL_UNAVAILABLE')  badge = `<span class="badge bg-secondary">NOT VERIFIED — ReadyDoc unavailable</span>`;
   else if (status === 'PANEL_SUPERSEDED')   badge = `<span class="badge bg-secondary">RE-PROOF — panel superseded</span>`;
+  else if (status === 'NOT_RUN' && !crits.length && !warns.length) badge = `<span class="badge bg-secondary">NOT RUN</span>`;
   else if (status === 'NOT_APPLICABLE')     badge = `<span class="badge bg-light text-secondary border">N/A for this SKU</span>`;
   else if (status === 'VERIFIED')           badge = `<span class="badge bg-success">Verified${pvTxt}</span>`;
   else if (notVerified)                     badge = `<span class="badge bg-secondary">NOT VERIFIED</span>`;
@@ -1112,24 +1094,17 @@ function checkCard(num, title, icon, check, uid, filename, checkKey, alwaysOpen)
       ${rowsHtml}${gapsHtml ? `<div class="mt-1">${gapsHtml}</div>` : ''}
     </div></div>`;
   }
-  if (checkKey === 'nfp') {
-    const fc = check.front_callout || {};
-    const nf = check.nfp_data     || {};
-    const chk = v => v ? `<i class="bi bi-check-circle-fill text-success ms-1"></i>` : `<span class="text-muted">—</span>`;
-    extras += `<div class="mt-2 border rounded overflow-hidden" style="font-size:.8rem"><div class="row g-0">
-      <div class="col-6 p-2 border-end">
-        <div class="text-muted fw-semibold mb-1" style="font-size:.72rem;text-transform:uppercase;letter-spacing:.04em">Front Panel (call-out)</div>
-        <div>Calories: ${fc.calories?.length ? `<strong>${fc.calories.join(', ')}</strong>` : '—'}</div>
-        <div>Protein: ${fc.proteins?.length ? `<strong>${fc.proteins.join(', ')}g</strong>` : '—'}</div>
-        <div>0g Added Sugar: ${chk(fc.zero_sugar)}</div>
-      </div>
-      <div class="col-6 p-2">
-        <div class="text-muted fw-semibold mb-1" style="font-size:.72rem;text-transform:uppercase;letter-spacing:.04em">Nutrition Facts Panel</div>
-        <div>Calories: ${nf.calories?.length ? `<strong>${nf.calories.join(', ')}</strong>` : '—'}</div>
-        <div>Protein: ${nf.proteins?.length ? `<strong>${nf.proteins.join(', ')}g</strong>` : '—'}</div>
-        <div>0g Added Sugars: ${chk(nf.zero_sugar)}</div>
-      </div>
-    </div></div>`;
+  if (checkKey === 'front_callout' && (check.rings || []).length) {
+    const rows = check.rings.map(rg => {
+      const cls = rg.verdict === 'MISMATCH' ? 'table-danger' : rg.verdict === 'NOT EVALUATED' ? 'table-warning' : '';
+      const nv = (rg.nfp_value === null || rg.nfp_value === undefined || rg.nfp_value === '') ? '—' : esc(rg.nfp_value);
+      return `<tr class="${cls}"><td>${esc(rg.position || '—')}</td><td><strong>${esc(rg.number || '?')}</strong></td>
+        <td>${esc(rg.caption || '?')}</td><td>${nv}</td><td>${esc(rg.verdict || '')}</td></tr>`;
+    }).join('');
+    extras += `<div class="mt-2 border rounded overflow-hidden" style="font-size:.8rem"><table class="table table-sm mb-0">
+      <thead><tr class="text-muted" style="font-size:.72rem;text-transform:uppercase;letter-spacing:.04em">
+        <th>Ring</th><th>Number</th><th>Bound to caption</th><th>NFP</th><th>Verdict</th></tr></thead>
+      <tbody>${rows}</tbody></table></div>`;
   }
   if (checkKey === 'eyemark' && !check.skipped) {
     const colorBadge = c => {
@@ -1253,7 +1228,8 @@ function fileResult(r, jobId, idx) {
   checksHtml += checkCard('1','GTIN / Barcode',        'bi-upc-scan',           checks.gtin,     uid, r.filename, 'gtin',     false);
   if (checks.panel != null) checksHtml += checkCard('2','Nutrition Panel vs Approved (ReadyDoc)','bi-patch-check', checks.panel, uid, r.filename, 'panel', true);
   if (checks.netwt != null) checksHtml += checkCard('3','Nutrition Panel vs Net Weight','bi-calculator', checks.netwt, uid, r.filename, 'netwt', true);
-  if (checks.nfp != null) checksHtml += checkCard('4','Front Call-Out vs NFP','bi-clipboard2-pulse', checks.nfp, uid, r.filename, 'nfp', false);
+  if (checks.nfp != null) checksHtml += checkCard('4','Nutrition Facts Panel','bi-clipboard2-pulse', checks.nfp, uid, r.filename, 'nfp', false);
+  if (checks.front_callout != null) checksHtml += checkCard('4b','Front Call-Outs vs NFP','bi-bullseye', checks.front_callout, uid, r.filename, 'front_callout', true);
   checksHtml += checkCard('5','Eyemark Contrast',       'bi-eye',                checks.eyemark,  uid, r.filename, 'eyemark',  false);
   checksHtml += checkCard('6','Spelling / Brand Name', 'bi-spellcheck',         checks.spelling, uid, r.filename, 'spelling', false);
   checksHtml += checkCard('7','FDA Audit Risk',         'bi-shield-exclamation', checks.fda,      uid, r.filename, 'fda',      true);
@@ -1316,6 +1292,7 @@ function filterBarHTML() {
           <button type="button" class="btn btn-dark active" onclick="setCheckFilter('all')">All</button>
           <button type="button" class="btn btn-outline-dark" onclick="setCheckFilter('gtin')">GTIN</button>
           <button type="button" class="btn btn-outline-dark" onclick="setCheckFilter('nfp')">NFP</button>
+          <button type="button" class="btn btn-outline-dark" onclick="setCheckFilter('front_callout')">Call-Outs</button>
           <button type="button" class="btn btn-outline-dark" onclick="setCheckFilter('eyemark')">Eyemark</button>
           <button type="button" class="btn btn-outline-dark" onclick="setCheckFilter('spelling')">Spelling</button>
           <button type="button" class="btn btn-outline-dark" onclick="setCheckFilter('fda')">FDA</button>

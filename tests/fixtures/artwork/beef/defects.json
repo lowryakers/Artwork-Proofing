@@ -14,7 +14,11 @@
       "expect": {
         "critical_count": 1,
         "check": "front_callout",
-        "message_contains": "calorie",
+        "message_contains": [
+          "calories",
+          "100",
+          "130"
+        ],
         "no_other_findings": true
       },
       "why": "Front ring reads 100 Calories Per Serving; the file's own NFP and approved F-00068 v1.0 read 130. Three of the four rings are correct, so a check that binds a ring to the wrong value either misses this or fires on a correct ring. Calories is a do-not-exceed nutrient (21 CFR 101.9(g)(5)): 130 against a declared 100 is 130%, so CRITICAL."

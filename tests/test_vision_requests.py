@@ -114,13 +114,17 @@ def _run():
         n = len(bodies)
         diag = []
         pe._read_front_callouts(ring_img, [0.25, 0.25, 0.4375, 0.75], diag=diag)
-        sent = [c for b in bodies[n:] for m in b['messages'] for c in m['content'] if c.get('type') == 'image']
-        got = Image.open(_io.BytesIO(_b64.b64decode(sent[0]['source']['data']))).convert('L') if sent else None
+        sent = [Image.open(_io.BytesIO(_b64.b64decode(c['source']['data']))).convert('L')
+                for b in bodies[n:] for m in b['messages'] for c in m['content'] if c.get('type') == 'image']
+        # 2x2 tiles with 15% overlap: the top-left tile spans 0-57.5% of each axis.
+        # The panel (x 407-701, y 300-900 of 1600x1200) falls in it at x 44-76%,
+        # y 44-100%; the ring (x 1000-1100, y 400-500) only in the right-hand tiles.
+        tl_ = sent[0] if sent else None
+        panel_white = tl_ is not None and tl_.crop((int(tl_.width * 0.47), int(tl_.height * 0.47),
+                                                   int(tl_.width * 0.73), int(tl_.height * 0.97))).getextrema()[0] > 200
         check(f'front rings: a located panel is masked and the ring beside it kept ({diag[:1]})',
-              got is not None and 'panel masked at' in diag[0]
-              and got.crop((int(got.width * 0.27), int(got.height * 0.27), int(got.width * 0.42),
-                            int(got.height * 0.7))).getextrema()[0] > 200
-              and got.getextrema()[0] < 60)
+              len(sent) == 4 and 'panel masked at' in diag[0] and panel_white
+              and min(t.getextrema()[0] for t in sent[1:]) < 60)
         diag = []
         pe._read_front_callouts(tmp, [0.1, 0.2, 0.4, 0.8], diag=diag)
         check(f'front rings: the read records the artwork size, masking and what came back ({diag})',
