@@ -263,6 +263,35 @@ def _run():
     finally:
         pe.ANTHROPIC_AVAILABLE, pe._anthropic = _prev
 
+    # ── 3b5. An empty-looking %DV column is confirmed before it is reported ──
+    # CI run 38814047567: weak full reads (15-18 fields, no %DV, count 0) on two
+    # panels with a full %DV column gave false column CRITICALs.
+    for _label, _conf, _want in (('confirmation lists percentages', ['3%', '0%', '11%'], 3),
+                                 ('confirmation also finds none', [], 0)):
+        _replies4 = iter([json.dumps(dict(_full, serving_size_g=37, serving_size_text='1 bottle (37g)',
+                                          dv_header=True, dv_percent_count=0)),
+                          json.dumps({'dv_percents': _conf})])
+        pe.ANTHROPIC_AVAILABLE = True
+        pe._anthropic = types.SimpleNamespace(Anthropic=lambda api_key=None: types.SimpleNamespace(
+            messages=types.SimpleNamespace(create=lambda **k: _R(next(_replies4)))))
+        try:
+            d = []
+            got = pe._read_nfp_panel(_tmp, [0.2, 0.2, 0.8, 0.8], diag=d)
+            check(f'%DV column: count 0, {_label} -> dv_percent_count {_want} (got {got.get("dv_percent_count")})',
+                  got.get('dv_percent_count') == _want and any('confirmation read' in x for x in d))
+        finally:
+            pe.ANTHROPIC_AVAILABLE, pe._anthropic = _prev
+
+    # Text bands: full width, top to bottom, overlapping, each within budget.
+    import io as _io
+    _tall = _Img.new('RGB', (1060, 4761), 'white')
+    _b = pe._jpeg_bands(_tall)
+    _sizes = [_Img.open(_io.BytesIO(x)).size for x in _b]
+    check(f'text bands: every band full width and within the pixel budget ({_sizes})',
+          len(_b) >= 4 and all(w == 1060 and w * h <= pe._API_PIXELS for w, h in _sizes)
+          and sum(h for _, h in _sizes) > 4761)
+    check('text bands: a small crop is one image', len(pe._jpeg_bands(_Img.new('RGB', (800, 600)))) == 1)
+
     # ── 3c. Master-list fetch retries transient failures with backoff ───────
     _orig_fetch, _orig_sleep = A._fetch_sheet_rows, A.time.sleep
     calls = []

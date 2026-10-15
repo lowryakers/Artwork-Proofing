@@ -1352,6 +1352,15 @@ def _read_front_callouts(img_path: str, nfp_bbox=None, diag: list = None) -> dic
         return {}
 
 
+_NFP_DV_COLUMN_PROMPT = (
+    'This image is a crop of ONE Nutrition Facts panel. It may be MIRROR-REVERSED or rotated; '
+    'read it correctly oriented. Look only at the "% Daily Value" column on the right of the '
+    'table. List every percentage printed in that column, top to bottom, exactly as printed '
+    '(e.g. "3%", "0%"). Return ONLY this JSON object: {"dv_percents": ["3%", ...]} — an empty '
+    'list if the column header is printed but no row prints a percentage — or '
+    '{"dv_percents": null} if you cannot see the column clearly.')
+
+
 _NFP_RING_FIELDS_PROMPT = (
     'This image is a crop of ONE Nutrition Facts panel. It may be MIRROR-REVERSED or rotated; '
     'read it correctly oriented. Read ONLY these rows of the bordered Nutrition Facts table — '
@@ -1719,6 +1728,25 @@ def _read_nfp_panel(img_path: str, bbox, diag: list = None) -> dict:
 
         _client = _anthropic.Anthropic(api_key=os.environ['ANTHROPIC_API_KEY'])
 
+        def _read_dv_column(pim):
+            # [percentages printed in the %DV column], or None if unreadable.
+            try:
+                _b = io.BytesIO()
+                pim.save(_b, format='JPEG', quality=95)
+                _msg = _client.messages.create(
+                    model='claude-sonnet-4-6', max_tokens=300, extra_body={'temperature': 0},
+                    messages=[{'role': 'user', 'content': [
+                        {'type': 'image', 'source': {'type': 'base64', 'media_type': 'image/jpeg',
+                                                     'data': base64.standard_b64encode(_b.getvalue()).decode('utf-8')}},
+                        {'type': 'text', 'text': _NFP_DV_COLUMN_PROMPT}]}])
+                _t = next((b.text for b in (_msg.content or []) if getattr(b, 'text', None)), '')
+                data, _ = json.JSONDecoder().raw_decode(_t[_t.find('{'):])
+                v = data.get('dv_percents')
+                return [str(x) for x in v] if isinstance(v, list) else None
+            except Exception as _e:
+                diag.append(f'%DV column confirmation failed: {_e}')
+                return None
+
         def _read_crop(pim, label, prompt=_NFP_CROP_PROMPT):
             _b = io.BytesIO()
             pim.save(_b, format='JPEG', quality=95)
@@ -1805,6 +1833,20 @@ def _read_nfp_panel(img_path: str, bbox, diag: list = None) -> dict:
         # crop (front_callout trusts nothing else). A full read that left one
         # out gets one focused re-read of the same image (CI run 38808063967:
         # the chocolate pancake's 4521x2907 panel read 22 fields, no protein).
+        # An apparently empty %DV column is confirmed by a second, focused read
+        # before anything is reported: a weak full read (CI run 38814047567:
+        # 15-18 fields, no %DV, a count of 0) is not evidence of an empty column.
+        _dv_read = any(best.get(g) is not None for g in _NFP_CROP_FIELDS if g.endswith('_dv'))
+        if best and not _dv_read and (best.get('dv_percent_count') == 0 or best.get('dv_blank')):
+            _conf = _read_dv_column(best_img)
+            diag.append(f'%DV column confirmation read: {_conf!r}')
+            if _conf is None:
+                best.pop('dv_percent_count', None)
+                best['dv_blank'] = []
+            elif _conf:
+                best['dv_percent_count'], best['dv_blank'] = len(_conf), []
+            else:
+                best['dv_percent_count'] = 0
         _ring = [k for k in ('calories', 'protein_g', 'added_sugar_g') if best.get(k) is None]
         if best and _ring:
             _again = _read_crop(best_img, 'ring-field re-read', _NFP_RING_FIELDS_PROMPT)
@@ -1861,7 +1903,32 @@ def _jpeg_tiles(img, overlap: float = 0.15) -> list:
     return out
 
 
-def _read_near_panel(img_path: str, bbox, prompt: str, accept, max_tokens: int = 300):
+def _jpeg_bands(img, max_long: int = 1400, overlap: float = 0.12) -> list:
+    """`img` as JPEG bytes in full-width horizontal bands, top to bottom, each
+    within the API's pixel budget. For copying text: a 2x2 grid splits every
+    printed line at the vertical seam and the read copies half of each (CI run
+    38814047567: "SteviaLe", "CocoaPow"); a band never cuts a line across."""
+    import io
+    if img.width > max_long:
+        s = max_long / float(img.width)
+        img = img.resize((max_long, max(1, int(img.height * s))))
+    w, h = img.size
+    band_h = max(1, min(h, int(_API_PIXELS / w)))
+    n = max(1, -(-h // band_h))
+    if n > 1:
+        n = max(1, -(-int(h * (1 + overlap)) // band_h))
+    out = []
+    for i in range(n):
+        y0 = max(0, int(i * h / n - overlap * band_h / 2))
+        y1 = min(h, y0 + band_h)
+        b = io.BytesIO()
+        img.crop((0, y0, w, y1)).save(b, format='JPEG', quality=92)
+        out.append(b.getvalue())
+    return out
+
+
+def _read_near_panel(img_path: str, bbox, prompt: str, accept, max_tokens: int = 300,
+                     bands: bool = False, pad_x: float = 0.6):
     """Ask about the text around the Nutrition Facts panel — a padded crop of
     the panel's box, turned upright, tried as is, rotated 180 and mirrored.
     `accept(data)` returns the answer to keep from the reply JSON, or None to
@@ -1873,7 +1940,7 @@ def _read_near_panel(img_path: str, bbox, prompt: str, accept, max_tokens: int =
         im = Image.open(img_path).convert('RGB')
         W, H = im.size
         x0, y0, x1, y1 = bbox
-        pw, ph = (x1 - x0) * 0.6, (y1 - y0) * 0.6
+        pw, ph = (x1 - x0) * pad_x, (y1 - y0) * 0.6
         box = (max(0, int((x0 - pw) * W)), max(0, int((y0 - ph) * H)),
                min(W, int((x1 + pw) * W)), min(H, int((y1 + ph) * H)))
         if box[2] - box[0] < 8 or box[3] - box[1] < 8:
@@ -1882,9 +1949,11 @@ def _read_near_panel(img_path: str, bbox, prompt: str, accept, max_tokens: int =
         _client = _anthropic.Anthropic(api_key=os.environ['ANTHROPIC_API_KEY'])
         for _t in (None, Image.ROTATE_180, Image.FLIP_LEFT_RIGHT):
             pim = crop if _t is None else crop.transpose(_t)
-            tiles = _jpeg_tiles(pim)
-            _lead = ([{'type': 'text', 'text': 'These images are overlapping tiles of one crop.'}]
-                     if len(tiles) > 1 else [])
+            tiles = _jpeg_bands(pim) if bands else _jpeg_tiles(pim)
+            _lead = ([{'type': 'text', 'text': (
+                'These images are overlapping horizontal bands of one crop, top to bottom; a line '
+                'in the overlap appears twice — copy it once.' if bands else
+                'These images are overlapping tiles of one crop.')}] if len(tiles) > 1 else [])
             _msg = _client.messages.create(
                 model='claude-sonnet-4-6', max_tokens=max_tokens, extra_body={'temperature': 0},
                 messages=[{'role': 'user', 'content': _lead + [
@@ -1972,7 +2041,11 @@ def _read_ingredients_verbatim(img_path: str, bbox):
             if text.count(',') >= 2:
                 return re.sub(r'(?i)^\s*ingredients?\s*:?\s*', '', text)
         return None
-    return _read_near_panel(img_path, bbox, _INGREDIENTS_VERBATIM_PROMPT, _accept, max_tokens=900)
+    # Bands, not a 2x2 grid, so no printed line is cut; the statement sits
+    # above or below the panel at about its width, so a narrow side margin
+    # keeps the text large.
+    return _read_near_panel(img_path, bbox, _INGREDIENTS_VERBATIM_PROMPT, _accept, max_tokens=1200,
+                            bands=True, pad_x=0.15)
 
 
 # Live-text path: on hold until live-text PDFs are confirmed available from the
