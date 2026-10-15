@@ -1,5 +1,5 @@
 {
-  "note": "Expected output per clean artwork file. Verified against the Nutrition Facts panel PDFs issued by the formulator (F-00060/F-00010/F-00061/F-00002, No-Erythritol generation) and against the artwork itself.",
+  "note": "Expected output per clean artwork file. Verified against the Nutrition Facts panel PDFs issued by the formulator (F-00060/F-00010/F-00061/F-00002, No-Erythritol generation) and against the artwork itself. overall_status is REVIEW, not CLEAN: all four pouches print the DSHEA disclaimer (\"These statements have not been evaluated by the FDA...\") on a conventional food, which the claims check rightly sends to a person; earlier CLEAN results were the detector missing it (CI run 38784993759).",
   "files": [
     {
       "file": "86974_PD_pancake_buttermilk_26.10.02-ok.pdf",
@@ -17,10 +17,13 @@
           "PMS 304 C",
           "PMS 9224 U"
         ],
-        "overall_status": "CLEAN",
+        "overall_status": "REVIEW",
         "critical_count": 0,
         "warning_count": 0,
-        "panel_field_source": "nfp_crop"
+        "panel_field_source": "nfp_crop",
+        "reviews_only_from": [
+          "claims"
+        ]
       }
     },
     {
@@ -39,10 +42,13 @@
           "PMS 470 C",
           "PMS 475 C"
         ],
-        "overall_status": "CLEAN",
+        "overall_status": "REVIEW",
         "critical_count": 0,
         "warning_count": 0,
-        "panel_field_source": "nfp_crop"
+        "panel_field_source": "nfp_crop",
+        "reviews_only_from": [
+          "claims"
+        ]
       }
     },
     {
@@ -61,10 +67,13 @@
           "PMS 1565 C",
           "PMS 9184 C"
         ],
-        "overall_status": "CLEAN",
+        "overall_status": "REVIEW",
         "critical_count": 0,
         "warning_count": 0,
-        "panel_field_source": "nfp_crop"
+        "panel_field_source": "nfp_crop",
+        "reviews_only_from": [
+          "claims"
+        ]
       }
     },
     {
@@ -83,10 +92,13 @@
           "PMS 7580 C",
           "PMS 7506 C"
         ],
-        "overall_status": "CLEAN",
+        "overall_status": "REVIEW",
         "critical_count": 0,
         "warning_count": 0,
-        "panel_field_source": "nfp_crop"
+        "panel_field_source": "nfp_crop",
+        "reviews_only_from": [
+          "claims"
+        ]
       }
     }
   ]

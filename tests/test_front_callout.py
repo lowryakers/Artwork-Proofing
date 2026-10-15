@@ -128,6 +128,28 @@ def _run():
     check('"<1" ring equals "<1" NFP, and never equals 0',
           pe._same_amount('<1', '<1') and not pe._same_amount(0.0, '<1'))
 
+    # ── The same tiled read copies the DSHEA disclaimer (mocked API) ────────
+    import json, tempfile, types
+    from PIL import Image
+    tmp = os.path.join(tempfile.mkdtemp(), 'p.png')
+    Image.new('RGB', (1600, 1200), 'white').save(tmp)
+    reply = json.dumps({'rings': [{'position': 'a', 'number': '130', 'caption': 'Calories Per Serving'}],
+                        'disclaimer': '*These statements have not been evaluated by the FDA.'})
+
+    class _R:
+        content, stop_reason = [types.SimpleNamespace(text=reply)], 'end_turn'
+    prev = (pe.ANTHROPIC_AVAILABLE, pe._anthropic)
+    os.environ.setdefault('ANTHROPIC_API_KEY', 'test')
+    pe.ANTHROPIC_AVAILABLE = True
+    pe._anthropic = types.SimpleNamespace(Anthropic=lambda api_key=None: types.SimpleNamespace(
+        messages=types.SimpleNamespace(create=lambda **k: _R())))
+    try:
+        got = pe._read_front_callouts(tmp, None)
+        check('the tiled read returns the rings and the disclaimer it copied',
+              len(got['rings']) == 1 and got['disclaimer'].startswith('*These statements'))
+    finally:
+        pe.ANTHROPIC_AVAILABLE, pe._anthropic = prev
+
     print()
     if fails:
         print('FAILURES:', *fails, sep='\n  - ')

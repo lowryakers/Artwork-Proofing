@@ -1079,10 +1079,13 @@ _FRONT_CROP_PROMPT = (
     '"number": "<the big number exactly as printed, with any unit or % sign, e.g. \\"130\\", '
     '\\"26G\\", \\"100%\\"; null if you cannot read it>", "caption": "<the caption printed in '
     'that same badge, exactly as printed, e.g. \\"Calories Per Serving\\"; null if you cannot read '
-    'it>"}]}\n'
+    'it>"}], "disclaimer": "<the full text of any disclaimer that begins \\"These statements have '
+    'not been evaluated\\", copied exactly as printed anywhere on the artwork (it may be small or '
+    'upside down); null if none is printed>"}\n'
     'Transcribe only. Do NOT correct, infer or reconcile any number against anything else on the '
     'package (including the Nutrition Facts panel): a badge that prints 100 is "100" even if you '
-    'believe it should be something else. Return {"rings": []} if there are no badges.')
+    'believe it should be something else. Return {"rings": [], "disclaimer": null} if there are no '
+    'badges and no disclaimer.')
 
 # Ring caption -> the NFP field it declares. "Sugar" alone does not say added
 # or total, so it binds to nothing (NOT EVALUATED) rather than to a guess.
@@ -1261,9 +1264,10 @@ def _read_front_callouts(img_path: str, nfp_bbox=None, diag: list = None) -> dic
     the whole artwork is read — never a vision-estimated ring box: on the
     bottle sleeves that box landed half on the back panel, and masking with
     vision's rough panel box erased the left ring column (CI runs 38305043657,
-    38308802272). Returns {'rings': [<badge as transcribed>, ...]} (exact
-    duplicates from overlapping tiles removed) or {} on failure, and records
-    why in `diag`. Never raises. _check_front_callout binds and compares."""
+    38308802272). Returns {'rings': [<badge as transcribed>, ...] (exact
+    duplicates from overlapping tiles removed), 'disclaimer': <the DSHEA
+    disclaimer copied verbatim, or None>} or {} on failure, and records why in
+    `diag`. Never raises. _check_front_callout binds and compares."""
     diag = diag if diag is not None else []
     if not (ANTHROPIC_AVAILABLE and PIL_AVAILABLE):
         diag.append('not attempted: vision unavailable')
@@ -1329,10 +1333,14 @@ def _read_front_callouts(img_path: str, nfp_bbox=None, diag: list = None) -> dic
                 continue
             seen.add(key)
             rings.append(r)
+        disclaimer = data.get('disclaimer') if isinstance(data.get('disclaimer'), str) else None
         diag.append(f'{len(tiles)} tiles {_sent}B sent; stop={_stop}; {len(rings)} rings: '
                     + ', '.join(f'{r.get("position") or "?"}: {r.get("number")} / {r.get("caption")}'
-                                for r in rings))
-        return {'rings': rings}
+                                for r in rings)
+                    + f'; disclaimer {"read" if disclaimer else "none"}')
+        # The same high-resolution read also copies the DSHEA disclaimer: the
+        # full-page pass missed it intermittently on the pouch back panels.
+        return {'rings': rings, 'disclaimer': disclaimer}
     except Exception as _e:
         diag.append(f'error: {type(_e).__name__}: {_e}')
         print(f'[vision] front-callout crop read failed: {_e}')
@@ -2362,9 +2370,15 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
     # the prior proofed version for this SKU from stored history (ReadyDoc → local).
     _snapshot = _build_label_snapshot(label_text, _panel, vision_nutrition,
                                       reader_source='vision' if _label_is_vision else 'ocr')
-    # DSHEA disclaimer detection is robust to vision omitting it from raw_text: the
-    # first pass reports it as a structured boolean, OR-ed with the text regex.
-    _snapshot['dshea_disclaimer'] = bool(_snapshot.get('dshea_disclaimer')) or vision_dshea
+    # DSHEA disclaimer: any of three reads — the label text, vision's structured
+    # flag, or the Tesseract passes (which include the upside-down back-panel
+    # reads). Vision alone missed it intermittently on the pancake pouches, all
+    # four of which print it (CI run 38784993759): a correct REVIEW that came
+    # and went between runs of the same file.
+    _dshea_re = r'statements\s+have\s+not\s+been\s+evaluated'
+    _snapshot['dshea_disclaimer'] = (bool(_snapshot.get('dshea_disclaimer')) or vision_dshea
+                                     or bool(re.search(_dshea_re, combined_text, re.I))
+                                     or bool(re.search(_dshea_re, (_front_read or {}).get('disclaimer') or '', re.I)))
     _prior_snapshot = _fetch_prior_snapshot(_gtin_lookup, _sku_lookup)
 
     # Approved-nutrition-panel comparison (the outside-the-artwork source of
