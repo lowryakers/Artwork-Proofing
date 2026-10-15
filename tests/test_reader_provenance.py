@@ -263,25 +263,6 @@ def _run():
     finally:
         pe.ANTHROPIC_AVAILABLE, pe._anthropic = _prev
 
-    # ── 3b5. An empty-looking %DV column is confirmed before it is reported ──
-    # CI run 38814047567: weak full reads (15-18 fields, no %DV, count 0) on two
-    # panels with a full %DV column gave false column CRITICALs.
-    for _label, _conf, _want in (('confirmation lists percentages', ['3%', '0%', '11%'], 3),
-                                 ('confirmation also finds none', [], 0)):
-        _replies4 = iter([json.dumps(dict(_full, serving_size_g=37, serving_size_text='1 bottle (37g)',
-                                          dv_header=True, dv_percent_count=0)),
-                          json.dumps({'dv_percents': _conf})])
-        pe.ANTHROPIC_AVAILABLE = True
-        pe._anthropic = types.SimpleNamespace(Anthropic=lambda api_key=None: types.SimpleNamespace(
-            messages=types.SimpleNamespace(create=lambda **k: _R(next(_replies4)))))
-        try:
-            d = []
-            got = pe._read_nfp_panel(_tmp, [0.2, 0.2, 0.8, 0.8], diag=d)
-            check(f'%DV column: count 0, {_label} -> dv_percent_count {_want} (got {got.get("dv_percent_count")})',
-                  got.get('dv_percent_count') == _want and any('confirmation read' in x for x in d))
-        finally:
-            pe.ANTHROPIC_AVAILABLE, pe._anthropic = _prev
-
     # Text bands: full width, top to bottom, overlapping, each within budget.
     import io as _io
     _tall = _Img.new('RGB', (1060, 4761), 'white')

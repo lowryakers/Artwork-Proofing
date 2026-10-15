@@ -1352,15 +1352,6 @@ def _read_front_callouts(img_path: str, nfp_bbox=None, diag: list = None) -> dic
         return {}
 
 
-_NFP_DV_COLUMN_PROMPT = (
-    'This image is a crop of ONE Nutrition Facts panel. It may be MIRROR-REVERSED or rotated; '
-    'read it correctly oriented. Look only at the "% Daily Value" column on the right of the '
-    'table. List every percentage printed in that column, top to bottom, exactly as printed '
-    '(e.g. "3%", "0%"). Return ONLY this JSON object: {"dv_percents": ["3%", ...]} — an empty '
-    'list if the column header is printed but no row prints a percentage — or '
-    '{"dv_percents": null} if you cannot see the column clearly.')
-
-
 _NFP_RING_FIELDS_PROMPT = (
     'This image is a crop of ONE Nutrition Facts panel. It may be MIRROR-REVERSED or rotated; '
     'read it correctly oriented. Read ONLY these rows of the bordered Nutrition Facts table — '
@@ -1407,9 +1398,7 @@ _NFP_CROP_PROMPT = (
     'The % Daily Value column: every *_dv field is the integer printed in that row\'s % Daily '
     'Value cell; the string "blank" if the row prints an amount but its % Daily Value cell is '
     'EMPTY (nothing printed where the percentage would go); null only if you cannot read it. Also '
-    'return "dv_header": true if the "% Daily Value" column header is printed, else false; and '
-    '"dv_percent_count": the number of rows that print a percentage in the % Daily Value column '
-    '(0 if the header is printed but not one row prints a percentage).\n'
+    'return "dv_header": true if the "% Daily Value" column header is printed, else false.\n'
     'Take servings-per-container ONLY from the literal "servings per container" line — '
     'never a "Makes N" count. Read every row you can actually see. Numbers only, no units, '
     'EXCEPT: a value printed as a threshold form ("<1", "<5", etc. — below the FDA rounding '
@@ -1464,6 +1453,117 @@ def _parse_nfp_amount(v):
         if m:
             return float(m.group(0))
     return None
+
+
+def _panel_rules(img, width: int = 900):
+    """The Nutrition Facts panel's horizontal rules in `img`: [(y, x0, x1)] in
+    the coordinates of `img` scaled to `width` px wide, that scale, and the
+    scaled grey image. A rule is a dark run with the panel's white ground at
+    both ends — the artwork around a panel is not white, so runs there never
+    qualify — and the panel's rules all end at its right inner edge, so the
+    largest set sharing a right end is the panel (the crop may be far wider:
+    the chocolate pancake's panel is a fifth of its crop). Thin rules are
+    thickened before the downscale so they survive it."""
+    g = img.convert('L')
+    sc = min(1.0, width / float(g.width))
+    size = (max(1, int(g.width * sc)), max(1, int(g.height * sc)))
+    # Binarise at full resolution, then shrink: a cell is dark if any pixel
+    # in it is, white only if all are — a one-pixel rule survives any shrink.
+    dark = g.point(lambda v: 255 if v < 110 else 0).resize(size, Image.BOX)
+    white = g.point(lambda v: 255 if v > 200 else 0).resize(size, Image.BOX)
+    if sc == 1.0:
+        g_out = g
+    else:
+        g_out = dark.point(lambda v: 0 if v > 0 else 255)
+    W, H = size
+    dk, wt = dark.load(), white.load()
+    runs, min_run = [], max(20, 0.06 * W)
+    for y in range(H):
+        run, start = 0, 0
+        for x in range(W):
+            if dk[x, y] > 0:
+                if run == 0:
+                    start = x
+                run += 1
+            else:
+                # Every qualifying run, not only the row's longest: light
+                # lettering on dark artwork bounds runs too, but those end
+                # all over the place, and the grouping below leaves them out.
+                if run >= min_run and start > 0 and wt[x, y] >= 250 and wt[start - 1, y] >= 250:
+                    runs.append((y, start, x))
+                run = 0
+    g = g_out
+    tol = max(3, int(0.01 * W))
+    groups = {}
+    for r in runs:
+        key = next((k for k in groups if abs(k - r[2]) <= tol), r[2])
+        groups.setdefault(key, []).append(r)
+
+    def _distinct(rs):
+        ys = sorted({r[0] for r in rs})
+        return sum(1 for i, y in enumerate(ys) if i == 0 or y - ys[i - 1] > 1)
+    rules = max(groups.values(), key=_distinct, default=[])
+    # A panel's rules span most of it: drop short underlines from the group's width.
+    if rules:
+        span = max(r[2] for r in rules) - min(r[1] for r in rules)
+        rules = sorted(r for r in rules if r[2] - r[1] >= 0.4 * span)
+    if _distinct(rules) < 4:
+        rules = []
+    return rules, sc, g
+
+
+def _nfp_rect_from_rules(img):
+    """The Nutrition Facts panel's rectangle in `img` (px), from its rules,
+    padded for the title above the first rule and the footnote below the last;
+    None without at least four rules. CI run 38818908500: vision boxed the
+    chocolate pancake's panel with the instructions beside it, the crop came
+    out 4709x2907 px, and the Protein and Added Sugars rows were too small to
+    read once it was shrunk to the API's budget."""
+    try:
+        rules, sc, _g = _panel_rules(img, width=min(900, img.width))
+        if not rules:
+            return None
+        x0, x1 = min(r[1] for r in rules) / sc, max(r[2] for r in rules) / sc
+        y0, y1 = rules[0][0] / sc, rules[-1][0] / sc
+        w, h = x1 - x0, y1 - y0
+        return (max(0, int(x0 - 0.04 * w)), max(0, int(y0 - 0.18 * h)),
+                min(img.width, int(x1 + 0.04 * w)), min(img.height, int(y1 + 0.16 * h)))
+    except Exception:
+        return None
+
+
+def _dv_column_ink(img):
+    """(text lines with ink in the % Daily Value strip, text lines) between the
+    Nutrition Facts panel's first and last horizontal rule, or None when the
+    rules are not found. `img` is the upright panel crop as read.
+
+    The %DV strip is the right 16% of the rules' width. A populated column
+    puts ink there on every nutrient row (14 on the whey bottles); an empty
+    one only on the serving size, calories and header lines (3 on Blueberry
+    Muffin)."""
+    try:
+        rules, _sc, g = _panel_rules(img)
+        if not rules:
+            return None
+        px = g.load()
+        left, right = min(r[1] for r in rules), max(r[2] for r in rules)
+        s0 = right - int((right - left) * 0.16)
+        rule_rows = {r[0] for r in rules}
+        lines, cur = [], None
+        for y in range(rules[0][0], rules[-1][0] + 1):
+            inked = y not in rule_rows and any(px[x, y] < 110 for x in range(left, right))
+            if inked:
+                r = any(px[x, y] < 110 for x in range(s0, right - 1))
+                cur = [y, y, r] if cur is None else [cur[0], y, cur[2] or r]
+            elif cur is not None:
+                lines.append(cur)
+                cur = None
+        if cur is not None:
+            lines.append(cur)
+        lines = [l for l in lines if l[1] - l[0] >= 3]
+        return sum(1 for l in lines if l[2]), len(lines)
+    except Exception:
+        return None
 
 
 def _largest_white_region_bbox_frac(im, white_threshold: int = 238, min_frac: float = 0.15,
@@ -1723,29 +1823,17 @@ def _read_nfp_panel(img_path: str, bbox, diag: list = None) -> dict:
                 c = c.resize((max(1, int(c.width * s)), max(1, int(c.height * s))))
             return c
 
+        # A crop much larger than the panel its rules outline is narrowed to
+        # it, so the rows keep their size once shrunk to the API's budget.
+        _rect = _nfp_rect_from_rules(crop)
+        if _rect and (_rect[2] - _rect[0]) * (_rect[3] - _rect[1]) < 0.5 * crop.width * crop.height:
+            diag.append(f'crop {crop.width}x{crop.height}px narrowed to the panel\'s rules '
+                        f'{_rect[2] - _rect[0]}x{_rect[3] - _rect[1]}px')
+            crop = crop.crop(_rect)
         _untightened = candidate if bbox and crop is not candidate else None
         crop = _prep(crop)
 
         _client = _anthropic.Anthropic(api_key=os.environ['ANTHROPIC_API_KEY'])
-
-        def _read_dv_column(pim):
-            # [percentages printed in the %DV column], or None if unreadable.
-            try:
-                _b = io.BytesIO()
-                pim.save(_b, format='JPEG', quality=95)
-                _msg = _client.messages.create(
-                    model='claude-sonnet-4-6', max_tokens=300, extra_body={'temperature': 0},
-                    messages=[{'role': 'user', 'content': [
-                        {'type': 'image', 'source': {'type': 'base64', 'media_type': 'image/jpeg',
-                                                     'data': base64.standard_b64encode(_b.getvalue()).decode('utf-8')}},
-                        {'type': 'text', 'text': _NFP_DV_COLUMN_PROMPT}]}])
-                _t = next((b.text for b in (_msg.content or []) if getattr(b, 'text', None)), '')
-                data, _ = json.JSONDecoder().raw_decode(_t[_t.find('{'):])
-                v = data.get('dv_percents')
-                return [str(x) for x in v] if isinstance(v, list) else None
-            except Exception as _e:
-                diag.append(f'%DV column confirmation failed: {_e}')
-                return None
 
         def _read_crop(pim, label, prompt=_NFP_CROP_PROMPT):
             _b = io.BytesIO()
@@ -1799,8 +1887,6 @@ def _read_nfp_panel(img_path: str, bbox, diag: list = None) -> dict:
                 out['dv_blank'] = dv_blank
                 if isinstance(data.get('dv_header'), bool):
                     out['dv_header'] = data['dv_header']
-                if isinstance(data.get('dv_percent_count'), int) and not isinstance(data['dv_percent_count'], bool):
-                    out['dv_percent_count'] = data['dv_percent_count']
             return out
 
         def _score(d):
@@ -1833,20 +1919,19 @@ def _read_nfp_panel(img_path: str, bbox, diag: list = None) -> dict:
         # crop (front_callout trusts nothing else). A full read that left one
         # out gets one focused re-read of the same image (CI run 38808063967:
         # the chocolate pancake's 4521x2907 panel read 22 fields, no protein).
-        # An apparently empty %DV column is confirmed by a second, focused read
-        # before anything is reported: a weak full read (CI run 38814047567:
-        # 15-18 fields, no %DV, a count of 0) is not evidence of an empty column.
-        _dv_read = any(best.get(g) is not None for g in _NFP_CROP_FIELDS if g.endswith('_dv'))
-        if best and not _dv_read and (best.get('dv_percent_count') == 0 or best.get('dv_blank')):
-            _conf = _read_dv_column(best_img)
-            diag.append(f'%DV column confirmation read: {_conf!r}')
-            if _conf is None:
-                best.pop('dv_percent_count', None)
-                best['dv_blank'] = []
-            elif _conf:
-                best['dv_percent_count'], best['dv_blank'] = len(_conf), []
-            else:
-                best['dv_percent_count'] = 0
+        # Whether the %DV column is empty is decided from the pixels, never by
+        # vision alone: a weak read returns no %DV and a count of 0 on a full
+        # column, and a read asked to list the column invents one on an empty
+        # one (CI runs 38814047567, 38818908500). Only when no %DV was read.
+        if best and not any(best.get(g) is not None for g in _NFP_CROP_FIELDS if g.endswith('_dv')):
+            _ink = _dv_column_ink(best_img)
+            best['dv_column_empty'] = bool(_ink and _ink[0] <= 4 and _ink[1] >= 10)
+            if not best['dv_column_empty']:
+                best['dv_blank'] = []      # blank cells the pixels do not bear out
+            diag.append('%DV column ink test: ' + (
+                f'{_ink[0]} of {_ink[1]} text lines print in the %DV strip -> '
+                + ('EMPTY' if best['dv_column_empty'] else 'populated' if _ink[0] >= 8 else 'inconclusive')
+                if _ink else 'panel rules not found -> inconclusive'))
         _ring = [k for k in ('calories', 'protein_g', 'added_sugar_g') if best.get(k) is None]
         if best and _ring:
             _again = _read_crop(best_img, 'ring-field re-read', _NFP_RING_FIELDS_PROMPT)
@@ -2458,7 +2543,8 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
         # its small digits are legible instead of squashed in the full-page pass.
         nfp_read = _read_nfp_panel(img_path, vision_nfp_bbox, diag=_nfp_crop_diag)
         # %DV column marks are not panel values: keep them out of every value map.
-        _dv_marks = {k: nfp_read.pop(k) for k in ('dv_blank', 'dv_header', 'dv_percent_count') if k in nfp_read}
+        _dv_marks = {k: nfp_read.pop(k) for k in ('dv_blank', 'dv_header', 'dv_column_empty')
+                     if k in nfp_read}
         print(f'[nfp-crop] {fname} ' + ('OK ' if nfp_read else 'NOTHING READ ') + ' | '.join(_nfp_crop_diag))
         # Front call-out rings: only the isolated read (panel masked) may supply
         # them. The full-page values are kept as unconfirmed — reported, never
@@ -4396,15 +4482,15 @@ def _check_dv_populated(panel_read: dict, marks: dict) -> list:
     amount, and not one percentage — the panel read cleanly and nothing fired.
 
     marks: {'dv_blank': [*_dv fields the panel read saw printed EMPTY],
-    'dv_header': bool, 'dv_percent_count': rows printing a percentage}. Only a cell read as printed empty counts; an unreadable
+    'dv_header': bool, 'dv_column_empty': the pixel test found no %DV
+    column ink (_dv_column_ink)}. Only a cell read as printed empty counts; an unreadable
     cell is not evidence. A column whose header is printed and whose every row
     is empty is ONE finding naming the column."""
     marks = marks or {}
     blank_keys = set(marks.get('dv_blank') or ())
-    # The read counted no percentage in the column, and read none either: the
-    # whole column is empty (CI run 38808063967 — Blueberry Muffin's cells came
-    # back null, not "blank"). Never when a single %DV value was read.
-    if marks.get('dv_percent_count') == 0 and not any(
+    # The pixels show an empty column and the read found no %DV value: the
+    # whole column is empty (Blueberry Muffin). Never when one value was read.
+    if marks.get('dv_column_empty') and not any(
             panel_read.get(g[2]) is not None for g in _PANEL_DV_GROUPS):
         blank_keys |= {g[2] for g in _PANEL_DV_GROUPS}
     rows = [(label, panel_read.get(a_amt), unit, a_dv in blank_keys, panel_read.get(a_dv) is not None)

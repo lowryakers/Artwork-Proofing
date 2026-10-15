@@ -215,15 +215,58 @@ def _run():
               len(f) == 1 and all(w in f[0]['message'] for w in want)
               and f[0]['message'].count('" (') == len(want))
 
-    # ── A, CI run 38808063967: the column's cells come back null, not "blank" ──
-    f = pe._check_dv_populated(MUFFIN, {'dv_header': True, 'dv_percent_count': 0, 'dv_blank': []})
-    check('no percentage counted, none read -> one column CRITICAL', len(f) == 1 and 'column' in f[0]['message'])
-    check('count 0 but a %DV value WAS read -> no column finding (the read contradicts itself)',
-          pe._check_dv_populated(dict(MUFFIN, sodium_dv=3), {'dv_header': True, 'dv_percent_count': 0}) == [])
-    check('count > 0 -> no finding', pe._check_dv_populated(MUFFIN, {'dv_header': True, 'dv_percent_count': 11}) == [])
-    check('count 0 but the header is not printed -> per-row findings, not the column one',
-          all('column' not in i['message'] for i in pe._check_dv_populated(
-              MUFFIN, {'dv_header': False, 'dv_percent_count': 0})))
+    # ── A: the column's emptiness is decided from the pixels ────────────────
+    f = pe._check_dv_populated(MUFFIN, {'dv_header': True, 'dv_column_empty': True, 'dv_blank': []})
+    check('pixels show an empty column, no %DV read -> one column CRITICAL',
+          len(f) == 1 and 'column' in f[0]['message'])
+    check('pixels show an empty column but a %DV value WAS read -> no column finding',
+          pe._check_dv_populated(dict(MUFFIN, sodium_dv=3), {'dv_header': True, 'dv_column_empty': True}) == [])
+    check('pixels do not show an empty column -> no finding',
+          pe._check_dv_populated(MUFFIN, {'dv_header': True, 'dv_column_empty': False}) == [])
+
+    from PIL import Image, ImageDraw
+
+    def panel(dv_rows, bg=(20, 30, 80), size=(600, 1500)):
+        # A Nutrition Facts panel on dark artwork: white ground, rules, text
+        # blocks on the left, and on `dv_rows` of the 14 rows a %DV block right.
+        im = Image.new('RGB', size, bg)
+        d = ImageDraw.Draw(im)
+        L, R, T = 60, 540, 100
+        d.rectangle((L - 15, T - 15, R + 15, 1400), fill='white')
+        d.rectangle((L, T, R, T + 6), fill='black')
+        d.rectangle((L, T + 20, L + 200, T + 40), fill='black')            # serving size
+        d.rectangle((R - 120, T + 20, R, T + 40), fill='black')
+        d.rectangle((L, T + 60, R, T + 70), fill='black')
+        d.rectangle((L, T + 85, L + 150, T + 115), fill='black')           # calories
+        d.rectangle((R - 80, T + 85, R, T + 115), fill='black')
+        d.rectangle((L, T + 130, R, T + 134), fill='black')
+        d.rectangle((R - 140, T + 145, R, T + 160), fill='black')          # % Daily Value*
+        y = T + 175
+        for i in range(14):
+            d.rectangle((L, y, R, y + 2), fill='black')
+            d.rectangle((L + 5, y + 12, L + 220, y + 30), fill='black')
+            if i < dv_rows:
+                d.rectangle((R - 45, y + 12, R - 5, y + 30), fill='black')
+            y += 45
+        d.rectangle((L, y, R, y + 8), fill='black')
+        return im
+
+    empty, full = pe._dv_column_ink(panel(0)), pe._dv_column_ink(panel(11))
+    check(f'ink test: empty column -> few strip lines ({empty})', empty and empty[0] <= 4 and empty[1] >= 10)
+    check(f'ink test: populated column -> many strip lines ({full})', full and full[0] >= 8)
+    # The chocolate pancake: vision's box took in the instructions beside the
+    # panel; the crop is narrowed to the panel's own rules.
+    wide = Image.new('RGB', (2600, 1700), (60, 35, 25))
+    d = ImageDraw.Draw(wide)
+    for i in range(12):   # cream lettering on brown, ending all over the place
+        d.rectangle((900, 150 + i * 110, 900 + 300 + (i * 97) % 900, 175 + i * 110), fill=(240, 225, 200))
+    wide.paste(panel(11), (150, 100))
+    r = pe._nfp_rect_from_rules(wide)
+    check(f'narrowing: a panel a quarter of its crop is found by its rules ({r})',
+          r is not None and 150 <= r[0] <= 230 and 650 <= r[2] <= 720 and r[3] - r[1] > 1000)
+    check('narrowing: nothing panel-like -> None', pe._nfp_rect_from_rules(Image.new('RGB', (900, 900), 'gray')) is None)
+    check('ink test: no panel rules on the ground -> None (no verdict)',
+          pe._dv_column_ink(Image.new('RGB', (600, 1500), (20, 30, 80))) is None)
 
     print()
     if fails:
