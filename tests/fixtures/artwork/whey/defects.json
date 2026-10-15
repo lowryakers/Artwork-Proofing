@@ -28,9 +28,14 @@
           "% Daily Value",
           "column"
         ],
-        "no_other_findings": true
+        "other_findings_only": [
+          [
+            "Ingredient statement spacing",
+            "\"SteviaLeaf\""
+          ]
+        ]
       },
-      "why": "Every % Daily Value cell on the Nutrition Facts panel is empty; the '% Daily Value*' header and footnote are present (verified at 800 dpi, run aa5b6042). %DV is mandatory for every nutrient with an established DV. One CRITICAL naming the whole column, not one per row."
+      "why": "Every % Daily Value cell on the Nutrition Facts panel is empty; the '% Daily Value*' header and footnote are present (verified at 800 dpi, run aa5b6042). %DV is mandatory for every nutrient with an established DV. One CRITICAL naming the whole column, not one per row. The file also prints 'SteviaLeaf' (missing space), verified by eye — the only other finding allowed."
     }
   ]
 }

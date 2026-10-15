@@ -416,10 +416,12 @@ def _run():
                                           - len(exp.get('expected_warnings', [])))
         S.check(f'{key}: zero CRITICAL', not _criticals(res))
         # A file can carry known, hand-verified warnings (expected_warnings:
-        # one phrase per warning); every other graded finding is a stray.
+        # one entry per warning — a phrase, or a list of phrases that must all
+        # appear in it); every other graded finding is a stray.
         want_w = exp.get('expected_warnings', [])
         hits = [next((i for i, (_, f) in enumerate(graded) if f['severity'] == 'warning'
-                      and ph.lower() in f['message'].lower()), None) for ph in want_w]
+                      and all(p.lower() in f['message'].lower() for p in _phrases(ph))), None)
+                for ph in want_w]
         stray_w = [(k, f['message'][:70]) for i, (k, f) in enumerate(graded) if i not in hits]
         S.check(f'{key}: ' + (f'exactly the expected WARNINGs {want_w}' if want_w else 'zero WARNING / SUSPECT findings')
                 + f' (got {[(k, f["message"][:70]) for k, f in graded]})',
@@ -540,8 +542,12 @@ def _run():
         ck = CHECK_KEY[exp['check']]
         hit = (len(crits) == 1 and crits[0][0] == ck
                and all(m.lower() in crits[0][1]['message'].lower() for m in _phrases(exp['message_contains'])))
-        if exp.get('no_other_findings'):
-            others = [(k, i['message'][:70]) for k, i in _graded(res) if i['severity'] != 'critical']
+        if exp.get('no_other_findings') or 'other_findings_only' in exp:
+            # other_findings_only: hand-verified findings the file also
+            # carries (each a phrase list); anything else is a stray.
+            allowed = [_phrases(a) for a in exp.get('other_findings_only', [])]
+            others = [(k, i['message'][:70]) for k, i in _graded(res) if i['severity'] != 'critical'
+                      and not any(all(p.lower() in i['message'].lower() for p in a) for a in allowed)]
             hit = hit and not others
         else:
             others = None

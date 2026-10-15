@@ -196,7 +196,8 @@ def _run():
     from PIL import Image as _Img
     _tmp = os.path.join(tempfile.mkdtemp(), 'p.png')
     _Img.new('RGB', (1200, 1600), 'white').save(_tmp)
-    _full = {'servings_per_container': 1, 'calories': 130, 'protein_g': 26, 'total_carbohydrate_g': 5}
+    _full = {'servings_per_container': 1, 'calories': 130, 'protein_g': 26, 'total_carbohydrate_g': 5,
+             'added_sugar_g': 0}
     _replies = iter([json.dumps(dict(_full, serving_size_g=370, serving_size_text='1 bottle (37g)')),
                      json.dumps(dict(_full, serving_size_g=37, serving_size_text='1 bottle (37g)'))])
 
@@ -234,6 +235,31 @@ def _run():
         got = pe._read_nfp_panel(_tmp2, [0.33, 0.25, 0.67, 0.75], diag=d)
         check(f'panel crop: tightened read empty -> untightened box re-read ({got.get("serving_size_g")})',
               got.get('serving_size_g') == 37.0 and any('re-reading the untightened box' in x for x in d))
+    finally:
+        pe.ANTHROPIC_AVAILABLE, pe._anthropic = _prev
+
+    # ── 3b4. A ring field the full read left out gets one focused re-read ──
+    # CI run 38808063967: the chocolate pancake crop read 22 fields, no protein,
+    # so the protein ring could not be compared with a crop value.
+    _no_protein = {k: v for k, v in _full.items() if k != 'protein_g'}
+    _replies3 = iter([json.dumps(dict(_no_protein, serving_size_g=83, serving_size_text='3/4 Cup (83g)')),
+                      json.dumps({'calories': 290, 'protein_g': 19, 'added_sugar_g': None})])
+    _prompts = []
+
+    def _create3(**k):
+        _prompts.append(k['messages'][0]['content'][-1]['text'])
+        return _R(next(_replies3))
+    pe.ANTHROPIC_AVAILABLE = True
+    pe._anthropic = types.SimpleNamespace(Anthropic=lambda api_key=None: types.SimpleNamespace(
+        messages=types.SimpleNamespace(create=_create3)))
+    try:
+        d = []
+        got = pe._read_nfp_panel(_tmp, [0.2, 0.2, 0.8, 0.8], diag=d)
+        check(f'crop: protein missing from the full read -> focused re-read fills it, nothing else '
+              f'overwritten ({got.get("protein_g")}, calories {got.get("calories")})',
+              got.get('protein_g') == 19 and got.get('calories') == 130 and len(_prompts) == 2
+              and _prompts[1] is pe._NFP_RING_FIELDS_PROMPT
+              and any('ring-field re-read' in x and 'protein_g' in x for x in d))
     finally:
         pe.ANTHROPIC_AVAILABLE, pe._anthropic = _prev
 

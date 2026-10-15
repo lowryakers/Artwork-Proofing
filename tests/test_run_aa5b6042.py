@@ -186,6 +186,45 @@ def _run():
           pe._ingredient_whitespace_issues('DATEM, pH Adjuster, McIntosh Apple, Vitamin D (1,000 IU), '
                                            'Whey (Milk), Salt') == [])
 
+    # Reads from CI run 38808063967, each checked by eye on the artwork.
+    CLEAN_READS = {
+        'Key Lime Pie': 'Whey Protein Isolate, Non-Fat Milk Powder, MCT Oil Powder, Natural Flavors, contains less than 2 percent of Guar Gum, Himalayan Pink Salt, Stevia Leaf Extract (Reb A & Reb M), Spirulina Extract (color), Turmeric (color), Digestive Enzyme Blend (Protease 400 HUT, Fungal Lipase 50 FIP, Amylase 300 DU, Lactase 20 ALU)',
+        'Red Velvet (fixed)': 'Whey Protein Isolate, Non-Fat Milk Powder, MCT Oil Powder, contains less than 2 percent of Himalayan Pink Salt, Guar Gum, Natural Flavors, Stevia Leaf Extract (Reb A & Reb M), DL-Malic Acid, Citric Acid, Beet Root (color)',
+        'Pancake buttermilk': 'Oat Flour, Buttermilk Powder, Whey Protein Isolate (sunflower lecithin - as emulsifier), Rice Flour, Potato Starch, contains less than 2% of: Aluminum Free Baking Powder, Baking Soda, Xanthan Gum, Himalayan Pink Salt, Monk Fruit Extract',
+        'Beef double chocolate': 'Grass Fed Beef Protein Isolate, Bovine Collagen Peptides, Cocoa Powder (processed with alkali), Natural Flavor, Coconut Milk Powder, MCT Oil Powder, contains less than 2% of: Stevia Leaf Extract (Reb A & Reb M), Himalayan Pink Salt, Guar Gum, Xanthan Gum',
+        'Vitamins and units': 'Vitamin B12, Vitamin D3, Omega-3, Calcium (20mg), Whey (Milk), Salt',
+    }
+    for name, stmt in CLEAN_READS.items():
+        check(f'spacing: clean read ({name}) -> nothing', pe._ingredient_whitespace_issues(stmt) == [])
+    check('spacing: "Monk" / "Fruit Extract" across a line break is NOT a join (Cinnamon Swirl)',
+          pe._ingredient_whitespace_issues('Baking Soda, Xanthan Gum, Himalayan Pink Salt, Monk\n'
+                                           'Fruit Extract, Stevia Leaf Extract (Reb A & Reb M),') == [])
+    DEFECT_READS = {
+        'Glazed Donut': ('Guar Gum, Stevia Leaf Extract (Reb A& Reb M),', ['"A&"']),
+        'Mint Chocolate': ('Guar Gum, contains less than 2percent of Himalayan Pink Salt', ['"2percent"']),
+        'Pomegranate Acai': ('SteviaLeaf Extract (Reb A & Reb M), Fungal Lipase 50 FIP, Amylase300 DU, Lactase 20 ALU)',
+                             ['"SteviaLeaf"', '"Amylase300"']),
+        'Pumpkin Spice': ('Fungal Lipase 50 FIP, Amylase 300DU, Lactase 20 ALU)', ['"300DU"']),
+        'Horchata': ('Himalayan Pink Salt,Stevia Leaf Extract, Amylase 300 DU,Lactase 20 ALU)',
+                     ['"Salt,Stevia"', '"DU,Lactase"']),
+        'Cookie Crumble': ('Amylase 300 DU, Lactase 20 ALU)v', ['"ALU)v"']),
+    }
+    for name, (stmt, want) in DEFECT_READS.items():
+        f = pe._ingredient_whitespace_issues(stmt)
+        check(f'spacing: {name} -> one WARNING naming {want}',
+              len(f) == 1 and all(w in f[0]['message'] for w in want)
+              and f[0]['message'].count('" (') == len(want))
+
+    # ── A, CI run 38808063967: the column's cells come back null, not "blank" ──
+    f = pe._check_dv_populated(MUFFIN, {'dv_header': True, 'dv_percent_count': 0, 'dv_blank': []})
+    check('no percentage counted, none read -> one column CRITICAL', len(f) == 1 and 'column' in f[0]['message'])
+    check('count 0 but a %DV value WAS read -> no column finding (the read contradicts itself)',
+          pe._check_dv_populated(dict(MUFFIN, sodium_dv=3), {'dv_header': True, 'dv_percent_count': 0}) == [])
+    check('count > 0 -> no finding', pe._check_dv_populated(MUFFIN, {'dv_header': True, 'dv_percent_count': 11}) == [])
+    check('count 0 but the header is not printed -> per-row findings, not the column one',
+          all('column' not in i['message'] for i in pe._check_dv_populated(
+              MUFFIN, {'dv_header': False, 'dv_percent_count': 0})))
+
     print()
     if fails:
         print('FAILURES:', *fails, sep='\n  - ')

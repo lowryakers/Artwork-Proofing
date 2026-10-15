@@ -1352,6 +1352,15 @@ def _read_front_callouts(img_path: str, nfp_bbox=None, diag: list = None) -> dic
         return {}
 
 
+_NFP_RING_FIELDS_PROMPT = (
+    'This image is a crop of ONE Nutrition Facts panel. It may be MIRROR-REVERSED or rotated; '
+    'read it correctly oriented. Read ONLY these rows of the bordered Nutrition Facts table — '
+    'ignore any "protein options" strip with preparation text beside it. Return ONLY this JSON '
+    'object: {"calories": <number or null>, "protein_g": <grams on the Protein row, or null>, '
+    '"added_sugar_g": <grams on the Includes ... Added Sugars row, or null>}. Return null for '
+    'any value you cannot clearly read; never guess.')
+
+
 _NFP_CROP_PROMPT = (
     'This image is a crop of ONE Nutrition Facts (or Supplement Facts) panel and nothing '
     'else. It may be MIRROR-REVERSED or rotated (these are film/pouch back panels printed '
@@ -1389,7 +1398,9 @@ _NFP_CROP_PROMPT = (
     'The % Daily Value column: every *_dv field is the integer printed in that row\'s % Daily '
     'Value cell; the string "blank" if the row prints an amount but its % Daily Value cell is '
     'EMPTY (nothing printed where the percentage would go); null only if you cannot read it. Also '
-    'return "dv_header": true if the "% Daily Value" column header is printed, else false.\n'
+    'return "dv_header": true if the "% Daily Value" column header is printed, else false; and '
+    '"dv_percent_count": the number of rows that print a percentage in the % Daily Value column '
+    '(0 if the header is printed but not one row prints a percentage).\n'
     'Take servings-per-container ONLY from the literal "servings per container" line — '
     'never a "Makes N" count. Read every row you can actually see. Numbers only, no units, '
     'EXCEPT: a value printed as a threshold form ("<1", "<5", etc. — below the FDA rounding '
@@ -1708,7 +1719,7 @@ def _read_nfp_panel(img_path: str, bbox, diag: list = None) -> dict:
 
         _client = _anthropic.Anthropic(api_key=os.environ['ANTHROPIC_API_KEY'])
 
-        def _read_crop(pim, label):
+        def _read_crop(pim, label, prompt=_NFP_CROP_PROMPT):
             _b = io.BytesIO()
             pim.save(_b, format='JPEG', quality=95)
             b64 = base64.standard_b64encode(_b.getvalue()).decode('utf-8')
@@ -1720,7 +1731,7 @@ def _read_nfp_panel(img_path: str, bbox, diag: list = None) -> dict:
                 model='claude-sonnet-4-6', max_tokens=1200, extra_body={'temperature': 0},
                 messages=[{'role': 'user', 'content': [
                     {'type': 'image', 'source': {'type': 'base64', 'media_type': 'image/jpeg', 'data': b64}},
-                    {'type': 'text', 'text': _NFP_CROP_PROMPT}]}])
+                    {'type': 'text', 'text': prompt}]}])
             _stop = getattr(_msg, 'stop_reason', None)
             if _stop == 'max_tokens':
                 diag.append(f'{label}: {pim.width}x{pim.height}px {_sent}B sent; reply cut off at max_tokens')
@@ -1760,6 +1771,8 @@ def _read_nfp_panel(img_path: str, bbox, diag: list = None) -> dict:
                 out['dv_blank'] = dv_blank
                 if isinstance(data.get('dv_header'), bool):
                     out['dv_header'] = data['dv_header']
+                if isinstance(data.get('dv_percent_count'), int) and not isinstance(data['dv_percent_count'], bool):
+                    out['dv_percent_count'] = data['dv_percent_count']
             return out
 
         def _score(d):
@@ -1788,6 +1801,16 @@ def _read_nfp_panel(img_path: str, bbox, diag: list = None) -> dict:
             diag.append('tightened crop read nothing — re-reading the untightened box')
             best, best_img = _read_all(_prep(_untightened), 'untightened ')
         best = _settle_serving_g(best, lambda: _read_crop(best_img, 're-read'), diag)
+        # The values the front rings are compared with must come from this
+        # crop (front_callout trusts nothing else). A full read that left one
+        # out gets one focused re-read of the same image (CI run 38808063967:
+        # the chocolate pancake's 4521x2907 panel read 22 fields, no protein).
+        _ring = [k for k in ('calories', 'protein_g', 'added_sugar_g') if best.get(k) is None]
+        if best and _ring:
+            _again = _read_crop(best_img, 'ring-field re-read', _NFP_RING_FIELDS_PROMPT)
+            _got = {k: _again[k] for k in _ring if _again.get(k) is not None}
+            best.update(_got)
+            diag.append(f'ring-field re-read for {_ring}: ' + (f'read {_got}' if _got else 'nothing'))
         best.pop('serving_size_text', None)
         return best
     except Exception as _e:
@@ -1925,24 +1948,29 @@ def _read_disclaimer_crop(img_path: str, bbox):
 _INGREDIENTS_VERBATIM_PROMPT = (
     'This image is a crop of a food package back panel around its Nutrition Facts table. It may be '
     'upside down, rotated or MIRROR-REVERSED; read it correctly oriented. Find the ingredient '
-    'statement (it begins "Ingredients:"). Copy it CHARACTER FOR CHARACTER as printed: keep every '
-    'space and every missing space exactly as on the label. If two words are printed with no space '
-    'between them (e.g. "SteviaLeaf"), or a comma has no space after it (e.g. "Powder,Salt"), copy '
-    'them that way. Do NOT correct, normalise or reflow anything. Return ONLY this JSON object:\n'
-    '{"ingredients": "<the statement after the word Ingredients, verbatim, or null if none is '
-    'visible in this image>"}')
+    'statement (it begins "Ingredients:"). Copy it CHARACTER FOR CHARACTER, ONE PRINTED LINE PER '
+    'ARRAY ENTRY, exactly as the lines break on the label: keep every space and every missing '
+    'space. If two words are printed with no space between them (e.g. "SteviaLeaf"), or a comma '
+    'has no space after it (e.g. "Powder,Salt"), copy them that way. Do NOT join lines, correct, '
+    'normalise or reflow anything. Return ONLY this JSON object:\n'
+    '{"lines": ["<first printed line of the statement, starting after Ingredients:>", '
+    '"<second line>", ...]} or {"lines": null} if no statement is visible in this image.')
 
 
 def _read_ingredients_verbatim(img_path: str, bbox):
     """The ingredient statement copied character for character from the area
-    around the Nutrition Facts panel, spacing kept as printed. The full-page
-    transcription reflows text and silently repairs a missing space, so it
-    cannot show "SteviaLeaf" or "Powder,Himalayan" (run aa5b6042: eight of
-    sixteen files). Returns the statement text, or None. Never raises."""
+    around the Nutrition Facts panel, line by line as printed, spacing kept.
+    The full-page transcription reflows text and silently repairs a missing
+    space, so it cannot show "SteviaLeaf" or "Powder,Himalayan" (run aa5b6042:
+    eight of sixteen files). Lines are kept apart: a line break is a space, and
+    a read that joined "Monk" / "Fruit" across one reported "MonkFruit" (CI run
+    38808063967). Returns the lines joined by newlines, or None. Never raises."""
     def _accept(data):
-        t = data.get('ingredients')
-        if isinstance(t, str) and t.count(',') >= 2 and t.strip().lower() not in ('null', 'none'):
-            return re.sub(r'(?i)^\s*ingredients?\s*:?\s*', '', t.strip())
+        lines = data.get('lines')
+        if isinstance(lines, list) and all(isinstance(x, str) for x in lines):
+            text = '\n'.join(x.strip() for x in lines if x.strip())
+            if text.count(',') >= 2:
+                return re.sub(r'(?i)^\s*ingredients?\s*:?\s*', '', text)
         return None
     return _read_near_panel(img_path, bbox, _INGREDIENTS_VERBATIM_PROMPT, _accept, max_tokens=900)
 
@@ -2357,7 +2385,7 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
         # its small digits are legible instead of squashed in the full-page pass.
         nfp_read = _read_nfp_panel(img_path, vision_nfp_bbox, diag=_nfp_crop_diag)
         # %DV column marks are not panel values: keep them out of every value map.
-        _dv_marks = {k: nfp_read.pop(k) for k in ('dv_blank', 'dv_header') if k in nfp_read}
+        _dv_marks = {k: nfp_read.pop(k) for k in ('dv_blank', 'dv_header', 'dv_percent_count') if k in nfp_read}
         print(f'[nfp-crop] {fname} ' + ('OK ' if nfp_read else 'NOTHING READ ') + ' | '.join(_nfp_crop_diag))
         # Front call-out rings: only the isolated read (panel masked) may supply
         # them. The full-page values are kept as unconfirmed — reported, never
@@ -4295,10 +4323,17 @@ def _check_dv_populated(panel_read: dict, marks: dict) -> list:
     amount, and not one percentage — the panel read cleanly and nothing fired.
 
     marks: {'dv_blank': [*_dv fields the panel read saw printed EMPTY],
-    'dv_header': bool}. Only a cell read as printed empty counts; an unreadable
+    'dv_header': bool, 'dv_percent_count': rows printing a percentage}. Only a cell read as printed empty counts; an unreadable
     cell is not evidence. A column whose header is printed and whose every row
     is empty is ONE finding naming the column."""
-    blank_keys = set((marks or {}).get('dv_blank') or ())
+    marks = marks or {}
+    blank_keys = set(marks.get('dv_blank') or ())
+    # The read counted no percentage in the column, and read none either: the
+    # whole column is empty (CI run 38808063967 — Blueberry Muffin's cells came
+    # back null, not "blank"). Never when a single %DV value was read.
+    if marks.get('dv_percent_count') == 0 and not any(
+            panel_read.get(g[2]) is not None for g in _PANEL_DV_GROUPS):
+        blank_keys |= {g[2] for g in _PANEL_DV_GROUPS}
     rows = [(label, panel_read.get(a_amt), unit, a_dv in blank_keys, panel_read.get(a_dv) is not None)
             for a_amt, _p, a_dv, _pd, label, unit in _PANEL_DV_GROUPS
             if panel_read.get(a_amt) is not None]
@@ -4306,7 +4341,7 @@ def _check_dv_populated(panel_read: dict, marks: dict) -> list:
     if not blank:
         return []
     filled = [r for r in rows if r[4]]
-    if len(blank) >= 3 and not filled and (marks or {}).get('dv_header') is not False:
+    if len(blank) >= 3 and not filled and marks.get('dv_header') is not False:
         return [{'severity': 'critical', 'message': (
             'Nutrition panel prints the % Daily Value column header but the column is empty — '
             f'{", ".join(f"{label} {_fmt_amt(amt)}{unit}" for label, amt, unit in blank)} all '
@@ -5682,22 +5717,35 @@ def _check_spelling(ocr_text: str, fname: str) -> dict:
 
 # Legitimate lower->upper inside a word: pH, McIntosh / MacX surnames.
 _CAMEL_OK = re.compile(r'^(?:pH|Mc[A-Z]\w*|Mac[A-Z]\w*)$')
+# Units a number legitimately runs into: 20mg, 5g, 1st.
+_NUM_UNIT_OK = re.compile(r'\d(?:mg|mcg|g|kg|iu|oz|ml|st|nd|rd|th)\b', re.I)
+_SPACING_RULES = (
+    (lambda t: re.search(r'[a-z][A-Z]', t) and not _CAMEL_OK.match(t.strip(',.;:()')),
+     'no space between words'),
+    (lambda t: re.search(r',(?=[A-Za-z(])', t), 'no space after the comma'),
+    (lambda t: re.search(r'\w&|&\w', t), 'no space at the "&"'),
+    (lambda t: re.search(r'[a-z]\d', t)
+     or (re.search(r'\d[A-Za-z]{2,}', t) and not _NUM_UNIT_OK.search(t)), 'no space between number and word'),
+    (lambda t: re.search(r'\)[A-Za-z]', t), 'no space after the bracket'),
+)
 
 
 def _ingredient_whitespace_issues(statement: str) -> list:
-    """Missing spaces in the ingredient statement, as printed: a lowercase-to-
-    uppercase change inside a word ("SteviaLeaf", "GuarGum") or a comma with
-    no space after it ("Powder,Himalayan"). One WARNING listing every
-    instance. `statement` must be a verbatim read — a transcription that
-    reflows text repairs exactly these."""
+    """Missing spaces in the ingredient statement, as printed: two words run
+    together ("SteviaLeaf"), a comma with no space after it ("Powder,Himalayan"),
+    a glued "&" ("A& Reb M"), a number run into a word ("Amylase300", "300DU",
+    "2percent"), a character straight after a bracket ("ALU)v"). One WARNING
+    listing every instance. `statement` must be a verbatim read, one printed
+    line per line: a token is never joined across a line break."""
     if not statement:
         return []
     found = []
-    for m in re.finditer(r'[A-Za-z]*[a-z][A-Z][A-Za-z]*', statement):
-        if not _CAMEL_OK.match(m.group(0)):
-            found.append(f'"{m.group(0)}" (no space between words)')
-    for m in re.finditer(r'([A-Za-z)\]]+),(?=[A-Za-z(])([A-Za-z]*)', statement):
-        found.append(f'"{m.group(1)},{m.group(2)}" (no space after the comma)')
+    for line in statement.split('\n'):
+        for tok in line.split():
+            for test, why in _SPACING_RULES:
+                if test(tok):
+                    found.append(f'"{tok.rstrip(",.;")}" ({why})')
+                    break
     if not found:
         return []
     return [{'severity': 'warning', 'message': (
