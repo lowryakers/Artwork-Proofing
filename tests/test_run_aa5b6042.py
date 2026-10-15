@@ -126,6 +126,66 @@ def _run():
     check('right height but the box is tall and the region squat -> rejected on aspect',
           'aspect' in (pe._implausible_tightened_crop(1400, 1600, 1100, 3000) or ''))
 
+    # ── C. Allergen consistency ─────────────────────────────────────────────
+    whey = 'Whey Protein Isolate (Milk), Coconut Milk Powder, Natural Flavors, Erythritol, Guar Gum'
+    beef = 'Beef Protein Isolate, Coconut Milk Powder, Natural Flavors, Cocoa Powder, Guar Gum'
+    check('coconut maps to no allergen (not a tree nut, coconut milk is not milk)',
+          pe._ingredient_allergens(['coconut milk powder', 'coconut', 'coconut cream']) == {})
+    pw = pe._allergen_profile(whey, 'Milk, Tree Nuts')
+    f = pe._check_declared_without_source(pw)
+    check('Contains declares Tree Nuts, no ingredient sources it -> one WARNING, says coconut is not a tree nut',
+          len(f) == 1 and f[0]['severity'] == 'warning' and 'declares Tree Nuts' in f[0]['message']
+          and 'Coconut is not a tree nut' in f[0]['message'])
+    check('Milk, sourced by whey -> no finding',
+          pe._check_declared_without_source(pe._allergen_profile(whey, 'Milk')) == [])
+    check('a sub-ingredient sources it ("Lecithin (Soy)") -> no finding',
+          pe._check_declared_without_source(pe._allergen_profile(
+              'Whey (Milk), Lecithin (Soy), Salt, Sugar', 'Milk, Soy')) == [])
+    check('no ingredient statement read -> nothing (not evidence)',
+          pe._check_declared_without_source(pe._allergen_profile('', 'Milk, Tree Nuts')) == [])
+
+    def _res(name, stmt, contains):
+        return {'filename': name, 'snapshot': {'ingredients_raw': stmt}, 'checks': {},
+                'vision_allergens': {'contains_statement': contains} if contains else {}}
+    rs = [_res('Coconut_Cream_.pdf', whey, 'Milk, Tree Nuts'), _res('beef_toffee.pdf', beef, None),
+          _res('beef_vanilla.pdf', beef, None)]
+    pe._flag_allergen_consistency(rs)
+    w = {r['filename']: [i['message'] for i in r['checks'].get('fda', {}).get('issues', [])
+                         if i['severity'] == 'warning'] for r in rs}
+    check('same ingredient, declared differently across the run -> a WARNING on each side, naming '
+          'both files and the ingredient',
+          len(w['Coconut_Cream_.pdf']) == 1 and 'beef_toffee.pdf' in w['Coconut_Cream_.pdf'][0]
+          and 'beef_vanilla.pdf' in w['Coconut_Cream_.pdf'][0]
+          and 'Coconut Milk Powder' in w['Coconut_Cream_.pdf'][0]
+          and len(w['beef_toffee.pdf']) == 1 and 'Coconut_Cream_.pdf' in w['beef_toffee.pdf'][0])
+    check('...and not on every other shared ingredient (Natural Flavors, Guar Gum)',
+          not any('Natural Flavors' in m or 'Guar Gum' in m for v in w.values() for m in v))
+    check('...two beef files that agree say nothing about each other',
+          not any('beef_vanilla.pdf' in m for m in w['beef_toffee.pdf']))
+    rs = [_res('a.pdf', 'Whey Protein (Milk), Sugar, Salt', 'Milk'), _res('b.pdf', 'Whey Protein (Milk), Sugar, Cocoa', None)]
+    pe._flag_allergen_consistency(rs)
+    check('an allergen-mapped ingredient declared in one file and not the other -> WARNING',
+          any('Whey Protein' in i['message'] and 'does not declare Milk' in i['message']
+              for i in rs[1]['checks']['fda']['issues']))
+    rs = [_res('a.pdf', beef, None), _res('b.pdf', beef, None)]
+    pe._flag_allergen_consistency(rs)
+    check('coconut on files that agree -> no finding anywhere', all(not r['checks'] for r in rs))
+
+    # ── F. Ingredient-statement whitespace ──────────────────────────────────
+    f = pe._ingredient_whitespace_issues(
+        'Whey Protein Isolate (Milk), SteviaLeaf Extract, GuarGum, NaturalFlavors, MCT Oil '
+        'Powder,Himalayan Pink Salt, Citric Acid,Stevia')
+    check('every instance from the run named, in one WARNING',
+          len(f) == 1 and f[0]['severity'] == 'warning'
+          and all(x in f[0]['message'] for x in ('"SteviaLeaf"', '"GuarGum"', '"NaturalFlavors"',
+                                                  '"Powder,Himalayan"', '"Acid,Stevia"')))
+    check('a correctly spaced statement -> nothing',
+          pe._ingredient_whitespace_issues('Whey Protein Isolate (Milk), Stevia Leaf Extract, Guar Gum, '
+                                           'MCT Oil Powder, Himalayan Pink Salt') == [])
+    check('all-caps words, pH, McIntosh, "1,000" and "(Milk)," -> nothing',
+          pe._ingredient_whitespace_issues('DATEM, pH Adjuster, McIntosh Apple, Vitamin D (1,000 IU), '
+                                           'Whey (Milk), Salt') == [])
+
     print()
     if fails:
         print('FAILURES:', *fails, sep='\n  - ')

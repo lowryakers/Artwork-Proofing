@@ -75,8 +75,13 @@
         "fill_weight_g": 35.13471,
         "item_reference": "WHY-BTL-CNC",
         "critical_count": 0,
-        "warning_count": 0
-      }
+        "warning_count": 2,
+        "expected_warnings": [
+          "declares Tree Nuts",
+          "\"Powder,Himalayan\""
+        ]
+      },
+      "note": "Prints 'Contains: Milk, Tree Nuts' with no tree-nut source (Coconut Milk Powder; coconut is not a tree nut, FDA 2025), and 'Non-Fat Milk Powder,Himalayan Pink Salt' with no space after the comma. Both verified by eye on the fixture (run aa5b6042 §C, §F)."
     },
     {
       "file": "Cookie_Crumble_.pdf",

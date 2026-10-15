@@ -13,7 +13,10 @@ reports each file as an un-pulled pointer and skips this set (loudly).
 - `expected.json` — per file (29; Blueberry Muffin is a defect, below): SKU, GTIN,
   fill weight, and the converter's `Cust. Item Ref`. Verified for all 30: the decoded barcode is the master GTIN, and
   the item reference is the SKU that GTIN resolves to. Expected: zero CRITICAL and
-  zero WARNING with spot colour and trim disabled. Add `serving_size_g`,
+  zero WARNING with spot colour and trim disabled — except where a file lists
+  `expected_warnings` (hand-verified on the artwork): Coconut Cream prints
+  `Contains: Milk, Tree Nuts` with no tree-nut source (coconut is not a tree nut,
+  FDA 2025) and `Milk Powder,Himalayan` with no space after the comma. Add `serving_size_g`,
   `servings_per_container` (and optionally `serving_size_desc`,
   `declared_net_weight_g`, `overall_status`) to a file's `expect` to also assert the
   panel read and a CLEAN verdict.

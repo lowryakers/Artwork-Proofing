@@ -452,6 +452,7 @@ def _process_job(job_id: str, pdf_paths: list, gtin_rows: list, work_dir: str,
         # front-value collisions across SKUs (Check E). Run once all files are in.
         _flag_duplicate_ingredients(results)
         _flag_cross_sku_collisions(results)
+        _flag_allergen_consistency(results)
 
         summary = _build_summary(results)
         _update_job(job_id, status='done', progress=100,
@@ -1921,6 +1922,31 @@ def _read_disclaimer_crop(img_path: str, bbox):
     return _read_near_panel(img_path, bbox, _DISCLAIMER_CROP_PROMPT, _accept)
 
 
+_INGREDIENTS_VERBATIM_PROMPT = (
+    'This image is a crop of a food package back panel around its Nutrition Facts table. It may be '
+    'upside down, rotated or MIRROR-REVERSED; read it correctly oriented. Find the ingredient '
+    'statement (it begins "Ingredients:"). Copy it CHARACTER FOR CHARACTER as printed: keep every '
+    'space and every missing space exactly as on the label. If two words are printed with no space '
+    'between them (e.g. "SteviaLeaf"), or a comma has no space after it (e.g. "Powder,Salt"), copy '
+    'them that way. Do NOT correct, normalise or reflow anything. Return ONLY this JSON object:\n'
+    '{"ingredients": "<the statement after the word Ingredients, verbatim, or null if none is '
+    'visible in this image>"}')
+
+
+def _read_ingredients_verbatim(img_path: str, bbox):
+    """The ingredient statement copied character for character from the area
+    around the Nutrition Facts panel, spacing kept as printed. The full-page
+    transcription reflows text and silently repairs a missing space, so it
+    cannot show "SteviaLeaf" or "Powder,Himalayan" (run aa5b6042: eight of
+    sixteen files). Returns the statement text, or None. Never raises."""
+    def _accept(data):
+        t = data.get('ingredients')
+        if isinstance(t, str) and t.count(',') >= 2 and t.strip().lower() not in ('null', 'none'):
+            return re.sub(r'(?i)^\s*ingredients?\s*:?\s*', '', t.strip())
+        return None
+    return _read_near_panel(img_path, bbox, _INGREDIENTS_VERBATIM_PROMPT, _accept, max_tokens=900)
+
+
 # Live-text path: on hold until live-text PDFs are confirmed available from the
 # designer. Off, no file is paired or read through its text layer and every
 # check takes the OCR path. Set LIVE_TEXT_ENABLED=true to turn it on.
@@ -2640,8 +2666,23 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
         for _ai in _allergen_issues:
             _ai['kind'] = _FALCPA_ISSUE_KIND
         checks['fda'].setdefault('issues', []).extend(_allergen_issues)
+        # An allergen declared that no ingredient accounts for (run aa5b6042).
+        checks['fda']['issues'].extend(_check_declared_without_source(_allergen_profile(
+            _snapshot.get('ingredients_raw'), (vision_allergens or {}).get('contains_statement'))))
     else:
         _allergen_issues = None
+    # Ingredient-statement spacing, from a verbatim read of the back panel —
+    # the full-page transcription repairs exactly what this looks for.
+    if 'spelling' in checks and isinstance(checks['spelling'], dict) and brand_mode == 'prodough':
+        _verbatim = _read_ingredients_verbatim(img_path, vision_nfp_bbox) if vision_nfp_bbox else None
+        _snapshot['ingredients_verbatim'] = _verbatim
+        if _verbatim:
+            checks['spelling']['issues'].extend(_ingredient_whitespace_issues(_verbatim))
+        else:
+            checks['spelling'].setdefault('notes', []).append(
+                'Ingredient-statement spacing not checked — the verbatim back-panel read returned no '
+                'statement' + ('' if vision_nfp_bbox else ' (panel not located)') + '.')
+        print(f'[ingredients-verbatim] {fname} {_verbatim!r}')
     # A check this consequential never returns nothing without saying why.
     print(f'[allergen] {fname} record={"yes" if _approved_panel else "none"} '
           f'({_panel_fetch_reason}) declared={_allergen_declared} '
@@ -5038,6 +5079,111 @@ def _named_flavor_mismatches(ingredients: list, flavor_name: str) -> list:
     return out
 
 
+# Ingredients often mistaken for an allergen source: coconut for a tree nut
+# (removed from FDA's list, 2025), cocoa butter or coconut milk for milk.
+_ALLERGEN_LOOKALIKES = {
+    'tree nut': r'\b(?:coconut|nutmeg|shea|water\s+chestnut|butternut)\b',
+    'milk': r'\b(?:coconut\s+milk|cocoa\s+butter|lactic\s+acid|lactate|cream\s+of\s+tartar)\b',
+    'wheat': r'\bbuckwheat\b',
+    'egg': r'\beggplant\b',
+}
+
+
+_ALLERGEN_LABEL = {'tree nut': 'Tree Nuts', 'peanut': 'Peanuts', 'egg': 'Eggs'}
+
+
+def _allergen_label(a: str) -> str:
+    return _ALLERGEN_LABEL.get(a, a.title())
+
+
+def _allergen_profile(ingredients_raw: str, contains_statement) -> dict:
+    """What one file says about allergens: {'items': {ingredient: [allergens
+    its own name or sub-ingredients source]}, 'declared': [allergens on the
+    Contains line], 'unsourced': [declared, but no ingredient sources it]}.
+    None without an ingredient statement of at least three items."""
+    items = {}
+    for x in _split_ingredients(ingredients_raw or ''):
+        name = _norm_ing(x)
+        if name:
+            items.setdefault(name, sorted(_ingredient_allergens(
+                [p for p in re.split(r'[,;()\[\]]', x.lower()) if p.strip()])))
+    if len(items) < 3:
+        return None
+    declared = []
+    for part in re.split(r'[,;/&]|\band\b', re.sub(r'(?i)^\s*contains\s*:?', '', contains_statement or '')):
+        c = _canonical_allergen(part)
+        if c and c not in declared:
+            declared.append(c)
+    sourced = {a for v in items.values() for a in v}
+    return {'items': items, 'declared': declared, 'unsourced': [a for a in declared if a not in sourced]}
+
+
+def _check_declared_without_source(profile) -> list:
+    """An allergen the Contains line declares that no ingredient accounts for.
+    Run aa5b6042: Coconut Cream whey declares "Milk, Tree Nuts"; its only
+    candidate is Coconut Milk Powder, and coconut is not a tree nut (FDA food
+    allergen Q&A, 5th ed., 2025). A question, not a verdict: the statement may
+    have been read short, or the declaration may be wrong."""
+    if not profile:
+        return []
+    return [{'severity': 'warning', 'message': (
+        f'The Contains line declares {_allergen_label(a)}, but no ingredient in the statement is a '
+        f'{a} source. Confirm the declaration against the formula: either an ingredient is missing '
+        'from the statement or the allergen is declared in error.'
+        + (' (Coconut is not a tree nut under FDA\'s 2025 allergen guidance.)'
+           if a == 'tree nut' and any('coconut' in i for i in profile['items']) else ''))}
+        for a in profile['unsourced']]
+
+
+def _flag_allergen_consistency(results: list) -> None:
+    """Two files in one run carrying the same ingredient and treating it
+    differently on the Contains line -> a WARNING on each, naming the other
+    file and the ingredient. Either the ingredient maps to an allergen one
+    declares and the other does not, or one file declares an allergen that
+    only the shared ingredient could account for (run aa5b6042: Coconut Cream
+    whey declares Tree Nuts for Coconut Milk Powder; three beef files with the
+    same ingredient declare nothing). Which side is right is the question."""
+    prof = []
+    for res in results or []:
+        snap = res.get('snapshot') or {}
+        p = _allergen_profile(snap.get('ingredients_raw'),
+                              (res.get('vision_allergens') or {}).get('contains_statement'))
+        if p:
+            prof.append((res, p))
+    found = {}   # (filename, ingredient, allergen) -> [other filenames]
+    for i in range(len(prof)):
+        for j in range(i + 1, len(prof)):
+            (ra, pa), (rb, pb) = prof[i], prof[j]
+            if ra.get('filename') == rb.get('filename'):
+                continue
+            for ing in set(pa['items']) & set(pb['items']):
+                cand = set(pa['items'][ing]) | set(pb['items'][ing])
+                # An allergen a file declares with no source is attributed to
+                # the shared ingredient only when that ingredient is a known
+                # look-alike for it (coconut for tree nuts) — not to every
+                # shared "Natural Flavors".
+                for p_ in (pa, pb):
+                    cand |= {a for a in p_['unsourced']
+                             if re.search(_ALLERGEN_LOOKALIKES.get(a, r'(?!)'), ing)}
+                for a in cand:
+                    if (a in pa['declared']) != (a in pb['declared']):
+                        for r, o in ((ra, rb), (rb, ra)):
+                            found.setdefault((r.get('filename'), ing, a), []).append(o)
+    by_name = {r.get('filename'): r for r, _ in prof}
+    for (fname, ing, a), others in found.items():
+        res = by_name[fname]
+        mine = a in next(p for r, p in prof if r is res)['declared']
+        names = ', '.join(dict.fromkeys(o.get('filename') for o in others))
+        chk = res.setdefault('checks', {}).setdefault('fda', {'issues': [], 'notes': []})
+        chk.setdefault('issues', []).append({'severity': 'warning', 'message': (
+            f'Allergen declaration differs across this run for {ing.title()}: {fname} '
+            f'{"declares" if mine else "does not declare"} {_allergen_label(a)}, while {names} '
+            f'{"does not" if mine else "does"} — both carry {ing.title()}. A different declaration '
+            'for the same ingredient is a question whichever side is right; confirm against the '
+            'formula.')})
+        _recount_result(res)
+
+
 def _flag_duplicate_ingredients(results: list) -> None:
     """Check 7.4 — two distinct SKUs in the same batch with identical (or
     nearly identical) ingredient statements.
@@ -5532,6 +5678,32 @@ def _check_spelling(ocr_text: str, fname: str) -> dict:
     _tl_spell = ocr_text.lower()
     _brand_found = bool(re.search(r'\bprodough\b', _tl_spell))
     return {'issues': issues, 'notes': notes, 'brand_found': _brand_found}
+
+
+# Legitimate lower->upper inside a word: pH, McIntosh / MacX surnames.
+_CAMEL_OK = re.compile(r'^(?:pH|Mc[A-Z]\w*|Mac[A-Z]\w*)$')
+
+
+def _ingredient_whitespace_issues(statement: str) -> list:
+    """Missing spaces in the ingredient statement, as printed: a lowercase-to-
+    uppercase change inside a word ("SteviaLeaf", "GuarGum") or a comma with
+    no space after it ("Powder,Himalayan"). One WARNING listing every
+    instance. `statement` must be a verbatim read — a transcription that
+    reflows text repairs exactly these."""
+    if not statement:
+        return []
+    found = []
+    for m in re.finditer(r'[A-Za-z]*[a-z][A-Z][A-Za-z]*', statement):
+        if not _CAMEL_OK.match(m.group(0)):
+            found.append(f'"{m.group(0)}" (no space between words)')
+    for m in re.finditer(r'([A-Za-z)\]]+),(?=[A-Za-z(])([A-Za-z]*)', statement):
+        found.append(f'"{m.group(1)},{m.group(2)}" (no space after the comma)')
+    if not found:
+        return []
+    return [{'severity': 'warning', 'message': (
+        'Ingredient statement spacing: ' + '; '.join(dict.fromkeys(found)) + '. Read from the '
+        'statement copied character for character from the back panel — confirm on the artwork '
+        'and correct before print.')}]
 
 
 # ── Generic brand spelling check ─────────────────────────────────────────────

@@ -219,6 +219,7 @@ def _install_engine_stubs(pe):
     pe._read_nfp_panel = _memo(pe._read_nfp_panel, 'nfp_crop')
     pe._read_contains_crop = _memo(pe._read_contains_crop, 'contains_crop')
     pe._read_disclaimer_crop = _memo(pe._read_disclaimer_crop, 'disclaimer_crop')
+    pe._read_ingredients_verbatim = _memo(pe._read_ingredients_verbatim, 'ingredients_verbatim')
     pe._read_front_callouts = _memo(pe._read_front_callouts, 'front_crop')
     return local
 
@@ -411,10 +412,19 @@ def _run():
         exp = expected[key]['expect']
         vals, prov = res.get('panel_values') or {}, res.get('panel_provenance') or {}
         graded = _graded(res)
-        clean_fp[expected[key]['set']] = clean_fp.get(expected[key]['set'], 0) + len(graded)
+        clean_fp[expected[key]['set']] = (clean_fp.get(expected[key]['set'], 0) + len(graded)
+                                          - len(exp.get('expected_warnings', [])))
         S.check(f'{key}: zero CRITICAL', not _criticals(res))
-        S.check(f'{key}: zero WARNING / SUSPECT findings (got {[(k, i["message"][:50]) for k, i in graded]})',
-                not graded)
+        # A file can carry known, hand-verified warnings (expected_warnings:
+        # one phrase per warning); every other graded finding is a stray.
+        want_w = exp.get('expected_warnings', [])
+        hits = [next((i for i, (_, f) in enumerate(graded) if f['severity'] == 'warning'
+                      and ph.lower() in f['message'].lower()), None) for ph in want_w]
+        stray_w = [(k, f['message'][:70]) for i, (k, f) in enumerate(graded) if i not in hits]
+        S.check(f'{key}: ' + (f'exactly the expected WARNINGs {want_w}' if want_w else 'zero WARNING / SUSPECT findings')
+                + f' (got {[(k, f["message"][:70]) for k, f in graded]})',
+                None not in hits and len(set(hits)) == len(hits) and not stray_w,
+                needs_vision=bool(want_w))
         if 'item_reference' in exp:
             ir = (res.get('checks') or {}).get('item_reference') or {}
             S.check(f'{key}: item reference reads {exp["item_reference"]} and matches the barcode SKU '
@@ -451,6 +461,25 @@ def _run():
             stray = [(k, i['message'][:60]) for k, i in _reviews(res) if k not in exp['reviews_only_from']]
             S.check(f'{key}: review findings only from {exp["reviews_only_from"]} (stray: {stray})', not stray,
                     needs_vision=True)
+
+    # ── Cross-run allergen consistency, on the real reads of the whole set ──
+    # Run aa5b6042: Coconut Cream whey declares Tree Nuts for Coconut Milk
+    # Powder; the beef bottles carry the same ingredient and declare nothing.
+    by_file = {r.get('filename'): r for r in clean_results}
+    cc = next((n for n in by_file if 'Coconut_Cream' in n), None)
+    beef = [n for n in by_file if n.startswith('PD_beef_bottle')]
+    if cc and beef:
+        cross = copy.deepcopy(clean_results)
+        pe._flag_allergen_consistency(cross)
+        xw = {r['filename']: [i['message'] for i in (r.get('checks', {}).get('fda') or {}).get('issues', [])
+                              if 'differs across this run' in i['message']] for r in cross}
+        S.check(f'cross-run: {cc} warned for Coconut Milk Powder / Tree Nuts against the beef files '
+                f'(got {xw.get(cc)})',
+                any('Coconut Milk Powder' in m and 'Tree Nuts' in m and any(b in m for b in beef)
+                    for m in xw.get(cc, [])), needs_vision=True)
+        S.check(f'cross-run: each beef file warned the other way (got {[(b, len(xw.get(b, []))) for b in beef]})',
+                all(any(cc in m for m in xw.get(b, [])) for b in beef), needs_vision=True)
+        print('[cross-run] ' + '; '.join(f'{n}: {m[:110]}' for n, ms in xw.items() for m in ms))
 
     # ── Score: defects ──────────────────────────────────────────────────────
     planted = caught = 0
