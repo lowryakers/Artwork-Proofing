@@ -62,6 +62,10 @@
     <a href="{{ url_for('download_report', job_id=job_id) }}" class="btn btn-success btn-sm">
       <i class="bi bi-download me-1"></i>Download Report
     </a>
+    <a href="{{ url_for('summary_json', job_id=job_id) }}" class="btn btn-outline-secondary btn-sm"
+       title="SKU, check, result, path used — for the tracker">
+      <i class="bi bi-filetype-json me-1"></i>Summary JSON
+    </a>
     {% endif %}
     <a href="{{ url_for('landing') }}" class="btn btn-outline-secondary btn-sm">
       <i class="bi bi-arrow-left me-1"></i>New Proof
@@ -511,6 +515,22 @@
             {% endif %}
           </div>
         </div>
+      </div>
+      {% endif %}
+
+      {# ── Label copy vs approved panel, one row per element, with the path used ── #}
+      {% if check_key == 'panel' and check.get('label_copy') %}
+      <div class="mt-2 border rounded overflow-hidden" style="font-size:.8rem">
+        <table class="table table-sm mb-0">
+          <thead><tr class="text-muted" style="font-size:.72rem;text-transform:uppercase;letter-spacing:.04em">
+            <th>Label copy</th><th>Path</th><th>Result</th><th>Detail</th></tr></thead>
+          <tbody>
+          {% for el in check.label_copy %}
+            <tr class="{% if el.result == 'mismatch' %}table-danger{% elif el.result in ('not_evaluated', 'format_diff') %}table-warning{% endif %}">
+              <td>{{ el.element }}</td><td><code>{{ el.path }}</code></td><td>{{ el.result }}</td><td>{{ el.detail }}</td></tr>
+          {% endfor %}
+          </tbody>
+        </table>
       </div>
       {% endif %}
 
@@ -1094,6 +1114,16 @@ function checkCard(num, title, icon, check, uid, filename, checkKey, alwaysOpen)
       ${rowsHtml}${gapsHtml ? `<div class="mt-1">${gapsHtml}</div>` : ''}
     </div></div>`;
   }
+  if (checkKey === 'panel' && (check.label_copy || []).length) {
+    const rows = check.label_copy.map(el => {
+      const cls = el.result === 'mismatch' ? 'table-danger' : (el.result === 'not_evaluated' || el.result === 'format_diff') ? 'table-warning' : '';
+      return `<tr class="${cls}"><td>${esc(el.element)}</td><td><code>${esc(el.path || '')}</code></td><td>${esc(el.result || '')}</td><td>${esc(el.detail || '')}</td></tr>`;
+    }).join('');
+    extras += `<div class="mt-2 border rounded overflow-hidden" style="font-size:.8rem"><table class="table table-sm mb-0">
+      <thead><tr class="text-muted" style="font-size:.72rem;text-transform:uppercase;letter-spacing:.04em">
+        <th>Label copy</th><th>Path</th><th>Result</th><th>Detail</th></tr></thead>
+      <tbody>${rows}</tbody></table></div>`;
+  }
   if (checkKey === 'front_callout' && (check.rings || []).length) {
     const rows = check.rings.map(rg => {
       const cls = rg.verdict === 'MISMATCH' ? 'table-danger' : rg.verdict === 'NOT EVALUATED' ? 'table-warning' : '';
@@ -1326,6 +1356,7 @@ function buildReport(job) {
     <div class="ms-auto d-flex gap-2 flex-wrap">
       <a href="/summary/${job.id}" class="btn btn-outline-dark btn-sm"><i class="bi bi-clipboard2-check me-1"></i>Full Summary</a>
       <a href="/report/${job.id}" class="btn btn-success btn-sm"><i class="bi bi-download me-1"></i>Download Report</a>
+      <a href="/summary/${job.id}.json" class="btn btn-outline-secondary btn-sm" title="SKU, check, result, path used — for the tracker"><i class="bi bi-filetype-json me-1"></i>Summary JSON</a>
       <a href="/" class="btn btn-outline-secondary btn-sm"><i class="bi bi-arrow-left me-1"></i>New Proof</a>
     </div>
   </div>`;

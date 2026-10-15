@@ -338,6 +338,58 @@ load_jobs_from_disk()
 _BATCH_WORKERS = 4
 
 
+def _check_result(c: dict) -> str:
+    """One word for a check block, for the tracker: fail / warn / review /
+    not_run / not_applicable / pass. Never 'pass' for a check that did not run."""
+    sev = {i.get('severity') for i in (c.get('issues') or [])}
+    status = str(c.get('status', '')).upper()
+    if 'critical' in sev:
+        return 'fail'
+    if sev & {'warning', 'suspect'}:
+        return 'warn'
+    if status == _NOT_APPLICABLE:
+        return 'not_applicable'
+    if status in _NOT_VERIFIED_STATUSES or c.get('skipped'):
+        return 'not_run'
+    if 'review' in sev:
+        return 'review'
+    return 'pass'
+
+
+def run_summary(job: dict) -> dict:
+    """Machine-readable run summary: one row per file per check (and per
+    label-copy element), so the tracker can be updated without retyping:
+    {sku, gtin, file, check, element, result, path, panel_version, panel_source,
+    findings}. Derived from the stored results, so it reflects dismissals."""
+    rows = []
+    for r in job.get('results') or []:
+        if not r:
+            continue
+        sku = (r.get('matched_spec') or {}).get('sku')
+        gtins = ((r.get('checks') or {}).get('gtin') or {}).get('found_gtins') or []
+        base = {'sku': sku, 'gtin': gtins[0] if len(set(gtins)) == 1 else None, 'file': r.get('filename'),
+                'live_text': (r.get('live_text') or {}).get('mode', 'none')}
+        if r.get('error'):
+            rows.append(dict(base, check=None, element=None, result='error', path=None,
+                             findings=[str(r['error'])[:300]]))
+            continue
+        paths = r.get('check_paths') or {}
+        for k, c in (r.get('checks') or {}).items():
+            if not isinstance(c, dict):
+                continue
+            rows.append(dict(base, check=k, element=None, result=_check_result(c),
+                             path=paths.get(k, c.get('path')), panel_version=c.get('panel_version'),
+                             panel_source=c.get('panel_source'),
+                             findings=[f'{i.get("severity")}: {i.get("message")}' for i in (c.get('issues') or [])
+                                       if i.get('severity') in ('critical', 'warning', 'suspect', 'review')]))
+            for e in c.get('label_copy') or []:
+                rows.append(dict(base, check=k, element=e['element'], result=e['result'], path=e['path'],
+                                 panel_version=c.get('panel_version'), panel_source=c.get('panel_source'),
+                                 findings=[e.get('detail')] if e.get('detail') else []))
+    return {'job_id': job.get('id'), 'created': job.get('created'), 'files': len(job.get('results') or []),
+            'rows': rows}
+
+
 def _process_job(job_id: str, pdf_paths: list, gtin_rows: list, work_dir: str,
                  brand_config: dict = None, spec_rows: list = None):
     _update_job(job_id, status='running')
@@ -349,6 +401,15 @@ def _process_job(job_id: str, pdf_paths: list, gtin_rows: list, work_dir: str,
         readydoc.log_panel_endpoint_once()
     except Exception:
         pass
+    # Live-text companions (X_live.pdf next to X.pdf) ride along with their
+    # print file instead of being proofed as artworks of their own.
+    _pairs, _unpaired = {}, []
+    if LIVE_TEXT_ENABLED:
+        try:
+            import live_text as _lt
+            pdf_paths, _pairs, _unpaired = _lt.pair_files(list(pdf_paths))
+        except Exception as _e:
+            print(f'[live-text] pairing skipped: {_e}')
     total = len(pdf_paths)
     results = [None] * total          # order-safe: fill by index, never append
     _done = {'n': 0}
@@ -358,7 +419,11 @@ def _process_job(job_id: str, pdf_paths: list, gtin_rows: list, work_dir: str,
         fname = os.path.basename(pdf_path)
         try:
             res = _proof_single(pdf_path, gtin_rows, work_dir, brand_config=brand_config,
-                                spec_rows=spec_rows)
+                                spec_rows=spec_rows, live_pdf=_pairs.get(pdf_path))
+            if pdf_path in _unpaired:
+                res.setdefault('live_text', {})['unpaired'] = (
+                    'named as a live-text companion, but no print file of that name was uploaded; '
+                    'proofed as an artwork in its own right')
         except Exception as exc:
             res = {
                 'filename': fname,
@@ -391,6 +456,13 @@ def _process_job(job_id: str, pdf_paths: list, gtin_rows: list, work_dir: str,
         summary = _build_summary(results)
         _update_job(job_id, status='done', progress=100,
                     results=results, summary=summary, current_file='')
+        try:
+            with _jobs_lock:
+                _job = dict(_jobs.get(job_id) or {})
+            with open(os.path.join(work_dir, 'summary.json'), 'w') as _f:
+                json.dump(run_summary(_job), _f, indent=1, default=str)
+        except Exception as _e:
+            print(f'[summary] summary.json not written: {_e}')
         # File the results into ReadyDoc's artwork history. Off unless
         # READYDOC_URL/READYDOC_TOKEN are set, and asynchronous either way — a
         # ReadyDoc outage must not fail a proofing run that already succeeded.
@@ -1007,10 +1079,13 @@ _FRONT_CROP_PROMPT = (
     '"number": "<the big number exactly as printed, with any unit or % sign, e.g. \\"130\\", '
     '\\"26G\\", \\"100%\\"; null if you cannot read it>", "caption": "<the caption printed in '
     'that same badge, exactly as printed, e.g. \\"Calories Per Serving\\"; null if you cannot read '
-    'it>"}]}\n'
+    'it>"}], "disclaimer": "<the full text of any disclaimer that begins \\"These statements have '
+    'not been evaluated\\", copied exactly as printed anywhere on the artwork (it may be small or '
+    'upside down); null if none is printed>"}\n'
     'Transcribe only. Do NOT correct, infer or reconcile any number against anything else on the '
     'package (including the Nutrition Facts panel): a badge that prints 100 is "100" even if you '
-    'believe it should be something else. Return {"rings": []} if there are no badges.')
+    'believe it should be something else. Return {"rings": [], "disclaimer": null} if there are no '
+    'badges and no disclaimer.')
 
 # Ring caption -> the NFP field it declares. "Sugar" alone does not say added
 # or total, so it binds to nothing (NOT EVALUATED) rather than to a guess.
@@ -1189,9 +1264,10 @@ def _read_front_callouts(img_path: str, nfp_bbox=None, diag: list = None) -> dic
     the whole artwork is read — never a vision-estimated ring box: on the
     bottle sleeves that box landed half on the back panel, and masking with
     vision's rough panel box erased the left ring column (CI runs 38305043657,
-    38308802272). Returns {'rings': [<badge as transcribed>, ...]} (exact
-    duplicates from overlapping tiles removed) or {} on failure, and records
-    why in `diag`. Never raises. _check_front_callout binds and compares."""
+    38308802272). Returns {'rings': [<badge as transcribed>, ...] (exact
+    duplicates from overlapping tiles removed), 'disclaimer': <the DSHEA
+    disclaimer copied verbatim, or None>} or {} on failure, and records why in
+    `diag`. Never raises. _check_front_callout binds and compares."""
     diag = diag if diag is not None else []
     if not (ANTHROPIC_AVAILABLE and PIL_AVAILABLE):
         diag.append('not attempted: vision unavailable')
@@ -1219,20 +1295,7 @@ def _read_front_callouts(img_path: str, nfp_bbox=None, diag: list = None) -> dic
         # 2x2 overlapping tiles: one image of a 14,000 px pouch, shrunk to the
         # API's pixel budget, left ring captions a few pixels tall (CI run
         # 38312701844: "0G / Sugar", "100% / Gluten Free Flour").
-        _cap = 1_140_000
-        tiles, ov = [], 0.15
-        cw, ch = crop.size
-        for ty in (0, 1):
-            for tx in (0, 1):
-                x0 = max(0, int((tx * 0.5 - ov / 2) * cw)); x1 = min(cw, int(((tx + 1) * 0.5 + ov / 2) * cw))
-                y0 = max(0, int((ty * 0.5 - ov / 2) * ch)); y1 = min(ch, int(((ty + 1) * 0.5 + ov / 2) * ch))
-                t = crop.crop((x0, y0, x1, y1))
-                if t.width * t.height > _cap:
-                    sc = (_cap / float(t.width * t.height)) ** 0.5
-                    t = t.resize((max(1, int(t.width * sc)), max(1, int(t.height * sc))))
-                _tb = io.BytesIO()
-                t.save(_tb, format='JPEG', quality=92)
-                tiles.append(_tb.getvalue())
+        tiles = _jpeg_tiles(crop)
         _client = _anthropic.Anthropic(api_key=os.environ['ANTHROPIC_API_KEY'])
         _msg = _client.messages.create(
             model='claude-sonnet-4-6', max_tokens=800, extra_body={'temperature': 0},
@@ -1257,10 +1320,14 @@ def _read_front_callouts(img_path: str, nfp_bbox=None, diag: list = None) -> dic
                 continue
             seen.add(key)
             rings.append(r)
+        disclaimer = data.get('disclaimer') if isinstance(data.get('disclaimer'), str) else None
         diag.append(f'{len(tiles)} tiles {_sent}B sent; stop={_stop}; {len(rings)} rings: '
                     + ', '.join(f'{r.get("position") or "?"}: {r.get("number")} / {r.get("caption")}'
-                                for r in rings))
-        return {'rings': rings}
+                                for r in rings)
+                    + f'; disclaimer {"read" if disclaimer else "none"}')
+        # The same high-resolution read also copies the DSHEA disclaimer: the
+        # full-page pass missed it intermittently on the pouch back panels.
+        return {'rings': rings, 'disclaimer': disclaimer}
     except Exception as _e:
         diag.append(f'error: {type(_e).__name__}: {_e}')
         print(f'[vision] front-callout crop read failed: {_e}')
@@ -1557,9 +1624,19 @@ def _read_nfp_panel(img_path: str, bbox, diag: list = None) -> dict:
             # located geometrically — excludes an adjacent strip or other
             # artwork the padding can otherwise pull into the crop.
             refined = _largest_white_region_bbox_frac(candidate)
+            # A tightened rectangle that kept under half of vision's box height
+            # or width found some other white region, not the panel (CI run
+            # 38789924924: a 1643x439 strip of a tall panel; nothing read).
+            if refined:
+                bw, bh = (x1 - x0) * W, (y1 - y0) * H
+                cw, ch = candidate.size
+                rw, rh = (refined[2] - refined[0]) * cw, (refined[3] - refined[1]) * ch
+                if rw < 0.5 * bw or rh < 0.5 * bh:
+                    diag.append(f'tightened region {int(rw)}x{int(rh)}px rejected (vision box '
+                                f'{int(bw)}x{int(bh)}px) — not the panel')
+                    refined = None
             if refined:
                 rx0, ry0, rx1, ry1 = refined
-                cw, ch = candidate.size
                 tx0, ty0 = px0 + int(rx0 * cw), py0 + int(ry0 * ch)
                 tx1, ty1 = px0 + int(rx1 * cw), py0 + int(ry1 * ch)
                 crop = im.crop((tx0, ty0, tx1, ty1)) if (tx1 - tx0 >= 8 and ty1 - ty0 >= 8) else candidate
@@ -1573,16 +1650,21 @@ def _read_nfp_panel(img_path: str, bbox, diag: list = None) -> dict:
             # the panel unread, and still degrades to {} if nothing legible comes back.
             crop = im
             diag.append(f'panel NOT located by vision — reading the whole page {W}x{H}px')
-        crop = _upright(crop)
-        # Upscale small crops so digits are large; then cap to the API's ~1.1MP.
-        _long = max(crop.width, crop.height)
-        if _long < 1600:
-            s = min(3.0, 1600.0 / _long)
-            crop = crop.resize((int(crop.width * s), int(crop.height * s)))
-        _cap = 1_140_000
-        if crop.width * crop.height > _cap:
-            s = (_cap / float(crop.width * crop.height)) ** 0.5
-            crop = crop.resize((max(1, int(crop.width * s)), max(1, int(crop.height * s))))
+        def _prep(c):
+            c = _upright(c)
+            # Upscale small crops so digits are large; then cap to the API's ~1.1MP.
+            _long = max(c.width, c.height)
+            if _long < 1600:
+                s = min(3.0, 1600.0 / _long)
+                c = c.resize((int(c.width * s), int(c.height * s)))
+            _cap = 1_140_000
+            if c.width * c.height > _cap:
+                s = (_cap / float(c.width * c.height)) ** 0.5
+                c = c.resize((max(1, int(c.width * s)), max(1, int(c.height * s))))
+            return c
+
+        _untightened = candidate if bbox and crop is not candidate else None
+        crop = _prep(crop)
 
         _client = _anthropic.Anthropic(api_key=os.environ['ANTHROPIC_API_KEY'])
 
@@ -1637,15 +1719,24 @@ def _read_nfp_panel(img_path: str, bbox, diag: list = None) -> dict:
 
         # Straight read first; only try flipped/rotated orientations if it is sparse,
         # to keep the call count down. Mirror (left-right) is the common film case.
-        best, best_img = _read_crop(crop, 'straight'), crop
-        if _score(best) < 3:
-            for _t, _lbl in ((Image.FLIP_LEFT_RIGHT, 'mirrored'), (Image.ROTATE_180, 'rotated 180')):
-                alt_img = crop.transpose(_t)
-                alt = _read_crop(alt_img, _lbl)
-                if _score(alt) > _score(best):
-                    best, best_img = alt, alt_img
-                if _score(best) >= 3:
-                    break
+        def _read_all(c, tag=''):
+            b, b_img = _read_crop(c, tag + 'straight'), c
+            if _score(b) < 3:
+                for _t, _lbl in ((Image.FLIP_LEFT_RIGHT, 'mirrored'), (Image.ROTATE_180, 'rotated 180')):
+                    alt_img = c.transpose(_t)
+                    alt = _read_crop(alt_img, tag + _lbl)
+                    if _score(alt) > _score(b):
+                        b, b_img = alt, alt_img
+                    if _score(b) >= 3:
+                        break
+            return b, b_img
+
+        best, best_img = _read_all(crop)
+        # The geometric tightening can still pick the wrong white region; when
+        # the tightened crop reads nothing, read the panel's padded box instead.
+        if not best and _untightened is not None:
+            diag.append('tightened crop read nothing — re-reading the untightened box')
+            best, best_img = _read_all(_prep(_untightened), 'untightened ')
         best = _settle_serving_g(best, lambda: _read_crop(best_img, 're-read'), diag)
         best.pop('serving_size_text', None)
         return best
@@ -1669,14 +1760,39 @@ _CONTAINS_CROP_PROMPT = (
     'and null if you cannot clearly read one.')
 
 
-def _read_contains_crop(img_path: str, bbox):
-    """The FALCPA "Contains:" line, re-read from a crop around the Nutrition
-    Facts panel. The full-page vision pass misses it on small, upside-down back
-    panels (run 37975487968: the buttermilk pouch read no Contains line, so a
-    record declaring Wheat could not be checked). The declaration sits beside
-    the panel with the ingredients, so a padded crop of the panel's box holds
-    it. Tries the crop as is, rotated 180 and mirrored. Returns the statement
-    text, or None. Never raises."""
+_API_PIXELS = 1_140_000
+
+
+def _jpeg_tiles(img, overlap: float = 0.15) -> list:
+    """`img` as JPEG bytes, whole if it fits the API's pixel budget, else as a
+    2x2 grid of overlapping tiles, each within the budget. Shrinking a large
+    crop (a 14,500 px pouch proof) to one budget-sized image leaves small print
+    a few pixels tall; tiles keep about twice the resolution."""
+    import io
+    def _fit(t):
+        if t.width * t.height > _API_PIXELS:
+            sc = (_API_PIXELS / float(t.width * t.height)) ** 0.5
+            t = t.resize((max(1, int(t.width * sc)), max(1, int(t.height * sc))))
+        b = io.BytesIO()
+        t.save(b, format='JPEG', quality=92)
+        return b.getvalue()
+    if img.width * img.height <= _API_PIXELS * 1.5:
+        return [_fit(img)]
+    w, h = img.size
+    out = []
+    for ty in (0, 1):
+        for tx in (0, 1):
+            x0 = max(0, int((tx * 0.5 - overlap / 2) * w)); x1 = min(w, int(((tx + 1) * 0.5 + overlap / 2) * w))
+            y0 = max(0, int((ty * 0.5 - overlap / 2) * h)); y1 = min(h, int(((ty + 1) * 0.5 + overlap / 2) * h))
+            out.append(_fit(img.crop((x0, y0, x1, y1))))
+    return out
+
+
+def _read_near_panel(img_path: str, bbox, prompt: str, accept, max_tokens: int = 300):
+    """Ask about the text around the Nutrition Facts panel — a padded crop of
+    the panel's box, turned upright, tried as is, rotated 180 and mirrored.
+    `accept(data)` returns the answer to keep from the reply JSON, or None to
+    try the next orientation. None when nothing is accepted. Never raises."""
     if not (ANTHROPIC_AVAILABLE and PIL_AVAILABLE and bbox):
         return None
     try:
@@ -1690,21 +1806,18 @@ def _read_contains_crop(img_path: str, bbox):
         if box[2] - box[0] < 8 or box[3] - box[1] < 8:
             return None
         crop = _upright(im.crop(box))
-        _cap = 1_140_000
-        if crop.width * crop.height > _cap:
-            sc = (_cap / float(crop.width * crop.height)) ** 0.5
-            crop = crop.resize((max(1, int(crop.width * sc)), max(1, int(crop.height * sc))))
         _client = _anthropic.Anthropic(api_key=os.environ['ANTHROPIC_API_KEY'])
         for _t in (None, Image.ROTATE_180, Image.FLIP_LEFT_RIGHT):
             pim = crop if _t is None else crop.transpose(_t)
-            _b = io.BytesIO()
-            pim.save(_b, format='JPEG', quality=95)
+            tiles = _jpeg_tiles(pim)
+            _lead = ([{'type': 'text', 'text': 'These images are overlapping tiles of one crop.'}]
+                     if len(tiles) > 1 else [])
             _msg = _client.messages.create(
-                model='claude-sonnet-4-6', max_tokens=300, extra_body={'temperature': 0},
-                messages=[{'role': 'user', 'content': [
+                model='claude-sonnet-4-6', max_tokens=max_tokens, extra_body={'temperature': 0},
+                messages=[{'role': 'user', 'content': _lead + [
                     {'type': 'image', 'source': {'type': 'base64', 'media_type': 'image/jpeg',
-                                                 'data': base64.standard_b64encode(_b.getvalue()).decode('utf-8')}},
-                    {'type': 'text', 'text': _CONTAINS_CROP_PROMPT}]}])
+                                                 'data': base64.standard_b64encode(tb).decode('utf-8')}}
+                    for tb in tiles] + [{'type': 'text', 'text': prompt}]}])
             if getattr(_msg, 'stop_reason', None) == 'max_tokens':
                 continue
             _txt = next((b.text for b in (_msg.content or []) if getattr(b, 'text', None)), '')
@@ -1712,20 +1825,186 @@ def _read_contains_crop(img_path: str, bbox):
             if _start < 0:
                 continue
             data, _ = json.JSONDecoder().raw_decode(_txt[_start:])
-            cs = data.get('contains_statement')
-            if isinstance(cs, str) and cs.strip() and cs.strip().lower() not in ('null', 'none', 'n/a') \
-                    and any(_canonical_allergen(p) for p in re.split(r'[,;/&]|\band\b', cs)):
-                return re.sub(r'(?i)^\s*contains\s*:?\s*', '', cs.strip())
+            got = accept(data)
+            if got:
+                return got
         return None
     except Exception as _e:
-        print(f'[vision] contains-crop read failed: {_e}')
+        print(f'[vision] near-panel read failed: {_e}')
         return None
+
+
+def _read_contains_crop(img_path: str, bbox):
+    """The FALCPA "Contains:" line, re-read from a crop around the Nutrition
+    Facts panel. The full-page vision pass misses it on small, upside-down back
+    panels (run 37975487968: the buttermilk pouch read no Contains line, so a
+    record declaring Wheat could not be checked). The declaration sits beside
+    the panel with the ingredients, so a padded crop of the panel's box holds
+    it. Returns the statement text, or None. Never raises."""
+    def _accept(data):
+        cs = data.get('contains_statement')
+        if isinstance(cs, str) and cs.strip() and cs.strip().lower() not in ('null', 'none', 'n/a') \
+                and any(_canonical_allergen(p) for p in re.split(r'[,;/&]|\band\b', cs)):
+            return re.sub(r'(?i)^\s*contains\s*:?\s*', '', cs.strip())
+        return None
+    return _read_near_panel(img_path, bbox, _CONTAINS_CROP_PROMPT, _accept)
+
+
+_DISCLAIMER_CROP_PROMPT = (
+    'This image is a crop of a food package back panel around its Nutrition Facts table. It may be '
+    'upside down, rotated or MIRROR-REVERSED; read it correctly oriented. Is there a disclaimer that '
+    'begins "These statements have not been evaluated" (often in a small box, with an asterisk)? '
+    'Return ONLY this JSON object:\n'
+    '{"disclaimer": "<the disclaimer copied exactly as printed, or null if none is visible in this image>"}')
+
+
+def _read_disclaimer_crop(img_path: str, bbox):
+    """The DSHEA disclaimer, read from the area around the Nutrition Facts panel
+    (where the pancake pouches print it, upside down and small — the full-page
+    pass and the tiled whole-artwork read each missed it on 3 of 4 pouches, CI
+    run 38789924924). Returns the text only if it carries the disclaimer's own
+    wording. Never raises."""
+    def _accept(data):
+        t = data.get('disclaimer')
+        if isinstance(t, str) and re.search(r'statements\s+have\s+not\s+been\s+evaluated', t, re.I):
+            return t.strip()
+        return None
+    return _read_near_panel(img_path, bbox, _DISCLAIMER_CROP_PROMPT, _accept)
+
+
+# Live-text path: on hold until live-text PDFs are confirmed available from the
+# designer. Off, no file is paired or read through its text layer and every
+# check takes the OCR path. Set LIVE_TEXT_ENABLED=true to turn it on.
+LIVE_TEXT_ENABLED = _env_flag('LIVE_TEXT_ENABLED', False)
+
+
+def _acquire_live_text(pdf_path: str, live_pdf: str = None) -> dict:
+    """The file's live text, if any: its own text layer when it carries label
+    copy ('own'), else a paired companion live-text PDF ('companion', with its
+    layout comparison). None when neither, or when the path is switched off
+    (LIVE_TEXT_ENABLED) — the OCR path."""
+    if not LIVE_TEXT_ENABLED:
+        return None
+    try:
+        import live_text as _lt
+    except Exception:
+        return None
+    if _lt.has_label_text(pdf_path):
+        return {'mode': 'own', 'source': os.path.basename(pdf_path), 'lt': _lt.extract(pdf_path),
+                'layout': 'n/a', 'note': 'label copy read from the print file\'s own text layer'}
+    if not live_pdf:
+        return None
+    src = os.path.basename(live_pdf)
+    if not _lt.has_label_text(live_pdf):
+        return {'mode': 'rejected', 'source': src, 'lt': None, 'layout': 'n/a',
+                'note': f'{src} was supplied as the live-text PDF but carries no label copy in its text layer'}
+    state, detail = _lt.compare_layout(pdf_path, live_pdf)
+    if state == 'mismatch':
+        return {'mode': 'rejected', 'source': src, 'lt': None, 'layout': state,
+                'note': f'{src} is not the same artwork as the print file ({detail}); its text was not used'}
+    return {'mode': 'companion', 'source': src, 'lt': _lt.extract(live_pdf), 'layout': state, 'note': detail}
+
+
+def _dv_number(v):
+    m = re.match(r'^\s*(\d+(?:\.\d+)?)\s*%?\s*$', str(v))
+    if not m:
+        return v
+    f = float(m.group(1))
+    return int(f) if f.is_integer() else f
+
+
+def _label_copy_from_live(live: dict, ingredients_raw, allergen_contains, artwork_panel) -> dict:
+    """Label-copy inputs, taking each element from the live text where it can
+    be trusted and from the OCR reads otherwise. A companion file's element is
+    trusted only where it agrees in content with the print file's own read (or,
+    with no such read, where the two layouts matched)."""
+    import live_text as _lt
+    lc = _label_copy_from_reads(ingredients_raw, allergen_contains, artwork_panel)
+    if not live or live['mode'] == 'rejected':
+        if live:
+            lc['note'] = live['note']
+        return lc
+    own, lt = live['mode'] == 'own', live['lt']
+    layout_ok = live.get('layout') == 'match'
+    who = f'the live-text file {live["source"]}'
+
+    def _take(key, live_val, ocr_val, same):
+        el = lc[key]
+        if own:
+            el.update(text=live_val, path='live_text', absent=live_val is None)
+        elif live_val is None and ocr_val is None:
+            el.update(text=None, path='live_text', absent=True)
+        elif live_val is not None and ocr_val is not None:
+            if same(live_val, ocr_val):
+                el.update(text=live_val, path='live_text')
+            else:
+                diffs = _lt.char_diff(live_val, ocr_val, width=30)[:3]
+                where = '; '.join(f'live "…{d["context"]}…" vs print file "{d["approved"]}"' for d in diffs)
+                el.update(unverified=(f'{who} and the print file disagree ({where}) — confirm which one '
+                                      'is going to press'), path='live_text vs ocr')
+        elif live_val is not None and layout_ok:
+            el.update(text=live_val, path='live_text')
+        elif live_val is not None:
+            el.update(unverified=(f'the print file\'s own {key} could not be read to confirm the text in '
+                                  f'{who} belongs to it ({live.get("note")})'), path='live_text vs ocr')
+        # live_val None but the print file has one: keep the OCR read.
+
+    stmt = _lt.ingredient_statement(lt)
+    _take('ingredients', stmt, _strip_label(ingredients_raw, r'^ingredients?\s*:\s*') or None,
+          lambda a, b: _normalize_stmt(a) == _normalize_stmt(b) or _lt.content_equal(a, b))
+    _take('contains', _lt.contains_line(lt), lc['contains']['text'],
+          lambda a, b: _lt.content_equal(a, b))
+
+    live_dv = {f'{k}_dv': _dv_number(v) for k, v in (_lt.dv_column(lt) or {}).items()}
+    crop_dv = lc['dv']['values']
+    used, unverified = dict(crop_dv), {}
+    for k, v in live_dv.items():
+        c = crop_dv.get(k)
+        if own or (c is not None and _amounts_equal(c, v)) or (c is None and layout_ok):
+            used[k] = v
+        elif c is not None:
+            unverified[k] = f'{who} reads {v}% but the print file reads {c}% — confirm which is going to press'
+        else:
+            unverified[k] = f'the print file\'s own %DV could not be read to confirm {who}'
+    if live_dv:
+        lc['dv'] = {'values': used, 'path': 'live_text', 'unverified': unverified}
+    lc['note'] = live['note']
+    return lc
+
+
+# How each check reads the artwork, when it does not depend on the text path.
+_FIXED_CHECK_PATH = {'gtin': 'barcode', 'specs': 'pdf', 'eyemark': 'image', 'item_reference': 'ocr',
+                     'front_callout': 'vision', 'netwt': 'vision_crop', 'nfp': 'vision_crop'}
+
+
+def _check_paths(checks: dict, live: dict) -> dict:
+    """{check: path} — which reader each check used: 'live_text' or 'ocr' for
+    checks that read label copy, the fixed reader for the rest; the approved-
+    panel check reports 'live_text', 'ocr' or 'mixed' from its label-copy
+    elements. Stamped on each check as checks[k]['path'] too."""
+    text_path = 'live_text' if live and live.get('mode') == 'own' else 'ocr'
+    out = {}
+    for k, c in (checks or {}).items():
+        if not isinstance(c, dict):
+            continue
+        if k == 'panel' and c.get('label_copy'):
+            ps = {e['path'] for e in c['label_copy']}
+            out[k] = ps.pop() if len(ps) == 1 else 'mixed'
+        else:
+            out[k] = _FIXED_CHECK_PATH.get(k, text_path)
+        c['path'] = out[k]
+    return out
 
 
 def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
-                  brand_config: dict = None, spec_rows: list = None) -> dict:
+                  brand_config: dict = None, spec_rows: list = None, live_pdf: str = None) -> dict:
     brand_config = brand_config or {}
     fname = os.path.basename(pdf_path)
+    # Live text first: the print file's own text layer, or a paired companion.
+    _live = _acquire_live_text(pdf_path, live_pdf)
+    if LIVE_TEXT_ENABLED:
+        print(f'[live-text] {fname} ' + (f'{_live["mode"]} ({_live["source"]}): {_live["note"]}' if _live
+                                         else 'none — OCR path'))
     # Prefix intermediate filenames with a short unique token so that files which
     # happen to share a stem (same name, re-upload) cannot collide on their
     # _ocr*.png temp paths — required for safe concurrent processing.
@@ -2052,6 +2331,9 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
     # raw_text IS the clean label, so use it; otherwise (live-text labels with no
     # vision pass) fall back to the full OCR, which carries the label itself.
     label_text = ocr_claude if len(ocr_claude.strip()) > 40 else combined_text
+    # A print file that carries its own live label copy is read from it.
+    if _live and _live['mode'] == 'own':
+        label_text = _live['lt']['text']
 
     # barcode_gtins and matched_spec were computed up front (before the vision gate).
     brand_mode = brand_config.get('brand_mode', 'prodough')
@@ -2158,9 +2440,20 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
     # the prior proofed version for this SKU from stored history (ReadyDoc → local).
     _snapshot = _build_label_snapshot(label_text, _panel, vision_nutrition,
                                       reader_source='vision' if _label_is_vision else 'ocr')
-    # DSHEA disclaimer detection is robust to vision omitting it from raw_text: the
-    # first pass reports it as a structured boolean, OR-ed with the text regex.
-    _snapshot['dshea_disclaimer'] = bool(_snapshot.get('dshea_disclaimer')) or vision_dshea
+    # DSHEA disclaimer: any of three reads — the label text, vision's structured
+    # flag, or the Tesseract passes (which include the upside-down back-panel
+    # reads). Vision alone missed it intermittently on the pancake pouches, all
+    # four of which print it (CI run 38784993759): a correct REVIEW that came
+    # and went between runs of the same file.
+    _dshea_re = r'statements\s+have\s+not\s+been\s+evaluated'
+    _snapshot['dshea_disclaimer'] = (bool(_snapshot.get('dshea_disclaimer')) or vision_dshea
+                                     or bool(re.search(_dshea_re, combined_text, re.I))
+                                     or bool(re.search(_dshea_re, (_front_read or {}).get('disclaimer') or '', re.I)))
+    # Not found yet: a targeted, upright read of the panel's surroundings, where
+    # back-panel disclaimers sit. Only then — most files already have an answer.
+    if not _snapshot['dshea_disclaimer'] and vision_nfp_bbox:
+        _snapshot['dshea_disclaimer'] = bool(_read_disclaimer_crop(img_path, vision_nfp_bbox))
+    print(f'[dshea] {fname} disclaimer {"present" if _snapshot["dshea_disclaimer"] else "not found"}')
     _prior_snapshot = _fetch_prior_snapshot(_gtin_lookup, _sku_lookup)
 
     # Approved-nutrition-panel comparison (the outside-the-artwork source of
@@ -2179,10 +2472,17 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
     _front_nc = _front_net_carbs_g(label_text)
     if _front_nc is not None:
         _front_artwork_values['net_carbs_g'] = _front_nc
+    _label_copy = _label_copy_from_live(
+        _live, _snapshot.get('ingredients_raw'), (vision_allergens or {}).get('contains_statement'),
+        _artwork_panel_values)
     _panel_check = _check_approved_panel(
         _artwork_panel_values, _front_artwork_values, _snapshot.get('ingredients_raw'),
         (vision_allergens or {}).get('contains_statement'),
-        _approved_panel, prior_panel_version=_prior_panel_version, fetch_reason=_panel_fetch_reason)
+        _approved_panel, prior_panel_version=_prior_panel_version, fetch_reason=_panel_fetch_reason,
+        label_copy=_label_copy)
+    if _label_copy.get('note') and _live and _live['mode'] == 'rejected':
+        _panel_check.setdefault('issues', []).append({'severity': 'review', 'message': (
+            f'Live-text PDF not used — {_label_copy["note"]}. Label copy was compared on the OCR path.')})
 
     # Locked die template (bottle shrink sleeve, …): registered once and reused
     # for every flavor on that die, so a proof never re-measures. Selected by the
@@ -2349,6 +2649,9 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
         'ocr_preview': ('[' + _vision_diag + ']\n\n' + combined_text)[:3000] if _vision_diag else combined_text[:3000],
         'ocr_text': combined_text,
         'checks': checks,
+        # Which reader each check used, and the live text (if any) behind them.
+        'check_paths': _check_paths(checks, _live),
+        'live_text': ({k: v for k, v in _live.items() if k != 'lt'} if _live else {'mode': 'none'}),
         'severity': severity,
         'critical_count': len(crit),
         'warning_count': len(warns),
@@ -4040,9 +4343,103 @@ def _diff_text_statement(label: str, artwork_raw, approved_raw, version) -> list
         f'"{str(artwork_raw).strip()[:300]}" — Approved: "{str(approved_raw).strip()[:300]}"')}]
 
 
+def _label_copy_from_reads(ingredients_raw, allergen_contains, artwork_panel) -> dict:
+    """Label-copy inputs from the OCR/vision reads — the path every file takes
+    when it has no live text."""
+    return {
+        'ingredients': {'text': ingredients_raw or None, 'path': 'ocr', 'unverified': None},
+        'contains': {'text': f'Contains: {allergen_contains}' if allergen_contains else None,
+                     'path': 'ocr', 'unverified': None},
+        'dv': {'values': {k: v for k, v in (artwork_panel or {}).items() if k.endswith('_dv')},
+               'path': 'ocr', 'unverified': {}},
+    }
+
+
+def _strip_label(text, label_re):
+    return re.sub(label_re, '', str(text or '').strip(), count=1, flags=re.I).strip()
+
+
+def _diff_label_element(label: str, el: dict, approved_raw, version) -> tuple:
+    """(issues, element) for one label-copy text element against the approved
+    panel. On the live-text path the comparison is character for character and
+    the finding shows the characters that differ: a difference in content is
+    CRITICAL, one only in case, spacing or punctuation is REVIEW. On the OCR path
+    only content can be compared (an OCR read cannot vouch for a comma)."""
+    path = el.get('path')
+    element = {'element': label, 'path': path, 'result': None, 'detail': ''}
+    if not approved_raw:
+        element.update(result='no_reference', detail='the approved panel carries no value for this')
+        return [], element
+    if el.get('unverified'):
+        element.update(result='not_evaluated', detail=el['unverified'])
+        return [{'severity': 'review', 'message': f'NOT EVALUATED — {label}: {el["unverified"]}'}], element
+    art = el.get('text')
+    if not art and path == 'live_text' and el.get('absent'):
+        # The text layer is the artwork's own copy: no such text is a finding,
+        # not a failed read.
+        element.update(result='mismatch', detail='absent from the artwork')
+        return [{'severity': 'critical', 'message': (
+            f'{label} is missing from the artwork (live text has none); the approved panel '
+            f'v{version} says: "{str(approved_raw).strip()[:300]}".')}], element
+    if not art:
+        element.update(result='not_evaluated', detail='not read from the artwork')
+        return [{'severity': 'review', 'message': (
+            f'{label} could not be read from the artwork to compare against the approved panel '
+            f'v{version}. Approved panel says: "{str(approved_raw).strip()[:300]}".')}], element
+    appr = str(approved_raw).strip()
+    if path == 'live_text':
+        import live_text as _lt
+        if art == appr:
+            element.update(result='match', detail='identical, character for character')
+            return [], element
+        diffs = _lt.char_diff(art, appr)
+        shown = '; '.join(f'at {d["at"]}: artwork "{d["artwork"]}" vs approved "{d["approved"]}" '
+                          f'(…{d["context"]}…)' for d in diffs[:6])
+        more = f' (+{len(diffs) - 6} more)' if len(diffs) > 6 else ''
+        element['diffs'] = diffs
+        if _normalize_stmt(art) == _normalize_stmt(appr) or _lt.content_equal(art, appr):
+            element.update(result='format_diff', detail=f'{len(diffs)} character difference(s)')
+            return [{'severity': 'review', 'message': (
+                f'{label} matches the approved panel v{version} in content, but not character for '
+                f'character (live text): {shown}{more}.')}], element
+        element.update(result='mismatch', detail=f'{len(diffs)} character difference(s)')
+        return [{'severity': 'critical', 'message': (
+            f'{label} differs from the approved panel v{version} (live text, character for '
+            f'character): {shown}{more}. Artwork: "{art[:300]}" — Approved: "{appr[:300]}"')}], element
+    issues = _diff_text_statement(label, art, appr, version)
+    element.update(result='mismatch' if any(i['severity'] == 'critical' for i in issues)
+                   else 'format_diff' if issues else 'match',
+                   detail='compared in content (OCR path cannot vouch for punctuation)')
+    return issues, element
+
+
+def _break_element(art_stmt, appr_stmt, path) -> tuple:
+    """(element, message) for the "contains less than 2% of:" break: how many
+    ingredients precede it on the artwork vs the approved statement."""
+    import live_text as _lt
+    a, p = _lt.two_percent_break(art_stmt or ''), _lt.two_percent_break(appr_stmt or '')
+    el = {'element': '2% break position', 'path': path, 'result': None, 'detail': ''}
+    desc = lambda b: (f'after ingredient {b["position"]} ("{b["after"]}")' if b else 'no "less than 2%" group')
+    if not appr_stmt:
+        el.update(result='no_reference', detail='the approved panel carries no ingredient statement')
+        return el, ''
+    if not art_stmt:
+        el.update(result='not_evaluated', detail='ingredient statement not read')
+        return el, ''
+    if bool(a) != bool(p) or (a and p and (a['position'] != p['position']
+                                             or _normalize_stmt(a['after']) != _normalize_stmt(p['after']))):
+        el.update(result='mismatch', detail=f'artwork {desc(a)}; approved {desc(p)}')
+        return el, f'The "less than 2%" break is {desc(a)} on the artwork, {desc(p)} on the approved panel.'
+    if a and p and a['wording'] != p['wording'] and path == 'live_text':
+        el.update(result='format_diff', detail=f'wording "{a["wording"]}" vs approved "{p["wording"]}"')
+        return el, ''
+    el.update(result='match', detail=desc(a))
+    return el, ''
+
+
 def _check_approved_panel(artwork_panel: dict, front_artwork: dict, ingredients_raw: str,
                           allergen_contains, approved, prior_panel_version=None,
-                          fetch_reason: str = 'not_found') -> dict:
+                          fetch_reason: str = 'not_found', label_copy: dict = None) -> dict:
     """Compare the artwork against the APPROVED nutrition panel of record in
     ReadyDoc (Products -> Nutrition panels). Once a panel is approved, this diff
     IS the nutrition source of truth; the front-vs-NFP self-consistency check
@@ -4119,21 +4516,66 @@ def _check_approved_panel(artwork_panel: dict, front_artwork: dict, ingredients_
     approved_panel = approved.get('panel') or {}
     approved_front = approved.get('front_callouts') or {}
 
+    # Label copy — ingredient statement, Contains line, %DV column, 2% break —
+    # from the live-text path when the file has one, else the OCR reads. Each
+    # element records the path it used (run summary + report).
+    lc = label_copy or _label_copy_from_reads(ingredients_raw, allergen_contains, artwork_panel)
+    elements = []
+    dv = lc['dv']
+    artwork_panel = {k: v for k, v in (artwork_panel or {}).items() if not k.endswith('_dv')}
+    artwork_panel.update({k: v for k, v in dv['values'].items() if k not in dv.get('unverified', {})})
+
     issues, gaps = _diff_panel_fields(artwork_panel, approved_panel, version)
     fc_issues, fc_gaps = _diff_front_callouts(front_artwork, approved_front)
     issues += fc_issues
     gaps += fc_gaps
-    issues += _diff_text_statement('Ingredient statement', ingredients_raw,
-                                   approved_panel.get('ingredients'), version)
-    _artwork_allergen = f'Contains: {allergen_contains}' if allergen_contains else ''
-    _allergen_diff = _diff_text_statement('Allergen statement', _artwork_allergen,
-                                          approved_panel.get('allergen_statement'), version)
+
+    appr_ingr = _strip_label(approved_panel.get('ingredients'), r'^ingredients?\s*:\s*') or None
+    ingr_el = dict(lc['ingredients'], text=_strip_label(lc['ingredients'].get('text'), r'^ingredients?\s*:\s*') or None)
+    ingr_issues, ingr_elem = _diff_label_element('Ingredient statement', ingr_el, appr_ingr, version)
+    brk_elem, brk_msg = _break_element(ingr_el['text'] if not ingr_el.get('unverified') else None,
+                                       appr_ingr, ingr_el['path'])
+    if brk_msg:
+        crit = next((i for i in ingr_issues if i['severity'] == 'critical'), None)
+        if crit:
+            crit['message'] += ' ' + brk_msg
+        else:
+            ingr_issues.append({'severity': 'critical', 'message': f'{brk_msg} (approved panel v{version})'})
+    issues += ingr_issues
+    elements += [ingr_elem, brk_elem]
+
+    appr_contains = approved_panel.get('allergen_statement')
+    if appr_contains and not re.match(r'^\s*contains\b', str(appr_contains), re.I):
+        appr_contains = f'Contains: {str(appr_contains).strip()}'
+    _allergen_diff, cont_elem = _diff_label_element('Allergen statement', lc['contains'], appr_contains, version)
     for _ad in _allergen_diff:
         _ad['kind'] = _FALCPA_ISSUE_KIND   # never softened by the suspect downgrade
     issues += _allergen_diff
+    elements.append(cont_elem)
+
+    # %DV column: compared above with the amounts; summarised here per path.
+    appr_dv = {g[3]: approved_panel.get(g[3]) for g in _PANEL_DV_GROUPS if approved_panel.get(g[3]) is not None}
+    dv_bad = sorted(k for k, v in appr_dv.items() if k in artwork_panel and not _amounts_equal(artwork_panel[k], v))
+    dv_missing = sorted(k for k in appr_dv if k not in artwork_panel)
+    for k, why in sorted(dv.get('unverified', {}).items()):
+        issues.append({'severity': 'review', 'message': f'NOT EVALUATED — {k.replace("_dv", "").replace("_", " ")} %DV: {why}'})
+    elements.append({'element': '%DV column', 'path': dv['path'],
+                     'result': ('no_reference' if not appr_dv else 'mismatch' if dv_bad
+                                else 'not_evaluated' if dv_missing else 'match'),
+                     'detail': (f'differs: {", ".join(dv_bad)}' if dv_bad else
+                                f'not read: {", ".join(dv_missing)}' if dv_missing else
+                                f'{len(appr_dv)} rows compared')})
     issues += [{'severity': 'review', 'message': (
         f'{label} could not be read from the artwork to cross-check against the approved '
         f'panel v{version} ({_fmt_amt(p_val)}) — verify manually.')} for label, p_val in gaps]
+
+    # A panel value seeded in bulk (PANEL_SEED.csv) has not been checked
+    # against its source yet; say so on every finding against it.
+    _seed = approved.get('source') or approved.get('seed_source')
+    if _seed:
+        for i in issues:
+            i['message'] += f' [approved value seeded from {_seed} — confirm against the source before acting]'
+            i['seeded'] = True
 
     if not is_approved:
         # Draft data is still real, comparable data — the useful middle state
@@ -4146,23 +4588,27 @@ def _check_approved_panel(artwork_panel: dict, front_artwork: dict, ingredients_
         # what the diff finds.
         for i in issues:
             i['message'] = f'vs DRAFT panel v{version} — {i["message"]}'
-        return {'status': 'PANEL_NOT_APPROVED', 'issues': issues, 'panel_version': version, 'notes': [
+        return {'status': 'PANEL_NOT_APPROVED', 'issues': issues, 'panel_version': version,
+                'label_copy': elements, 'panel_source': _seed, 'notes': [
             f'PANEL NOT APPROVED — the nutrition panel on file for this product (v{version}) '
             'is still a draft. Approving it in ReadyDoc is what lets artwork be released to '
             'print against it; this blocks print release whether or not the artwork itself '
             'is correct.']}
 
     if any(i['severity'] == 'critical' for i in issues):
-        return {'status': 'CRITICAL', 'issues': issues, 'panel_version': version, 'notes': []}
+        return {'status': 'CRITICAL', 'issues': issues, 'panel_version': version,
+                'label_copy': elements, 'panel_source': _seed, 'notes': []}
 
     if prior_panel_version is not None and version is not None and prior_panel_version < version:
-        return {'status': 'PANEL_SUPERSEDED', 'issues': issues, 'panel_version': version, 'notes': [
+        return {'status': 'PANEL_SUPERSEDED', 'issues': issues, 'panel_version': version,
+                'label_copy': elements, 'panel_source': _seed, 'notes': [
             f'PANEL SUPERSEDED — this file was last proofed against panel v{prior_panel_version}; '
             f'the approved panel is now v{version}. Today’s values still match, but re-confirm '
             'this reflects an intentional re-approval before relying on it.']}
 
     return {'status': 'VERIFIED', 'issues': issues, 'panel_version': version,
-           'notes': [f'Matches the approved nutrition panel v{version}.']}
+            'label_copy': elements, 'panel_source': _seed,
+            'notes': [f'Matches the approved nutrition panel v{version}.']}
 
 
 def _detect_extra_nfp_columns(tl: str) -> list:

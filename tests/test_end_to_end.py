@@ -218,6 +218,7 @@ def _install_engine_stubs(pe):
     pe._claude_vision_ocr = _memo(pe._claude_vision_ocr, 'vision')
     pe._read_nfp_panel = _memo(pe._read_nfp_panel, 'nfp_crop')
     pe._read_contains_crop = _memo(pe._read_contains_crop, 'contains_crop')
+    pe._read_disclaimer_crop = _memo(pe._read_disclaimer_crop, 'disclaimer_crop')
     pe._read_front_callouts = _memo(pe._read_front_callouts, 'front_crop')
     return local
 
@@ -463,8 +464,17 @@ def _run():
                 want = expected[key]['expect']
                 S.check(f'{d["id"]} {key}: not CLEAN (got {res.get("severity")})',
                         res.get('severity') != 'clean')
-                S.check(f'{d["id"]} {key}: INCOMPLETE (got {res.get("severity")})',
-                        res.get('severity') == exp['overall_status'].lower(), needs_vision=True)
+                # INCOMPLETE, or REVIEW where the label also carries a claims
+                # review (every pancake prints the DSHEA disclaimer) — REVIEW
+                # outranks INCOMPLETE. What matters: the master-list checks did
+                # not run, nothing was graded, nothing passed.
+                stray = [k for k, _ in _reviews(res) if k not in want.get('reviews_only_from', [])]
+                S.check(f'{d["id"]} {key}: gtin and netwt skipped, no graded finding, '
+                        f'{exp["overall_status"]} or claims-only REVIEW (got {res.get("severity")}, '
+                        f'skipped {res.get("checks_skipped")}, stray reviews {stray})',
+                        {'gtin', 'netwt'} <= set(res.get('checks_skipped') or []) and not _graded(res)
+                        and (res.get('severity') == exp['overall_status'].lower()
+                             or (res.get('severity') == 'review' and not stray)), needs_vision=True)
                 S.check(f'{d["id"]} {key}: serving size still reads {want["serving_size_g"]:g}g / '
                         f'{want["servings_per_container"]:g} with no master list (got '
                         f'{vals.get("serving_size_g")} / {vals.get("servings_per_container")})',

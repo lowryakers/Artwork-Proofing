@@ -217,6 +217,26 @@ def _run():
     finally:
         pe.ANTHROPIC_AVAILABLE, pe._anthropic = _prev
 
+    # ── 3b3. Panel crop: a tightened crop that reads nothing falls back ────
+    # CI run 38789924924: the geometric tightening kept a 1643x439 strip of a
+    # tall panel; all three orientations read nothing. Re-read the padded box.
+    from PIL import ImageDraw as _Dr
+    _tmp2 = os.path.join(tempfile.mkdtemp(), 'q.png')
+    _im = _Img.new('RGB', (1200, 1600), (150, 100, 60))
+    _Dr.Draw(_im).rectangle((400, 400, 800, 1200), fill='white')
+    _im.save(_tmp2)
+    _replies2 = iter(['{}', '{}', '{}', json.dumps(dict(_full, serving_size_g=37, serving_size_text='1 bottle (37g)'))])
+    pe.ANTHROPIC_AVAILABLE = True
+    pe._anthropic = types.SimpleNamespace(Anthropic=lambda api_key=None: types.SimpleNamespace(
+        messages=types.SimpleNamespace(create=lambda **k: _R(next(_replies2)))))
+    try:
+        d = []
+        got = pe._read_nfp_panel(_tmp2, [0.33, 0.25, 0.67, 0.75], diag=d)
+        check(f'panel crop: tightened read empty -> untightened box re-read ({got.get("serving_size_g")})',
+              got.get('serving_size_g') == 37.0 and any('re-reading the untightened box' in x for x in d))
+    finally:
+        pe.ANTHROPIC_AVAILABLE, pe._anthropic = _prev
+
     # ── 3c. Master-list fetch retries transient failures with backoff ───────
     _orig_fetch, _orig_sleep = A._fetch_sheet_rows, A.time.sleep
     calls = []
