@@ -1,5 +1,5 @@
 {
-  "note": "30 whey protein bottle press proofs (converter proof sheets, runs 73096882 / 7f8ce432), verified against the master list: decoded barcode GTIN == master GTIN and the sheet's Cust. Item Ref == the SKU that GTIN resolves to, for all 30. Every file is fully outlined (no text layer). Expected: zero CRITICAL and zero WARNING with spot colour and trim disabled. Add serving_size_g / servings_per_container / declared_net_weight_g per file (hand-verified) to also assert the panel read and a CLEAN verdict \u2014 the harness builds the approved-panel record from them.",
+  "note": "30 whey protein bottle press proofs (converter proof sheets, runs 73096882 / 7f8ce432), verified against the master list: decoded barcode GTIN == master GTIN and the sheet's Cust. Item Ref == the SKU that GTIN resolves to, for all 30. Every file is fully outlined (no text layer). Expected: zero CRITICAL and zero WARNING with spot colour and trim disabled. Add serving_size_g / servings_per_container / declared_net_weight_g per file (hand-verified) to also assert the panel read and a CLEAN verdict — the harness builds the approved-panel record from them.",
   "files": [
     {
       "file": "Apple_Pie_.pdf",
@@ -30,17 +30,6 @@
       "expect": {
         "fill_weight_g": 34.20123,
         "item_reference": "WHY-BTL-BDC",
-        "critical_count": 0,
-        "warning_count": 0
-      }
-    },
-    {
-      "file": "Blueberry_Muffin.pdf",
-      "sku": "WHY-BTL-BLM",
-      "gtin": "850079939325",
-      "expect": {
-        "fill_weight_g": 34.03623,
-        "item_reference": "WHY-BTL-BLM",
         "critical_count": 0,
         "warning_count": 0
       }

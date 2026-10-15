@@ -10,8 +10,8 @@ reports each file as an un-pulled pointer and skips this set (loudly).
 - `master_rows.csv` — the 30 `WHY-BTL-*` rows from the master export of
   2026-10-07, unmodified. The harness combines it with the pancake set's rows into
   one master list.
-- `expected.json` — per file: SKU, GTIN, fill weight, and the converter's
-  `Cust. Item Ref`. Verified for all 30: the decoded barcode is the master GTIN, and
+- `expected.json` — per file (29; Blueberry Muffin is a defect, below): SKU, GTIN,
+  fill weight, and the converter's `Cust. Item Ref`. Verified for all 30: the decoded barcode is the master GTIN, and
   the item reference is the SKU that GTIN resolves to. Expected: zero CRITICAL and
   zero WARNING with spot colour and trim disabled. Add `serving_size_g`,
   `servings_per_container` (and optionally `serving_size_desc`,
@@ -20,6 +20,11 @@ reports each file as an un-pulled pointer and skips this set (loudly).
 - `defects.json` — `DEFECT_item_ref_mismatch`: the Double Chocolate master row's
   SKU is planted as `BEF-BTL-DCH`, so the barcode resolves to a different SKU than
   the sheet's `WHY-BTL-DCH`. Expect exactly one CRITICAL on `item_reference`.
+  `DEFECT_dv_column_empty`: a **file-level** defect, `Blueberry_Muffin.pdf`
+  unmodified. Every % Daily Value cell on its Nutrition Facts panel is empty while
+  the `% Daily Value*` header and footnote are printed (verified at 800 dpi, run
+  `aa5b6042`). Expect exactly one CRITICAL on `nfp` naming the whole column, and no
+  other finding. The other 29 were checked by hand and carry a full %DV column.
 
 **These files have no text layer at all** (0 fonts) — the technical block, item
 reference included, is outlined too, so everything is read by OCR or vision.

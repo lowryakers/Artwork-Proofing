@@ -8,8 +8,8 @@ each fixture set's expected.json and defects.json.
 Fixture sets (each a folder with expected.json, master_rows.csv and optional
 defects.json):
   * tests/fixtures/artwork/        — 4 pancake pouches (run 9ffb350f), 7 scenarios
-  * tests/fixtures/artwork/whey/   — 30 whey protein bottles (Git LFS), 1 scenario
-  * tests/fixtures/artwork/beef/   — 2 clean beef protein bottles + 1 defect file (Git LFS)
+  * tests/fixtures/artwork/whey/   — 30 whey protein bottles (Git LFS), 2 scenarios
+  * tests/fixtures/artwork/beef/   — 4 clean beef protein bottles + 1 defect file (Git LFS)
 
 No mocks of the reader, no pre-extracted values, no synthetic images. What IS
 stubbed, deliberately, is the reference data:
@@ -62,7 +62,7 @@ REQUIRED = bool(os.environ.get('ARTPROOF_E2E_REQUIRED'))
 BRAND = {'brand_mode': 'prodough', 'proof_type': 'press', 'wind_direction': ''}
 CHECK_KEY = {'gtin': 'gtin', 'net_weight': 'netwt', 'spot_color': 'specs',
              'fda_falcpa': 'fda', 'approved_panel': 'panel', 'item_reference': 'item_reference',
-             'front_callout': 'front_callout'}
+             'front_callout': 'front_callout', 'nfp': 'nfp'}
 NFP_FIELDS = ('serving_size_g', 'serving_size_cups', 'servings_per_container', 'serving_size_desc')
 
 
@@ -484,7 +484,7 @@ def _run():
             continue
         (_, key, res, _), = runs
         crits = _criticals(res)
-        vision_dep = exp.get('check') in ('approved_panel', 'fda_falcpa', 'front_callout')
+        vision_dep = exp.get('check') in ('approved_panel', 'fda_falcpa', 'front_callout', 'nfp')
         if 'status' in exp:
             # A planted defect the tool must refuse to evaluate, not flag: the
             # check reports exp['status'] with the reason in its notes, and no

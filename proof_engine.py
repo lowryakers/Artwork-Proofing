@@ -1368,6 +1368,10 @@ _NFP_CROP_PROMPT = (
     '"calcium_mg": <number or null>, "calcium_dv": <%DV integer, or null>, '
     '"iron_mg": <number or null>, "iron_dv": <%DV integer, or null>, '
     '"potassium_mg": <number or null>, "potassium_dv": <%DV integer, or null>}\n'
+    'The % Daily Value column: every *_dv field is the integer printed in that row\'s % Daily '
+    'Value cell; the string "blank" if the row prints an amount but its % Daily Value cell is '
+    'EMPTY (nothing printed where the percentage would go); null only if you cannot read it. Also '
+    'return "dv_header": true if the "% Daily Value" column header is printed, else false.\n'
     'Take servings-per-container ONLY from the literal "servings per container" line — '
     'never a "Makes N" count. Read every row you can actually see. Numbers only, no units, '
     'EXCEPT: a value printed as a threshold form ("<1", "<5", etc. — below the FDA rounding '
@@ -1696,8 +1700,11 @@ def _read_nfp_panel(img_path: str, bbox, diag: list = None) -> dict:
                             f'reply {len(_txt)} chars with no JSON: {_txt[:80]!r}')
                 return {}
             data, _ = json.JSONDecoder().raw_decode(_txt[_start:])
-            out = {}
+            out, dv_blank = {}, []
             for k in _NFP_CROP_FIELDS:
+                if k.endswith('_dv') and str(data.get(k)).strip().lower() == 'blank':
+                    dv_blank.append(k)        # printed empty — not the same as unread
+                    continue
                 v = _parse_nfp_amount(data.get(k))
                 if v is not None:
                     out[k] = v
@@ -1709,7 +1716,14 @@ def _read_nfp_panel(img_path: str, bbox, diag: list = None) -> dict:
                 out['serving_size_text'] = st.strip()
             diag.append(f'{label}: {pim.width}x{pim.height}px {_sent}B sent; stop={_stop}, '
                         f'reply {len(_txt)} chars, {len(out)} fields read'
+                        + (f', %DV printed empty on {len(dv_blank)} rows' if out and dv_blank else '')
                         + ('' if out else ' (model returned the panel as unreadable)'))
+            # Column marks ride along only with a real read, so an empty read
+            # stays falsy and still triggers the untightened fallback.
+            if out:
+                out['dv_blank'] = dv_blank
+                if isinstance(data.get('dv_header'), bool):
+                    out['dv_header'] = data['dv_header']
             return out
 
         def _score(d):
@@ -2241,6 +2255,7 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
     vision_nfp_bbox = None
     vision_dshea = False
     nfp_read = {}
+    _dv_marks = {}
     _nfp_crop_diag = []
     _front_crop_diag = []
     _front_read, _full_front = None, {}
@@ -2280,6 +2295,8 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
         # Durable read: re-read the Nutrition Facts panel from an isolated crop so
         # its small digits are legible instead of squashed in the full-page pass.
         nfp_read = _read_nfp_panel(img_path, vision_nfp_bbox, diag=_nfp_crop_diag)
+        # %DV column marks are not panel values: keep them out of every value map.
+        _dv_marks = {k: nfp_read.pop(k) for k in ('dv_blank', 'dv_header') if k in nfp_read}
         print(f'[nfp-crop] {fname} ' + ('OK ' if nfp_read else 'NOTHING READ ') + ' | '.join(_nfp_crop_diag))
         # Front call-out rings: only the isolated read (panel masked) may supply
         # them. The full-page values are kept as unconfirmed — reported, never
@@ -2554,7 +2571,8 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
             _regex_nfp_proteins = checks['nfp'].get('nfp_data', {}).get('proteins') or []
             if len(_regex_nfp_proteins) == 1:
                 _nfp_protein_ref = _regex_nfp_proteins[0]
-        extra = (_check_net_carbs(label_text, _panel.get('serving_size_g'), nfp_read)
+        extra = (_check_dv_populated(nfp_read, _dv_marks)
+                 + _check_net_carbs(label_text, _panel.get('serving_size_g'), nfp_read)
                  + _check_superseded_nfp(_panel, matched_spec)
                  + _check_protein_claims(label_text, _nfp_protein_ref))
         if extra:
@@ -4187,6 +4205,35 @@ def _amounts_equal(a, b) -> bool:
         return abs(float(a) - float(b)) < 1e-9
     except (TypeError, ValueError):
         return a == b
+
+
+def _check_dv_populated(panel_read: dict, marks: dict) -> list:
+    """The %DV column must be populated. Every nutrient row with an established
+    Daily Value that declares an amount must print its %DV (21 CFR 101.9(d)(7)).
+    Run aa5b6042: Blueberry Muffin printed the "% Daily Value*" header and every
+    amount, and not one percentage — the panel read cleanly and nothing fired.
+
+    marks: {'dv_blank': [*_dv fields the panel read saw printed EMPTY],
+    'dv_header': bool}. Only a cell read as printed empty counts; an unreadable
+    cell is not evidence. A column whose header is printed and whose every row
+    is empty is ONE finding naming the column."""
+    blank_keys = set((marks or {}).get('dv_blank') or ())
+    rows = [(label, panel_read.get(a_amt), unit, a_dv in blank_keys, panel_read.get(a_dv) is not None)
+            for a_amt, _p, a_dv, _pd, label, unit in _PANEL_DV_GROUPS
+            if panel_read.get(a_amt) is not None]
+    blank = [(label, amt, unit) for label, amt, unit, is_blank, _f in rows if is_blank]
+    if not blank:
+        return []
+    filled = [r for r in rows if r[4]]
+    if len(blank) >= 3 and not filled and (marks or {}).get('dv_header') is not False:
+        return [{'severity': 'critical', 'message': (
+            'Nutrition panel prints the % Daily Value column header but the column is empty — '
+            f'{", ".join(f"{label} {_fmt_amt(amt)}{unit}" for label, amt, unit in blank)} all '
+            'declare an amount with no % Daily Value. %DV is required for nutrients with an '
+            'established DV.')}]
+    return [{'severity': 'critical', 'message': (
+        f'Nutrition panel declares {label} {_fmt_amt(amt)}{unit} with no % Daily Value. %DV is '
+        'required for nutrients with an established DV.')} for label, amt, unit in blank]
 
 
 def _diff_panel_fields(artwork: dict, approved_panel: dict, version) -> tuple:
