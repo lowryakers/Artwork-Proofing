@@ -18,6 +18,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import proof_engine as pe  # noqa: E402
 
+# Every NFP value from the panel crop, as the pipeline reports it when the crop read.
+CROP = {f: 'nfp_crop' for f in ('calories', 'protein_g', 'added_sugar_g')}
+
 
 def _run():
     fails = []
@@ -51,13 +54,13 @@ def _run():
     rings = {'rings': [{'number': '120', 'caption': 'Calories Per Serving'},
                        {'number': '25G', 'caption': 'Protein Per Serving'},
                        {'number': '0G', 'caption': 'Added Sugar'}]}
-    out = pe._check_front_callout(rings, {}, vn_nfp, vision_ran=True)
+    out = pe._check_front_callout(rings, {}, vn_nfp, vision_ran=True, nfp_sources=CROP)
     crits = [i['message'] for i in out['issues'] if i['severity'] == 'critical']
     check('the 0G-ring-vs-NFP-<1g contradiction surfaces as one CRITICAL, on added sugars, quoting <1',
           len(crits) == 1 and 'added sugars' in crits[0].lower() and '<1' in crits[0])
 
     # Matching 0g/0g must stay silent — not a blanket "always flag added sugar".
-    out_ok = pe._check_front_callout(rings, {}, dict(vn_nfp, added_sugar_g=0), vision_ran=True)
+    out_ok = pe._check_front_callout(rings, {}, dict(vn_nfp, added_sugar_g=0), vision_ran=True, nfp_sources=CROP)
     check('matching 0g/0g added sugar stays silent', out_ok['issues'] == [] and out_ok['status'] == 'OK')
 
     # ═══════════════════════════════════════════════════════════════════════

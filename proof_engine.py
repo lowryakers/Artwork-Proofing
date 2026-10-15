@@ -1135,7 +1135,7 @@ def _same_amount(a, b) -> bool:
 
 
 def _check_front_callout(front_read, full_page_front: dict, nfp_vals: dict,
-                         vision_ran: bool, diag: list = None) -> dict:
+                         vision_ran: bool, diag: list = None, *, nfp_sources: dict) -> dict:
     """Front call-out rings vs the Nutrition Facts panel, ring by ring.
 
     Each ring is read as a unit (number + caption from the same badge) and is
@@ -1148,6 +1148,13 @@ def _check_front_callout(front_read, full_page_front: dict, nfp_vals: dict,
         unread                              -> NOT EVALUATED for that ring
       no rings on the artwork               -> NOT_APPLICABLE
       ring read did not run or failed       -> NOT_RUN
+      NFP value not from the panel crop     -> NOT EVALUATED for that ring
+
+    nfp_sources: {field: reader} for every value in nfp_vals. Only an
+    'nfp_crop' value is compared; anything else is NOT EVALUATED, never a
+    match. Run aa5b6042: three files whose crop read nothing reported
+    "match (NFP 120)" from a value the full-page pass supplied. Each ring
+    records the NFP side's reader as nfp_reader.
 
     Calories is a do-not-exceed nutrient (21 CFR 101.9(g)(5)); a front call-out
     is a declaration. Run 142db86d / eccfd9c9: Toffee Cream's "100 Calories"
@@ -1203,12 +1210,22 @@ def _check_front_callout(front_read, full_page_front: dict, nfp_vals: dict,
             continue
         nv = nfp_vals.get(f)
         rec['nfp_value'] = nv
+        rec['nfp_reader'] = (nfp_sources or {}).get(f) if nv is not None else None
         if nv is None:
             rec['verdict'] = 'NOT EVALUATED'
             unevaluated += 1
             issues.append({'severity': 'review', 'message': (
                 f'NOT EVALUATED — front ring {label}: the Nutrition Facts {_RING_FIELD_LABEL[f]} value '
                 'was not read, so there is nothing to compare it with.')})
+            continue
+        if rec['nfp_reader'] != 'nfp_crop':
+            rec['verdict'] = 'NOT EVALUATED'
+            unevaluated += 1
+            issues.append({'severity': 'review', 'message': (
+                f'NOT EVALUATED — front ring {label}: the panel crop did not read the Nutrition Facts '
+                f'{_RING_FIELD_LABEL[f]}; the only value ({nv}) came from '
+                f'{rec["nfp_reader"] or "an unrecorded reader"}, which is not trusted for this '
+                'comparison. Check the ring against the panel by eye.')})
             continue
         if _same_amount(rec['value'], nv):
             rec['verdict'] = 'match'
@@ -1591,6 +1608,22 @@ def _settle_serving_g(first: dict, reread, diag: list) -> dict:
     return out
 
 
+def _implausible_tightened_crop(rw, rh, bw, bh):
+    """Why a tightened panel rectangle (rw x rh px) is not the Nutrition Facts
+    panel vision boxed (bw x bh px), or None if it is plausible. The panel's
+    white rectangle sits inside vision's box and has its shape: a vertical
+    panel stays tall, a tabular one stays wide. Run aa5b6042: three bottles
+    tightened to 904x433 / 951x433 letterboxes of tall panels (1046x3094 on the
+    same sheet geometry) and read nothing; CI run 38789924924: 1643x439."""
+    if rw < 0.5 * bw or rh < 0.5 * bh:
+        return 'kept under half of the box width or height'
+    if rh and bh:
+        ra, ba = rw / rh, bw / bh
+        if ra > 2 * ba or ra < 0.5 * ba:
+            return f'aspect {ra:.2f} vs the box\'s {ba:.2f}'
+    return None
+
+
 def _read_nfp_panel(img_path: str, bbox, diag: list = None) -> dict:
     """Durable NFP read: crop the Nutrition/Supplement Facts panel to its own image
     (using the bbox from the first vision pass) and read that rectangle in isolation.
@@ -1635,9 +1668,11 @@ def _read_nfp_panel(img_path: str, bbox, diag: list = None) -> dict:
                 bw, bh = (x1 - x0) * W, (y1 - y0) * H
                 cw, ch = candidate.size
                 rw, rh = (refined[2] - refined[0]) * cw, (refined[3] - refined[1]) * ch
-                if rw < 0.5 * bw or rh < 0.5 * bh:
+                _why = _implausible_tightened_crop(rw, rh, bw, bh)
+                if _why:
                     diag.append(f'tightened region {int(rw)}x{int(rh)}px rejected (vision box '
-                                f'{int(bw)}x{int(bh)}px) — not the panel')
+                                f'{int(bw)}x{int(bh)}px): {_why} — not the panel; falling back to the '
+                                'untightened box')
                     refined = None
             if refined:
                 rx0, ry0, rx1, ry1 = refined
@@ -2545,13 +2580,18 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
 
     # Front call-out rings vs the NFP — its own check, on every file, so the
     # report always says whether it ran (run eccfd9c9 could not tell).
+    # Which reader supplied each NFP value: the crop overrides the full-page
+    # pass wherever it read the field, so a value the crop lacks is full-page.
+    _nfp_for_front = (vision_nutrition or {}).get('nfp') or {}
+    _nfp_sources = {f: ('nfp_crop' if nfp_read.get(f) is not None else 'vision_full_page')
+                    for f in _RING_FIELD_LABEL if _nfp_for_front.get(f) is not None}
     checks['front_callout'] = _check_front_callout(
-        _front_read, _full_front, (vision_nutrition or {}).get('nfp'),
-        vision_ran=_front_read is not None, diag=_front_crop_diag)
+        _front_read, _full_front, _nfp_for_front, vision_ran=_front_read is not None,
+        diag=_front_crop_diag, nfp_sources=_nfp_sources)
     for _r in checks['front_callout'].get('rings', []):
         print(f'[front-callout] {fname} ring {_r.get("position") or "?"}: "{_r.get("number")}" bound to '
-              f'"{_r.get("caption")}" -> {_r.get("field") or "not compared"}; NFP {_r.get("nfp_value")} '
-              f'-> {_r.get("verdict")}')
+              f'"{_r.get("caption")}" -> {_r.get("field") or "not compared"}; NFP {_r.get("nfp_value")}'
+              f'<{_r.get("nfp_reader") or "absent"}> -> {_r.get("verdict")}')
     if not checks['front_callout'].get('rings'):
         print(f'[front-callout] {fname} {checks["front_callout"]["status"]}: '
               + ' '.join(checks['front_callout'].get('notes', [])))
@@ -3826,7 +3866,7 @@ def _norm_ing(s: str) -> str:
     """Normalize an ingredient name for comparison: lowercase, drop parenthetical
     detail, collapse whitespace, strip a leading "less than 2% of" preamble."""
     s = re.sub(r'\([^)]*\)', '', s or '').lower()
-    s = re.sub(r'contains?\s+less\s+than\s+\d+\s*%?\s*(?:of)?\s*:?', '', s)
+    s = re.sub(r'contains?\s+less\s+than\s+\d+\s*(?:%|percent\b)?\s*(?:of)?\s*:?', '', s)
     return re.sub(r'[^a-z0-9 ]', ' ', s).strip()
 
 
@@ -3858,7 +3898,7 @@ def _build_label_snapshot(text: str, panel: dict, vision_nutrition: dict,
     _ings, _minor_from = [], None
     for x in _split_ingredients(stmt):
         if _norm_ing(x):
-            if _minor_from is None and re.search(r'less\s+than\s+\d+\s*%', x, re.I):
+            if _minor_from is None and re.search(r'less\s+than\s+\d+\s*(?:%|percent\b)', x, re.I):
                 _minor_from = len(_ings)
             _ings.append(_norm_ing(x))
     return {
@@ -3868,7 +3908,7 @@ def _build_label_snapshot(text: str, panel: dict, vision_nutrition: dict,
         # Index in `ingredients` where the "contains less than 2% of:" group
         # starts (None without one). Crossing that line is a formula change.
         'ingredients_minor_from': _minor_from,
-        'has_less_than_2pct': bool(re.search(r'less\s+than\s+\d+\s*%', stmt.lower())),
+        'has_less_than_2pct': bool(re.search(r'less\s+than\s+\d+\s*(?:%|percent\b)', stmt.lower())),
         'front_callout': vn.get('front_callout', {}) or {},
         'nfp': vn.get('nfp', {}) or {},
         'nfp_extra_columns': _detect_extra_nfp_columns(tl),
@@ -4460,9 +4500,28 @@ def _diff_label_element(label: str, el: dict, approved_raw, version) -> tuple:
     return issues, element
 
 
+def _break_crossings(a: dict, p: dict) -> list:
+    """Ingredients on both statements that sit on opposite sides of the "less
+    than 2%" break: (name as printed on the artwork, side on the artwork). A
+    set comparison sees no difference; the order is the quantitative claim."""
+    side_p = {}
+    for side in ('major', 'minor'):
+        for x in p.get(side) or []:
+            side_p.setdefault(_norm_ing(x), side)
+    out = []
+    for side in ('major', 'minor'):
+        for x in a.get(side) or []:
+            other = side_p.get(_norm_ing(x))
+            if other and other != side:
+                out.append((re.sub(r'\s+', ' ', x).strip(' .'), side))
+    return out
+
+
 def _break_element(art_stmt, appr_stmt, path) -> tuple:
     """(element, message) for the "contains less than 2% of:" break: how many
-    ingredients precede it on the artwork vs the approved statement."""
+    ingredients precede it on the artwork vs the approved statement, and which
+    ingredients cross it. Run aa5b6042, Apple Pie: Natural Flavors before the
+    break on the artwork, after it on the approved panel — same ingredient set."""
     import live_text as _lt
     a, p = _lt.two_percent_break(art_stmt or ''), _lt.two_percent_break(appr_stmt or '')
     el = {'element': '2% break position', 'path': path, 'result': None, 'detail': ''}
@@ -4475,8 +4534,19 @@ def _break_element(art_stmt, appr_stmt, path) -> tuple:
         return el, ''
     if bool(a) != bool(p) or (a and p and (a['position'] != p['position']
                                              or _normalize_stmt(a['after']) != _normalize_stmt(p['after']))):
-        el.update(result='mismatch', detail=f'artwork {desc(a)}; approved {desc(p)}')
-        return el, f'The "less than 2%" break is {desc(a)} on the artwork, {desc(p)} on the approved panel.'
+        crossed = _break_crossings(a, p) if a and p else []
+        el.update(result='mismatch', detail=f'artwork {desc(a)}; approved {desc(p)}', crossed=[c[0] for c in crossed])
+        msg = f'The "less than 2%" break is {desc(a)} on the artwork, {desc(p)} on the approved panel.'
+        if crossed:
+            msg = ' '.join(
+                f'{name} is {"above" if side == "major" else "below"} the "less than 2%" break on the artwork '
+                f'({"2% or more" if side == "major" else "less than 2%"}) and '
+                f'{"below" if side == "major" else "above"} it on the approved panel '
+                f'({"less than 2%" if side == "major" else "2% or more"}).'
+                for name, side in crossed) + (
+                ' Ingredients are listed by predominance: crossing the break is a quantitative claim, '
+                f'not formatting. ({msg})')
+        return el, msg
     if a and p and a['wording'] != p['wording'] and path == 'live_text':
         el.update(result='format_diff', detail=f'wording "{a["wording"]}" vs approved "{p["wording"]}"')
         return el, ''
@@ -5704,7 +5774,8 @@ def _ingredient_list(text: str) -> list:
     out = []
     for body in _ingredient_statements(text):
         for part in re.split(r'[,;()\[\]]|\band\b|&', body.lower()):
-            part = re.sub(r'^\s*(?:contains\s+)?(?:less\s+than|\d+%\s+or\s+less)[^:]*:\s*', '', part)
+            part = re.sub(r'^\s*(?:contains\s+)?(?:less\s+than\s+\d+\s*(?:%|percent\b)|\d+\s*(?:%|percent\b)'
+                          r'\s+or\s+less)(?:\s+of)?(?:\s+each\s+of)?(?:\s+the\s+following)?\s*:?\s*', '', part)
             part = re.sub(r'\s+', ' ', part).strip(' .:*-')
             if part:
                 out.append(part)

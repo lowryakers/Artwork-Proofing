@@ -17,6 +17,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import proof_engine as pe  # noqa: E402
 
+# Every NFP value from the panel crop, as the pipeline reports it when the crop read.
+CROP = {f: 'nfp_crop' for f in ('calories', 'protein_g', 'added_sugar_g')}
+
 NFP = {'calories': 130, 'protein_g': 26, 'added_sugar_g': 0}
 
 
@@ -43,7 +46,7 @@ def _run():
         return [i for i in out['issues'] if i['severity'] == 'review']
 
     # ── The defect ──────────────────────────────────────────────────────────
-    out = pe._check_front_callout(TOFFEE, {}, NFP, vision_ran=True)
+    out = pe._check_front_callout(TOFFEE, {}, NFP, vision_ran=True, nfp_sources=CROP)
     c = crit(out)
     check('Toffee Cream: exactly one CRITICAL, naming calories, 100 and 130',
           len(c) == 1 and 'calories' in c[0]['message'] and ' 100' in c[0]['message']
@@ -58,54 +61,54 @@ def _run():
     # ── Correct rings ───────────────────────────────────────────────────────
     ok = _rings(('top-left', '26G', 'Protein Per Serving'), ('top-right', '0G', 'Added Sugar'),
                 ('bottom-left', '130', 'Calories Per Serving'), ('bottom-right', '100%', 'Grass-Fed Beef'))
-    out = pe._check_front_callout(ok, {'calories': 130, 'protein_g': 26}, NFP, vision_ran=True)
+    out = pe._check_front_callout(ok, {'calories': 130, 'protein_g': 26}, NFP, vision_ran=True, nfp_sources=CROP)
     check('a correct bottle: zero findings, status OK', out['issues'] == [] and out['status'] == 'OK')
 
     # ── Binding is by caption, never by position or order ───────────────────
     shuffled = {'rings': list(reversed(ok['rings']))}
     check('ring order does not change the result',
-          pe._check_front_callout(shuffled, {}, NFP, vision_ran=True)['issues'] == [])
+          pe._check_front_callout(shuffled, {}, NFP, vision_ran=True, nfp_sources=CROP)['issues'] == [])
     apple = _rings(('a', '25G', 'Protein Per Serving'), ('b', '1G', 'Added Sugar'),
                    ('c', '120', 'Calories Per Serving'))
     out = pe._check_front_callout(apple, {}, {'calories': 120, 'protein_g': 25, 'added_sugar_g': 1},
-                                  vision_ran=True)
+                                  vision_ran=True, nfp_sources=CROP)
     check('Apple Pie: the 1G Added Sugar ring is compared with added sugars, never with protein',
           out['issues'] == [] and out['rings'][1]['field'] == 'added_sugar_g')
 
     # ── NOT EVALUATED: only the ring that could not be read ─────────────────
     out = pe._check_front_callout(_rings(('a', '26G', None), ('b', '100', 'Calories Per Serving')),
-                                  {}, NFP, vision_ran=True)
+                                  {}, NFP, vision_ran=True, nfp_sources=CROP)
     check('caption unreadable -> NOT EVALUATED for that ring only; the calorie ring still CRITICAL',
           len(rev(out)) == 1 and 'caption could not be read' in rev(out)[0]['message']
           and len(crit(out)) == 1 and out['status'] == 'UNVERIFIED')
-    out = pe._check_front_callout(_rings(('a', None, 'Calories Per Serving')), {}, NFP, vision_ran=True)
+    out = pe._check_front_callout(_rings(('a', None, 'Calories Per Serving')), {}, NFP, vision_ran=True, nfp_sources=CROP)
     check('number unreadable -> NOT EVALUATED', len(rev(out)) == 1 and 'number could not be read'
           in rev(out)[0]['message'] and out['status'] == 'UNVERIFIED')
-    out = pe._check_front_callout(_rings(('a', '0G', 'Sugar')), {}, NFP, vision_ran=True)
+    out = pe._check_front_callout(_rings(('a', '0G', 'Sugar')), {}, NFP, vision_ran=True, nfp_sources=CROP)
     check('"Sugar" (added or total?) -> NOT EVALUATED, never bound by guess',
           len(rev(out)) == 1 and 'does not name one' in rev(out)[0]['message'] and not crit(out))
     out = pe._check_front_callout(_rings(('a', '130', 'Calories Per Serving')), {}, {'protein_g': 26},
-                                  vision_ran=True)
+                                  vision_ran=True, nfp_sources=CROP)
     check('NFP field not read -> NOT EVALUATED', len(rev(out)) == 1 and 'was not read' in rev(out)[0]['message'])
     out = pe._check_front_callout(_rings(('a', '100', 'Calories Per Serving'), ('b', '130', 'Calories')),
-                                  {}, NFP, vision_ran=True)
+                                  {}, NFP, vision_ran=True, nfp_sources=CROP)
     check('two calorie rings with different numbers -> NOT EVALUATED, not a pick',
           len(rev(out)) == 2 and not crit(out))
     out = pe._check_front_callout(_rings(('a', '26G', 'Protein Per Serving')), {'calories': 130}, NFP,
-                                  vision_ran=True)
+                                  vision_ran=True, nfp_sources=CROP)
     check('a calorie call-out only the full-page pass saw -> NOT EVALUATED, not compared',
           len(rev(out)) == 1 and 'only the full-page pass saw it' in rev(out)[0]['message'])
 
     # ── Did it run? Always one of three answers ─────────────────────────────
-    out = pe._check_front_callout({'rings': []}, {}, NFP, vision_ran=True)
+    out = pe._check_front_callout({'rings': []}, {}, NFP, vision_ran=True, nfp_sources=CROP)
     check('no rings on the artwork -> NOT_APPLICABLE, no finding',
           out['status'] == 'NOT_APPLICABLE' and out['issues'] == [])
-    out = pe._check_front_callout({'rings': []}, {'calories': 100}, NFP, vision_ran=True)
+    out = pe._check_front_callout({'rings': []}, {'calories': 100}, NFP, vision_ran=True, nfp_sources=CROP)
     check('ring read found none but the full page saw some -> NOT_RUN', out['status'] == 'NOT_RUN')
-    out = pe._check_front_callout({}, {}, NFP, vision_ran=True, diag=['error: Timeout'])
+    out = pe._check_front_callout({}, {}, NFP, vision_ran=True, nfp_sources=CROP, diag=['error: Timeout'])
     check('ring read failed -> NOT_RUN, with the reason', out['status'] == 'NOT_RUN'
           and 'error: Timeout' in out['notes'][0])
-    out = pe._check_front_callout(None, {}, NFP, vision_ran=False)
+    out = pe._check_front_callout(None, {}, NFP, vision_ran=False, nfp_sources=CROP)
     check('vision did not run -> NOT_RUN', out['status'] == 'NOT_RUN')
     for st, want in (('NOT_RUN', 'skipped'), ('UNVERIFIED', 'skipped'), ('OK', 'run'), ('FAIL', 'run')):
         run, skipped = pe._completeness({'front_callout': {'status': st}})
@@ -115,7 +118,7 @@ def _run():
           and pe._not_applicable_checks({'front_callout': {'status': 'NOT_APPLICABLE'}}) == ['front_callout'])
 
     # ── CRITICAL is not softened by a doubtful read elsewhere on the file ───
-    toffee = pe._check_front_callout(TOFFEE, {}, NFP, vision_ran=True)
+    toffee = pe._check_front_callout(TOFFEE, {}, NFP, vision_ran=True, nfp_sources=CROP)
     checks = {'front_callout': toffee,
               'netwt': {'issues': [{'severity': 'suspect', 'message': 'SUSPECT READ — serving size'}]}}
     pe._downgrade_criticals_on_suspect_file(checks)

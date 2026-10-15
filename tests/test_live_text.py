@@ -54,8 +54,8 @@ def _run():
             'total_carbohydrate': '1%', 'dietary_fiber': '0%', 'added_sugars': '0%', 'vitamin_d': '0%',
             'calcium': '2%', 'iron': '0%', 'potassium': '4%'})
     check('2% break: after ingredient 5 (MCT Oil Powder)',
-          L.two_percent_break(F.INGREDIENTS) == {'wording': 'contains less than 2% of:', 'position': 5,
-                                                 'after': 'MCT Oil Powder'})
+          {k: v for k, v in L.two_percent_break(F.INGREDIENTS).items() if k not in ('major', 'minor')}
+          == {'wording': 'contains less than 2% of:', 'position': 5, 'after': 'MCT Oil Powder'})
     check('ligature glyphs are text-layer artefacts, not characters', L.clean('Layﬂat') == 'Layflat')
 
     # ── Pairing and layout ──────────────────────────────────────────────────

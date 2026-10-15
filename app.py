@@ -1233,7 +1233,8 @@ def _generate_report(job: dict, brand_name: str = 'ProDough') -> io.BytesIO:
             if mine:
                 val = '; '.join(
                     f'{x.get("number") or "?"} — bound to "{x.get("caption") or "?"}" — {x.get("reader")} — '
-                    f'{x.get("verdict")}' + (f' (NFP {x.get("nfp_value")})' if x.get('nfp_value') is not None else '')
+                    f'{x.get("verdict")}' + (f' (NFP {x.get("nfp_value")} — {x.get("nfp_reader") or "reader not recorded"})'
+                       if x.get('nfp_value') is not None else '')
                     for x in mine)
             else:
                 val = ('no such ring' if fc_check.get('status') in ('OK', 'FAIL', 'UNVERIFIED', 'NOT_APPLICABLE')
