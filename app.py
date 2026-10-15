@@ -841,6 +841,16 @@ def viewer(job_id):
     return redirect(url_for('result', job_id=job_id))
 
 
+@app.route('/summary/<job_id>.json')
+def summary_json(job_id):
+    """Machine-readable run summary (SKU, check, result, path used) for the
+    tracker. Computed from the stored results, so it reflects dismissals."""
+    job = proof_engine.get_job(job_id)
+    if not job:
+        return jsonify({'error': 'job not found'}), 404
+    return jsonify(proof_engine.run_summary(job))
+
+
 @app.route('/summary/<job_id>')
 def summary(job_id):
     job = proof_engine.get_job(job_id)
