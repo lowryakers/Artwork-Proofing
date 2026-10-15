@@ -187,6 +187,24 @@ def _run():
         pe.ANTHROPIC_AVAILABLE, pe.PIL_AVAILABLE, pe._anthropic, pe.Image = prev
         os.remove(tmp)
 
+    # DSHEA disclaimer crop: same near-panel read; only the disclaimer's own
+    # wording is accepted.
+    replies = iter(['{"disclaimer": null}', '{"disclaimer": "*These statements have not been evaluated by the FDA."}'])
+    pe.ANTHROPIC_AVAILABLE, pe.PIL_AVAILABLE, pe.Image = True, True, Image
+    pe._anthropic = types.SimpleNamespace(Anthropic=lambda api_key=None: types.SimpleNamespace(
+        messages=types.SimpleNamespace(create=lambda **k: _R(next(replies)))))
+    tmp = os.path.join(os.path.dirname(__file__), '_disc_tmp.png')
+    Image.new('RGB', (1200, 900), 'white').save(tmp)
+    try:
+        check('disclaimer crop: not read straight, read rotated',
+              (pe._read_disclaimer_crop(tmp, [0.4, 0.4, 0.6, 0.6]) or '').startswith('*These statements'))
+        replies = iter(['{"disclaimer": "Keep refrigerated."}'] * 3)
+        check('disclaimer crop: other small print is not the disclaimer',
+              pe._read_disclaimer_crop(tmp, [0.4, 0.4, 0.6, 0.6]) is None)
+    finally:
+        pe.ANTHROPIC_AVAILABLE, pe.PIL_AVAILABLE, pe._anthropic, pe.Image = prev
+        os.remove(tmp)
+
     print()
     if fails:
         print('FAILURES:', *fails, sep='\n  - ')

@@ -1637,9 +1637,19 @@ def _read_nfp_panel(img_path: str, bbox, diag: list = None) -> dict:
             # located geometrically — excludes an adjacent strip or other
             # artwork the padding can otherwise pull into the crop.
             refined = _largest_white_region_bbox_frac(candidate)
+            # A tightened rectangle that kept under half of vision's box height
+            # or width found some other white region, not the panel (CI run
+            # 38789924924: a 1643x439 strip of a tall panel; nothing read).
+            if refined:
+                bw, bh = (x1 - x0) * W, (y1 - y0) * H
+                cw, ch = candidate.size
+                rw, rh = (refined[2] - refined[0]) * cw, (refined[3] - refined[1]) * ch
+                if rw < 0.5 * bw or rh < 0.5 * bh:
+                    diag.append(f'tightened region {int(rw)}x{int(rh)}px rejected (vision box '
+                                f'{int(bw)}x{int(bh)}px) — not the panel')
+                    refined = None
             if refined:
                 rx0, ry0, rx1, ry1 = refined
-                cw, ch = candidate.size
                 tx0, ty0 = px0 + int(rx0 * cw), py0 + int(ry0 * ch)
                 tx1, ty1 = px0 + int(rx1 * cw), py0 + int(ry1 * ch)
                 crop = im.crop((tx0, ty0, tx1, ty1)) if (tx1 - tx0 >= 8 and ty1 - ty0 >= 8) else candidate
@@ -1653,16 +1663,21 @@ def _read_nfp_panel(img_path: str, bbox, diag: list = None) -> dict:
             # the panel unread, and still degrades to {} if nothing legible comes back.
             crop = im
             diag.append(f'panel NOT located by vision — reading the whole page {W}x{H}px')
-        crop = _upright(crop)
-        # Upscale small crops so digits are large; then cap to the API's ~1.1MP.
-        _long = max(crop.width, crop.height)
-        if _long < 1600:
-            s = min(3.0, 1600.0 / _long)
-            crop = crop.resize((int(crop.width * s), int(crop.height * s)))
-        _cap = 1_140_000
-        if crop.width * crop.height > _cap:
-            s = (_cap / float(crop.width * crop.height)) ** 0.5
-            crop = crop.resize((max(1, int(crop.width * s)), max(1, int(crop.height * s))))
+        def _prep(c):
+            c = _upright(c)
+            # Upscale small crops so digits are large; then cap to the API's ~1.1MP.
+            _long = max(c.width, c.height)
+            if _long < 1600:
+                s = min(3.0, 1600.0 / _long)
+                c = c.resize((int(c.width * s), int(c.height * s)))
+            _cap = 1_140_000
+            if c.width * c.height > _cap:
+                s = (_cap / float(c.width * c.height)) ** 0.5
+                c = c.resize((max(1, int(c.width * s)), max(1, int(c.height * s))))
+            return c
+
+        _untightened = candidate if bbox and crop is not candidate else None
+        crop = _prep(crop)
 
         _client = _anthropic.Anthropic(api_key=os.environ['ANTHROPIC_API_KEY'])
 
@@ -1717,15 +1732,24 @@ def _read_nfp_panel(img_path: str, bbox, diag: list = None) -> dict:
 
         # Straight read first; only try flipped/rotated orientations if it is sparse,
         # to keep the call count down. Mirror (left-right) is the common film case.
-        best, best_img = _read_crop(crop, 'straight'), crop
-        if _score(best) < 3:
-            for _t, _lbl in ((Image.FLIP_LEFT_RIGHT, 'mirrored'), (Image.ROTATE_180, 'rotated 180')):
-                alt_img = crop.transpose(_t)
-                alt = _read_crop(alt_img, _lbl)
-                if _score(alt) > _score(best):
-                    best, best_img = alt, alt_img
-                if _score(best) >= 3:
-                    break
+        def _read_all(c, tag=''):
+            b, b_img = _read_crop(c, tag + 'straight'), c
+            if _score(b) < 3:
+                for _t, _lbl in ((Image.FLIP_LEFT_RIGHT, 'mirrored'), (Image.ROTATE_180, 'rotated 180')):
+                    alt_img = c.transpose(_t)
+                    alt = _read_crop(alt_img, tag + _lbl)
+                    if _score(alt) > _score(b):
+                        b, b_img = alt, alt_img
+                    if _score(b) >= 3:
+                        break
+            return b, b_img
+
+        best, best_img = _read_all(crop)
+        # The geometric tightening can still pick the wrong white region; when
+        # the tightened crop reads nothing, read the panel's padded box instead.
+        if not best and _untightened is not None:
+            diag.append('tightened crop read nothing — re-reading the untightened box')
+            best, best_img = _read_all(_prep(_untightened), 'untightened ')
         best = _settle_serving_g(best, lambda: _read_crop(best_img, 're-read'), diag)
         best.pop('serving_size_text', None)
         return best
@@ -1749,14 +1773,11 @@ _CONTAINS_CROP_PROMPT = (
     'and null if you cannot clearly read one.')
 
 
-def _read_contains_crop(img_path: str, bbox):
-    """The FALCPA "Contains:" line, re-read from a crop around the Nutrition
-    Facts panel. The full-page vision pass misses it on small, upside-down back
-    panels (run 37975487968: the buttermilk pouch read no Contains line, so a
-    record declaring Wheat could not be checked). The declaration sits beside
-    the panel with the ingredients, so a padded crop of the panel's box holds
-    it. Tries the crop as is, rotated 180 and mirrored. Returns the statement
-    text, or None. Never raises."""
+def _read_near_panel(img_path: str, bbox, prompt: str, accept, max_tokens: int = 300):
+    """Ask about the text around the Nutrition Facts panel — a padded crop of
+    the panel's box, turned upright, tried as is, rotated 180 and mirrored.
+    `accept(data)` returns the answer to keep from the reply JSON, or None to
+    try the next orientation. None when nothing is accepted. Never raises."""
     if not (ANTHROPIC_AVAILABLE and PIL_AVAILABLE and bbox):
         return None
     try:
@@ -1780,11 +1801,11 @@ def _read_contains_crop(img_path: str, bbox):
             _b = io.BytesIO()
             pim.save(_b, format='JPEG', quality=95)
             _msg = _client.messages.create(
-                model='claude-sonnet-4-6', max_tokens=300, extra_body={'temperature': 0},
+                model='claude-sonnet-4-6', max_tokens=max_tokens, extra_body={'temperature': 0},
                 messages=[{'role': 'user', 'content': [
                     {'type': 'image', 'source': {'type': 'base64', 'media_type': 'image/jpeg',
                                                  'data': base64.standard_b64encode(_b.getvalue()).decode('utf-8')}},
-                    {'type': 'text', 'text': _CONTAINS_CROP_PROMPT}]}])
+                    {'type': 'text', 'text': prompt}]}])
             if getattr(_msg, 'stop_reason', None) == 'max_tokens':
                 continue
             _txt = next((b.text for b in (_msg.content or []) if getattr(b, 'text', None)), '')
@@ -1792,14 +1813,51 @@ def _read_contains_crop(img_path: str, bbox):
             if _start < 0:
                 continue
             data, _ = json.JSONDecoder().raw_decode(_txt[_start:])
-            cs = data.get('contains_statement')
-            if isinstance(cs, str) and cs.strip() and cs.strip().lower() not in ('null', 'none', 'n/a') \
-                    and any(_canonical_allergen(p) for p in re.split(r'[,;/&]|\band\b', cs)):
-                return re.sub(r'(?i)^\s*contains\s*:?\s*', '', cs.strip())
+            got = accept(data)
+            if got:
+                return got
         return None
     except Exception as _e:
-        print(f'[vision] contains-crop read failed: {_e}')
+        print(f'[vision] near-panel read failed: {_e}')
         return None
+
+
+def _read_contains_crop(img_path: str, bbox):
+    """The FALCPA "Contains:" line, re-read from a crop around the Nutrition
+    Facts panel. The full-page vision pass misses it on small, upside-down back
+    panels (run 37975487968: the buttermilk pouch read no Contains line, so a
+    record declaring Wheat could not be checked). The declaration sits beside
+    the panel with the ingredients, so a padded crop of the panel's box holds
+    it. Returns the statement text, or None. Never raises."""
+    def _accept(data):
+        cs = data.get('contains_statement')
+        if isinstance(cs, str) and cs.strip() and cs.strip().lower() not in ('null', 'none', 'n/a') \
+                and any(_canonical_allergen(p) for p in re.split(r'[,;/&]|\band\b', cs)):
+            return re.sub(r'(?i)^\s*contains\s*:?\s*', '', cs.strip())
+        return None
+    return _read_near_panel(img_path, bbox, _CONTAINS_CROP_PROMPT, _accept)
+
+
+_DISCLAIMER_CROP_PROMPT = (
+    'This image is a crop of a food package back panel around its Nutrition Facts table. It may be '
+    'upside down, rotated or MIRROR-REVERSED; read it correctly oriented. Is there a disclaimer that '
+    'begins "These statements have not been evaluated" (often in a small box, with an asterisk)? '
+    'Return ONLY this JSON object:\n'
+    '{"disclaimer": "<the disclaimer copied exactly as printed, or null if none is visible in this image>"}')
+
+
+def _read_disclaimer_crop(img_path: str, bbox):
+    """The DSHEA disclaimer, read from the area around the Nutrition Facts panel
+    (where the pancake pouches print it, upside down and small — the full-page
+    pass and the tiled whole-artwork read each missed it on 3 of 4 pouches, CI
+    run 38789924924). Returns the text only if it carries the disclaimer's own
+    wording. Never raises."""
+    def _accept(data):
+        t = data.get('disclaimer')
+        if isinstance(t, str) and re.search(r'statements\s+have\s+not\s+been\s+evaluated', t, re.I):
+            return t.strip()
+        return None
+    return _read_near_panel(img_path, bbox, _DISCLAIMER_CROP_PROMPT, _accept)
 
 
 # Live-text path: on hold until live-text PDFs are confirmed available from the
@@ -2379,6 +2437,11 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
     _snapshot['dshea_disclaimer'] = (bool(_snapshot.get('dshea_disclaimer')) or vision_dshea
                                      or bool(re.search(_dshea_re, combined_text, re.I))
                                      or bool(re.search(_dshea_re, (_front_read or {}).get('disclaimer') or '', re.I)))
+    # Not found yet: a targeted, upright read of the panel's surroundings, where
+    # back-panel disclaimers sit. Only then — most files already have an answer.
+    if not _snapshot['dshea_disclaimer'] and vision_nfp_bbox:
+        _snapshot['dshea_disclaimer'] = bool(_read_disclaimer_crop(img_path, vision_nfp_bbox))
+    print(f'[dshea] {fname} disclaimer {"present" if _snapshot["dshea_disclaimer"] else "not found"}')
     _prior_snapshot = _fetch_prior_snapshot(_gtin_lookup, _sku_lookup)
 
     # Approved-nutrition-panel comparison (the outside-the-artwork source of
