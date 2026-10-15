@@ -1295,20 +1295,7 @@ def _read_front_callouts(img_path: str, nfp_bbox=None, diag: list = None) -> dic
         # 2x2 overlapping tiles: one image of a 14,000 px pouch, shrunk to the
         # API's pixel budget, left ring captions a few pixels tall (CI run
         # 38312701844: "0G / Sugar", "100% / Gluten Free Flour").
-        _cap = 1_140_000
-        tiles, ov = [], 0.15
-        cw, ch = crop.size
-        for ty in (0, 1):
-            for tx in (0, 1):
-                x0 = max(0, int((tx * 0.5 - ov / 2) * cw)); x1 = min(cw, int(((tx + 1) * 0.5 + ov / 2) * cw))
-                y0 = max(0, int((ty * 0.5 - ov / 2) * ch)); y1 = min(ch, int(((ty + 1) * 0.5 + ov / 2) * ch))
-                t = crop.crop((x0, y0, x1, y1))
-                if t.width * t.height > _cap:
-                    sc = (_cap / float(t.width * t.height)) ** 0.5
-                    t = t.resize((max(1, int(t.width * sc)), max(1, int(t.height * sc))))
-                _tb = io.BytesIO()
-                t.save(_tb, format='JPEG', quality=92)
-                tiles.append(_tb.getvalue())
+        tiles = _jpeg_tiles(crop)
         _client = _anthropic.Anthropic(api_key=os.environ['ANTHROPIC_API_KEY'])
         _msg = _client.messages.create(
             model='claude-sonnet-4-6', max_tokens=800, extra_body={'temperature': 0},
@@ -1773,6 +1760,34 @@ _CONTAINS_CROP_PROMPT = (
     'and null if you cannot clearly read one.')
 
 
+_API_PIXELS = 1_140_000
+
+
+def _jpeg_tiles(img, overlap: float = 0.15) -> list:
+    """`img` as JPEG bytes, whole if it fits the API's pixel budget, else as a
+    2x2 grid of overlapping tiles, each within the budget. Shrinking a large
+    crop (a 14,500 px pouch proof) to one budget-sized image leaves small print
+    a few pixels tall; tiles keep about twice the resolution."""
+    import io
+    def _fit(t):
+        if t.width * t.height > _API_PIXELS:
+            sc = (_API_PIXELS / float(t.width * t.height)) ** 0.5
+            t = t.resize((max(1, int(t.width * sc)), max(1, int(t.height * sc))))
+        b = io.BytesIO()
+        t.save(b, format='JPEG', quality=92)
+        return b.getvalue()
+    if img.width * img.height <= _API_PIXELS * 1.5:
+        return [_fit(img)]
+    w, h = img.size
+    out = []
+    for ty in (0, 1):
+        for tx in (0, 1):
+            x0 = max(0, int((tx * 0.5 - overlap / 2) * w)); x1 = min(w, int(((tx + 1) * 0.5 + overlap / 2) * w))
+            y0 = max(0, int((ty * 0.5 - overlap / 2) * h)); y1 = min(h, int(((ty + 1) * 0.5 + overlap / 2) * h))
+            out.append(_fit(img.crop((x0, y0, x1, y1))))
+    return out
+
+
 def _read_near_panel(img_path: str, bbox, prompt: str, accept, max_tokens: int = 300):
     """Ask about the text around the Nutrition Facts panel — a padded crop of
     the panel's box, turned upright, tried as is, rotated 180 and mirrored.
@@ -1791,21 +1806,18 @@ def _read_near_panel(img_path: str, bbox, prompt: str, accept, max_tokens: int =
         if box[2] - box[0] < 8 or box[3] - box[1] < 8:
             return None
         crop = _upright(im.crop(box))
-        _cap = 1_140_000
-        if crop.width * crop.height > _cap:
-            sc = (_cap / float(crop.width * crop.height)) ** 0.5
-            crop = crop.resize((max(1, int(crop.width * sc)), max(1, int(crop.height * sc))))
         _client = _anthropic.Anthropic(api_key=os.environ['ANTHROPIC_API_KEY'])
         for _t in (None, Image.ROTATE_180, Image.FLIP_LEFT_RIGHT):
             pim = crop if _t is None else crop.transpose(_t)
-            _b = io.BytesIO()
-            pim.save(_b, format='JPEG', quality=95)
+            tiles = _jpeg_tiles(pim)
+            _lead = ([{'type': 'text', 'text': 'These images are overlapping tiles of one crop.'}]
+                     if len(tiles) > 1 else [])
             _msg = _client.messages.create(
                 model='claude-sonnet-4-6', max_tokens=max_tokens, extra_body={'temperature': 0},
-                messages=[{'role': 'user', 'content': [
+                messages=[{'role': 'user', 'content': _lead + [
                     {'type': 'image', 'source': {'type': 'base64', 'media_type': 'image/jpeg',
-                                                 'data': base64.standard_b64encode(_b.getvalue()).decode('utf-8')}},
-                    {'type': 'text', 'text': prompt}]}])
+                                                 'data': base64.standard_b64encode(tb).decode('utf-8')}}
+                    for tb in tiles] + [{'type': 'text', 'text': prompt}]}])
             if getattr(_msg, 'stop_reason', None) == 'max_tokens':
                 continue
             _txt = next((b.text for b in (_msg.content or []) if getattr(b, 'text', None)), '')
