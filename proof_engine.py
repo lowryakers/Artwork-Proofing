@@ -1489,10 +1489,35 @@ def _panel_rules(img, width: int = 900):
                 # Every qualifying run, not only the row's longest: light
                 # lettering on dark artwork bounds runs too, but those end
                 # all over the place, and the grouping below leaves them out.
-                if run >= min_run and start > 0 and wt[x, y] >= 250 and wt[start - 1, y] >= 250:
+                # White within a few pixels of each end: the edge pixel itself
+                # is anti-aliased grey.
+                if run >= min_run and start > 0 \
+                        and any(wt[i, y] >= 250 for i in range(x, min(W, x + 4))) \
+                        and any(wt[i, y] >= 250 for i in range(max(0, start - 4), start)):
                     runs.append((y, start, x))
                 run = 0
     g = g_out
+    # A rule is printed on the panel's white ground: going up and going down
+    # from it, across its length, the first pixel that is not dark is white.
+    # A run of dark artwork between light letters has more artwork above and
+    # below it (Blueberry Muffin: navy runs ending at the ingredient text's
+    # left margin all share a right end, and outnumber the panel's rules).
+    def _on_white(y, x0, x1):
+        good = 0
+        for i in range(9):
+            x = x0 + (x1 - x0) * (i + 0.5) / 9
+            x = int(x)
+            ok = True
+            for step in (-1, 1):
+                yy = y
+                while 0 <= yy < H and dk[x, yy] > 0 and abs(yy - y) < 60:
+                    yy += step
+                edge = [yy + step * k for k in range(4) if 0 <= yy + step * k < H]
+                if not edge or not any(wt[x, e] >= 250 for e in edge):   # past a grey edge
+                    ok = False
+            good += ok
+        return good >= 7
+    runs = [r for r in runs if _on_white(*r)]
     tol = max(3, int(0.01 * W))
     groups = {}
     for r in runs:
@@ -1770,8 +1795,11 @@ def _read_nfp_panel(img_path: str, bbox, diag: list = None) -> dict:
         W, H = im.size
         if bbox:
             x0, y0, x1, y1 = bbox
-            # Pad generously so a slightly-off or tight box still contains the panel.
-            pw, ph = (x1 - x0) * 0.15, (y1 - y0) * 0.15
+            # Pad generously so a slightly-off or tight box still contains the
+            # panel — sideways most: vision's box is often shifted a column's
+            # width (Neapolitan: its whole %DV column fell outside a 15% pad).
+            # The crop is narrowed back to the panel's own rules below.
+            pw, ph = (x1 - x0) * 0.30, (y1 - y0) * 0.15
             px0, py0 = max(0, int((x0 - pw) * W)), max(0, int((y0 - ph) * H))
             px1, py1 = min(W, int((x1 + pw) * W)), min(H, int((y1 + ph) * H))
             if px1 - px0 < 8 or py1 - py0 < 8:
@@ -1826,6 +1854,23 @@ def _read_nfp_panel(img_path: str, bbox, diag: list = None) -> dict:
         # A crop much larger than the panel its rules outline is narrowed to
         # it, so the rows keep their size once shrunk to the API's budget.
         _rect = _nfp_rect_from_rules(crop)
+        _clipped = _rect is not None and (_rect[0] == 0 or _rect[1] == 0 or _rect[2] == crop.width
+                                          or _rect[3] == crop.height)
+        # No panel rules in the crop, or they run into its edge: vision's box
+        # sits off the panel (Neapolitan: a column to the left; the chocolate
+        # pancake: short of the panel's lower half, Protein included). Look
+        # again, wider, up to twice; take the panel where it is whole.
+        for _grow in ((0.6, 1.2) if bbox else ()):
+            if _rect is not None and not _clipped:
+                break
+            _why = 'panel rules run into the crop\'s edge' if _clipped else 'no panel rules in the crop'
+            _wide = im.crop((max(0, int((x0 - (x1 - x0) * _grow) * W)), max(0, int((y0 - (y1 - y0) * _grow) * H)),
+                             min(W, int((x1 + (x1 - x0) * _grow) * W)), min(H, int((y1 + (y1 - y0) * _grow) * H))))
+            _wrect = _nfp_rect_from_rules(_wide)
+            if _wrect:
+                diag.append(f'{_why} — found them in a wider box {_wide.width}x{_wide.height}px')
+                crop, _rect = _wide, _wrect
+                _clipped = (_rect[0] == 0 or _rect[1] == 0 or _rect[2] == crop.width or _rect[3] == crop.height)
         if _rect and (_rect[2] - _rect[0]) * (_rect[3] - _rect[1]) < 0.5 * crop.width * crop.height:
             diag.append(f'crop {crop.width}x{crop.height}px narrowed to the panel\'s rules '
                         f'{_rect[2] - _rect[0]}x{_rect[3] - _rect[1]}px')

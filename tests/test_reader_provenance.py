@@ -263,6 +263,40 @@ def _run():
     finally:
         pe.ANTHROPIC_AVAILABLE, pe._anthropic = _prev
 
+    # ── 3b5. A box short of the panel is widened to the panel's rules ──────
+    # CI run 38823321563: vision's box stopped above the chocolate pancake's
+    # Protein row; the rules ran into the crop's bottom edge.
+    from PIL import ImageDraw as _D2
+    _pg = _Img.new('RGB', (3000, 4000), (70, 40, 30))
+    _d = _D2.Draw(_pg)
+    _d.rectangle((900, 800, 1700, 2900), fill='white')
+    for _i, _y in enumerate(range(900, 2800, 95)):
+        _d.rectangle((940, _y, 1660, _y + (14 if _i % 5 == 0 else 3)), fill='black')
+        _d.rectangle((950, _y + 30, 1250, _y + 60), fill='black')
+        _d.rectangle((1580, _y + 30, 1650, _y + 60), fill='black')
+    _tmp3 = os.path.join(tempfile.mkdtemp(), 'r.png')
+    _pg.save(_tmp3)
+    _sent = []
+
+    def _create5(**k):
+        import base64 as _b64
+        for _part in k['messages'][0]['content']:
+            if _part.get('type') == 'image':
+                _sent.append(_Img.open(io.BytesIO(_b64.b64decode(_part['source']['data']))).size)
+        return _R(json.dumps(dict(_full, serving_size_g=37, serving_size_text='1 bottle (37g)')))
+    import io
+    pe.ANTHROPIC_AVAILABLE = True
+    pe._anthropic = types.SimpleNamespace(Anthropic=lambda api_key=None: types.SimpleNamespace(
+        messages=types.SimpleNamespace(create=_create5)))
+    try:
+        d = []
+        pe._read_nfp_panel(_tmp3, [0.30, 0.20, 0.57, 0.42], diag=d)   # top third of the panel only
+        check(f'panel crop: rules running into the crop edge -> widened, narrowed to the whole panel ({d})',
+              any('wider box' in x for x in d) and any('narrowed to the panel' in x for x in d)
+              and _sent and _sent[0][1] > 1.8 * _sent[0][0])
+    finally:
+        pe.ANTHROPIC_AVAILABLE, pe._anthropic = _prev
+
     # Text bands: full width, top to bottom, overlapping, each within budget.
     import io as _io
     _tall = _Img.new('RGB', (1060, 4761), 'white')
