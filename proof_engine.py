@@ -452,6 +452,7 @@ def _process_job(job_id: str, pdf_paths: list, gtin_rows: list, work_dir: str,
         # front-value collisions across SKUs (Check E). Run once all files are in.
         _flag_duplicate_ingredients(results)
         _flag_cross_sku_collisions(results)
+        _flag_allergen_consistency(results)
 
         summary = _build_summary(results)
         _update_job(job_id, status='done', progress=100,
@@ -1135,7 +1136,7 @@ def _same_amount(a, b) -> bool:
 
 
 def _check_front_callout(front_read, full_page_front: dict, nfp_vals: dict,
-                         vision_ran: bool, diag: list = None) -> dict:
+                         vision_ran: bool, diag: list = None, *, nfp_sources: dict) -> dict:
     """Front call-out rings vs the Nutrition Facts panel, ring by ring.
 
     Each ring is read as a unit (number + caption from the same badge) and is
@@ -1148,6 +1149,13 @@ def _check_front_callout(front_read, full_page_front: dict, nfp_vals: dict,
         unread                              -> NOT EVALUATED for that ring
       no rings on the artwork               -> NOT_APPLICABLE
       ring read did not run or failed       -> NOT_RUN
+      NFP value not from the panel crop     -> NOT EVALUATED for that ring
+
+    nfp_sources: {field: reader} for every value in nfp_vals. Only an
+    'nfp_crop' value is compared; anything else is NOT EVALUATED, never a
+    match. Run aa5b6042: three files whose crop read nothing reported
+    "match (NFP 120)" from a value the full-page pass supplied. Each ring
+    records the NFP side's reader as nfp_reader.
 
     Calories is a do-not-exceed nutrient (21 CFR 101.9(g)(5)); a front call-out
     is a declaration. Run 142db86d / eccfd9c9: Toffee Cream's "100 Calories"
@@ -1203,12 +1211,22 @@ def _check_front_callout(front_read, full_page_front: dict, nfp_vals: dict,
             continue
         nv = nfp_vals.get(f)
         rec['nfp_value'] = nv
+        rec['nfp_reader'] = (nfp_sources or {}).get(f) if nv is not None else None
         if nv is None:
             rec['verdict'] = 'NOT EVALUATED'
             unevaluated += 1
             issues.append({'severity': 'review', 'message': (
                 f'NOT EVALUATED — front ring {label}: the Nutrition Facts {_RING_FIELD_LABEL[f]} value '
                 'was not read, so there is nothing to compare it with.')})
+            continue
+        if rec['nfp_reader'] != 'nfp_crop':
+            rec['verdict'] = 'NOT EVALUATED'
+            unevaluated += 1
+            issues.append({'severity': 'review', 'message': (
+                f'NOT EVALUATED — front ring {label}: the panel crop did not read the Nutrition Facts '
+                f'{_RING_FIELD_LABEL[f]}; the only value ({nv}) came from '
+                f'{rec["nfp_reader"] or "an unrecorded reader"}, which is not trusted for this '
+                'comparison. Check the ring against the panel by eye.')})
             continue
         if _same_amount(rec['value'], nv):
             rec['verdict'] = 'match'
@@ -1334,6 +1352,23 @@ def _read_front_callouts(img_path: str, nfp_bbox=None, diag: list = None) -> dic
         return {}
 
 
+_NFP_ROW_PROMPT = (
+    'This image is a crop of ONE Nutrition Facts panel. It may be MIRROR-REVERSED or rotated; '
+    'read it correctly oriented. Read ONLY the "<ROW>" row of the table. Return ONLY this JSON '
+    'object: {"row_amount": <the amount printed on that row, a number without its unit, or null>, '
+    '"row_dv": <the % Daily Value printed on that row, an integer, or null if that cell is empty or '
+    'you cannot read it>}. Copy what is printed; never correct it.')
+
+
+_NFP_RING_FIELDS_PROMPT = (
+    'This image is a crop of ONE Nutrition Facts panel. It may be MIRROR-REVERSED or rotated; '
+    'read it correctly oriented. Read ONLY these rows of the bordered Nutrition Facts table — '
+    'ignore any "protein options" strip with preparation text beside it. Return ONLY this JSON '
+    'object: {"calories": <number or null>, "protein_g": <grams on the Protein row, or null>, '
+    '"added_sugar_g": <grams on the Includes ... Added Sugars row, or null>}. Return null for '
+    'any value you cannot clearly read; never guess.')
+
+
 _NFP_CROP_PROMPT = (
     'This image is a crop of ONE Nutrition Facts (or Supplement Facts) panel and nothing '
     'else. It may be MIRROR-REVERSED or rotated (these are film/pouch back panels printed '
@@ -1367,7 +1402,14 @@ _NFP_CROP_PROMPT = (
     '"vitamin_d_mcg": <number or null>, "vitamin_d_dv": <%DV integer, or null>, '
     '"calcium_mg": <number or null>, "calcium_dv": <%DV integer, or null>, '
     '"iron_mg": <number or null>, "iron_dv": <%DV integer, or null>, '
-    '"potassium_mg": <number or null>, "potassium_dv": <%DV integer, or null>}\n'
+    '"potassium_mg": <number or null>, "potassium_dv": <%DV integer, or null>, '
+    '"other_vitamins_minerals": [every other vitamin or mineral row the panel prints (e.g. '
+    'Magnesium, Zinc, Vitamin C), each {"name": "<as printed>", "amount": <number>, "unit": '
+    '"<mg, mcg or g as printed>", "dv": <%DV integer, or null>}; [] if none]}\n'
+    'The % Daily Value column: every *_dv field is the integer printed in that row\'s % Daily '
+    'Value cell; the string "blank" if the row prints an amount but its % Daily Value cell is '
+    'EMPTY (nothing printed where the percentage would go); null only if you cannot read it. Also '
+    'return "dv_header": true if the "% Daily Value" column header is printed, else false.\n'
     'Take servings-per-container ONLY from the literal "servings per container" line — '
     'never a "Makes N" count. Read every row you can actually see. Numbers only, no units, '
     'EXCEPT: a value printed as a threshold form ("<1", "<5", etc. — below the FDA rounding '
@@ -1422,6 +1464,142 @@ def _parse_nfp_amount(v):
         if m:
             return float(m.group(0))
     return None
+
+
+def _panel_rules(img, width: int = 900):
+    """The Nutrition Facts panel's horizontal rules in `img`: [(y, x0, x1)] in
+    the coordinates of `img` scaled to `width` px wide, that scale, and the
+    scaled grey image. A rule is a dark run with the panel's white ground at
+    both ends — the artwork around a panel is not white, so runs there never
+    qualify — and the panel's rules all end at its right inner edge, so the
+    largest set sharing a right end is the panel (the crop may be far wider:
+    the chocolate pancake's panel is a fifth of its crop). Thin rules are
+    thickened before the downscale so they survive it."""
+    g = img.convert('L')
+    sc = min(1.0, width / float(g.width))
+    size = (max(1, int(g.width * sc)), max(1, int(g.height * sc)))
+    # Binarise at full resolution, then shrink: a cell is dark if any pixel
+    # in it is, white only if all are — a one-pixel rule survives any shrink.
+    dark = g.point(lambda v: 255 if v < 110 else 0).resize(size, Image.BOX)
+    white = g.point(lambda v: 255 if v > 200 else 0).resize(size, Image.BOX)
+    if sc == 1.0:
+        g_out = g
+    else:
+        g_out = dark.point(lambda v: 0 if v > 0 else 255)
+    W, H = size
+    dk, wt = dark.load(), white.load()
+    runs, min_run = [], max(20, 0.06 * W)
+    for y in range(H):
+        run, start = 0, 0
+        for x in range(W):
+            if dk[x, y] > 0:
+                if run == 0:
+                    start = x
+                run += 1
+            else:
+                # Every qualifying run, not only the row's longest: light
+                # lettering on dark artwork bounds runs too, but those end
+                # all over the place, and the grouping below leaves them out.
+                # White within a few pixels of each end: the edge pixel itself
+                # is anti-aliased grey.
+                if run >= min_run and start > 0 \
+                        and any(wt[i, y] >= 250 for i in range(x, min(W, x + 4))) \
+                        and any(wt[i, y] >= 250 for i in range(max(0, start - 4), start)):
+                    runs.append((y, start, x))
+                run = 0
+    g = g_out
+    # A rule is printed on the panel's white ground: going up and going down
+    # from it, across its length, the first pixel that is not dark is white.
+    # A run of dark artwork between light letters has more artwork above and
+    # below it (Blueberry Muffin: navy runs ending at the ingredient text's
+    # left margin all share a right end, and outnumber the panel's rules).
+    def _on_white(y, x0, x1):
+        good = 0
+        for i in range(9):
+            x = x0 + (x1 - x0) * (i + 0.5) / 9
+            x = int(x)
+            ok = True
+            for step in (-1, 1):
+                yy = y
+                while 0 <= yy < H and dk[x, yy] > 0 and abs(yy - y) < 60:
+                    yy += step
+                edge = [yy + step * k for k in range(4) if 0 <= yy + step * k < H]
+                if not edge or not any(wt[x, e] >= 250 for e in edge):   # past a grey edge
+                    ok = False
+            good += ok
+        return good >= 7
+    runs = [r for r in runs if _on_white(*r)]
+    tol = max(3, int(0.01 * W))
+    groups = {}
+    for r in runs:
+        key = next((k for k in groups if abs(k - r[2]) <= tol), r[2])
+        groups.setdefault(key, []).append(r)
+
+    def _distinct(rs):
+        ys = sorted({r[0] for r in rs})
+        return sum(1 for i, y in enumerate(ys) if i == 0 or y - ys[i - 1] > 1)
+    rules = max(groups.values(), key=_distinct, default=[])
+    # A panel's rules span most of it: drop short underlines from the group's width.
+    if rules:
+        span = max(r[2] for r in rules) - min(r[1] for r in rules)
+        rules = sorted(r for r in rules if r[2] - r[1] >= 0.4 * span)
+    if _distinct(rules) < 4:
+        rules = []
+    return rules, sc, g
+
+
+def _nfp_rect_from_rules(img):
+    """The Nutrition Facts panel's rectangle in `img` (px), from its rules,
+    padded for the title above the first rule and the footnote below the last;
+    None without at least four rules. CI run 38818908500: vision boxed the
+    chocolate pancake's panel with the instructions beside it, the crop came
+    out 4709x2907 px, and the Protein and Added Sugars rows were too small to
+    read once it was shrunk to the API's budget."""
+    try:
+        rules, sc, _g = _panel_rules(img, width=min(900, img.width))
+        if not rules:
+            return None
+        x0, x1 = min(r[1] for r in rules) / sc, max(r[2] for r in rules) / sc
+        y0, y1 = rules[0][0] / sc, rules[-1][0] / sc
+        w, h = x1 - x0, y1 - y0
+        return (max(0, int(x0 - 0.04 * w)), max(0, int(y0 - 0.18 * h)),
+                min(img.width, int(x1 + 0.04 * w)), min(img.height, int(y1 + 0.16 * h)))
+    except Exception:
+        return None
+
+
+def _dv_column_ink(img):
+    """(text lines with ink in the % Daily Value strip, text lines) between the
+    Nutrition Facts panel's first and last horizontal rule, or None when the
+    rules are not found. `img` is the upright panel crop as read.
+
+    The %DV strip is the right 16% of the rules' width. A populated column
+    puts ink there on every nutrient row (14 on the whey bottles); an empty
+    one only on the serving size, calories and header lines (3 on Blueberry
+    Muffin)."""
+    try:
+        rules, _sc, g = _panel_rules(img)
+        if not rules:
+            return None
+        px = g.load()
+        left, right = min(r[1] for r in rules), max(r[2] for r in rules)
+        s0 = right - int((right - left) * 0.16)
+        rule_rows = {r[0] for r in rules}
+        lines, cur = [], None
+        for y in range(rules[0][0], rules[-1][0] + 1):
+            inked = y not in rule_rows and any(px[x, y] < 110 for x in range(left, right))
+            if inked:
+                r = any(px[x, y] < 110 for x in range(s0, right - 1))
+                cur = [y, y, r] if cur is None else [cur[0], y, cur[2] or r]
+            elif cur is not None:
+                lines.append(cur)
+                cur = None
+        if cur is not None:
+            lines.append(cur)
+        lines = [l for l in lines if l[1] - l[0] >= 3]
+        return sum(1 for l in lines if l[2]), len(lines)
+    except Exception:
+        return None
 
 
 def _largest_white_region_bbox_frac(im, white_threshold: int = 238, min_frac: float = 0.15,
@@ -1587,6 +1765,22 @@ def _settle_serving_g(first: dict, reread, diag: list) -> dict:
     return out
 
 
+def _implausible_tightened_crop(rw, rh, bw, bh):
+    """Why a tightened panel rectangle (rw x rh px) is not the Nutrition Facts
+    panel vision boxed (bw x bh px), or None if it is plausible. The panel's
+    white rectangle sits inside vision's box and has its shape: a vertical
+    panel stays tall, a tabular one stays wide. Run aa5b6042: three bottles
+    tightened to 904x433 / 951x433 letterboxes of tall panels (1046x3094 on the
+    same sheet geometry) and read nothing; CI run 38789924924: 1643x439."""
+    if rw < 0.5 * bw or rh < 0.5 * bh:
+        return 'kept under half of the box width or height'
+    if rh and bh:
+        ra, ba = rw / rh, bw / bh
+        if ra > 2 * ba or ra < 0.5 * ba:
+            return f'aspect {ra:.2f} vs the box\'s {ba:.2f}'
+    return None
+
+
 def _read_nfp_panel(img_path: str, bbox, diag: list = None) -> dict:
     """Durable NFP read: crop the Nutrition/Supplement Facts panel to its own image
     (using the bbox from the first vision pass) and read that rectangle in isolation.
@@ -1612,8 +1806,11 @@ def _read_nfp_panel(img_path: str, bbox, diag: list = None) -> dict:
         W, H = im.size
         if bbox:
             x0, y0, x1, y1 = bbox
-            # Pad generously so a slightly-off or tight box still contains the panel.
-            pw, ph = (x1 - x0) * 0.15, (y1 - y0) * 0.15
+            # Pad generously so a slightly-off or tight box still contains the
+            # panel — sideways most: vision's box is often shifted a column's
+            # width (Neapolitan: its whole %DV column fell outside a 15% pad).
+            # The crop is narrowed back to the panel's own rules below.
+            pw, ph = (x1 - x0) * 0.30, (y1 - y0) * 0.15
             px0, py0 = max(0, int((x0 - pw) * W)), max(0, int((y0 - ph) * H))
             px1, py1 = min(W, int((x1 + pw) * W)), min(H, int((y1 + ph) * H))
             if px1 - px0 < 8 or py1 - py0 < 8:
@@ -1631,9 +1828,11 @@ def _read_nfp_panel(img_path: str, bbox, diag: list = None) -> dict:
                 bw, bh = (x1 - x0) * W, (y1 - y0) * H
                 cw, ch = candidate.size
                 rw, rh = (refined[2] - refined[0]) * cw, (refined[3] - refined[1]) * ch
-                if rw < 0.5 * bw or rh < 0.5 * bh:
+                _why = _implausible_tightened_crop(rw, rh, bw, bh)
+                if _why:
                     diag.append(f'tightened region {int(rw)}x{int(rh)}px rejected (vision box '
-                                f'{int(bw)}x{int(bh)}px) — not the panel')
+                                f'{int(bw)}x{int(bh)}px): {_why} — not the panel; falling back to the '
+                                'untightened box')
                     refined = None
             if refined:
                 rx0, ry0, rx1, ry1 = refined
@@ -1663,12 +1862,36 @@ def _read_nfp_panel(img_path: str, bbox, diag: list = None) -> dict:
                 c = c.resize((max(1, int(c.width * s)), max(1, int(c.height * s))))
             return c
 
+        # A crop much larger than the panel its rules outline is narrowed to
+        # it, so the rows keep their size once shrunk to the API's budget.
+        _rect = _nfp_rect_from_rules(crop)
+        _clipped = _rect is not None and (_rect[0] == 0 or _rect[1] == 0 or _rect[2] == crop.width
+                                          or _rect[3] == crop.height)
+        # No panel rules in the crop, or they run into its edge: vision's box
+        # sits off the panel (Neapolitan: a column to the left; the chocolate
+        # pancake: short of the panel's lower half, Protein included). Look
+        # again, wider, up to twice; take the panel where it is whole.
+        for _grow in ((0.6, 1.2) if bbox else ()):
+            if _rect is not None and not _clipped:
+                break
+            _why = 'panel rules run into the crop\'s edge' if _clipped else 'no panel rules in the crop'
+            _wide = im.crop((max(0, int((x0 - (x1 - x0) * _grow) * W)), max(0, int((y0 - (y1 - y0) * _grow) * H)),
+                             min(W, int((x1 + (x1 - x0) * _grow) * W)), min(H, int((y1 + (y1 - y0) * _grow) * H))))
+            _wrect = _nfp_rect_from_rules(_wide)
+            if _wrect:
+                diag.append(f'{_why} — found them in a wider box {_wide.width}x{_wide.height}px')
+                crop, _rect = _wide, _wrect
+                _clipped = (_rect[0] == 0 or _rect[1] == 0 or _rect[2] == crop.width or _rect[3] == crop.height)
+        if _rect and (_rect[2] - _rect[0]) * (_rect[3] - _rect[1]) < 0.5 * crop.width * crop.height:
+            diag.append(f'crop {crop.width}x{crop.height}px narrowed to the panel\'s rules '
+                        f'{_rect[2] - _rect[0]}x{_rect[3] - _rect[1]}px')
+            crop = crop.crop(_rect)
         _untightened = candidate if bbox and crop is not candidate else None
         crop = _prep(crop)
 
         _client = _anthropic.Anthropic(api_key=os.environ['ANTHROPIC_API_KEY'])
 
-        def _read_crop(pim, label):
+        def _read_crop(pim, label, prompt=_NFP_CROP_PROMPT):
             _b = io.BytesIO()
             pim.save(_b, format='JPEG', quality=95)
             b64 = base64.standard_b64encode(_b.getvalue()).decode('utf-8')
@@ -1680,7 +1903,7 @@ def _read_nfp_panel(img_path: str, bbox, diag: list = None) -> dict:
                 model='claude-sonnet-4-6', max_tokens=1200, extra_body={'temperature': 0},
                 messages=[{'role': 'user', 'content': [
                     {'type': 'image', 'source': {'type': 'base64', 'media_type': 'image/jpeg', 'data': b64}},
-                    {'type': 'text', 'text': _NFP_CROP_PROMPT}]}])
+                    {'type': 'text', 'text': prompt}]}])
             _stop = getattr(_msg, 'stop_reason', None)
             if _stop == 'max_tokens':
                 diag.append(f'{label}: {pim.width}x{pim.height}px {_sent}B sent; reply cut off at max_tokens')
@@ -1696,8 +1919,11 @@ def _read_nfp_panel(img_path: str, bbox, diag: list = None) -> dict:
                             f'reply {len(_txt)} chars with no JSON: {_txt[:80]!r}')
                 return {}
             data, _ = json.JSONDecoder().raw_decode(_txt[_start:])
-            out = {}
-            for k in _NFP_CROP_FIELDS:
+            out, dv_blank = {}, []
+            for k in _NFP_CROP_FIELDS + ('row_amount', 'row_dv'):
+                if k.endswith('_dv') and str(data.get(k)).strip().lower() == 'blank':
+                    dv_blank.append(k)        # printed empty — not the same as unread
+                    continue
                 v = _parse_nfp_amount(data.get(k))
                 if v is not None:
                     out[k] = v
@@ -1709,7 +1935,21 @@ def _read_nfp_panel(img_path: str, bbox, diag: list = None) -> dict:
                 out['serving_size_text'] = st.strip()
             diag.append(f'{label}: {pim.width}x{pim.height}px {_sent}B sent; stop={_stop}, '
                         f'reply {len(_txt)} chars, {len(out)} fields read'
+                        + (f', %DV printed empty on {len(dv_blank)} rows' if out and dv_blank else '')
                         + ('' if out else ' (model returned the panel as unreadable)'))
+            # Column marks ride along only with a real read, so an empty read
+            # stays falsy and still triggers the untightened fallback.
+            if out:
+                out['dv_blank'] = dv_blank
+                _vm = []
+                for _o in data.get('other_vitamins_minerals') or []:
+                    if isinstance(_o, dict) and isinstance(_o.get('name'), str):
+                        _vm.append({'name': _o['name'].strip(), 'amount': _parse_nfp_amount(_o.get('amount')),
+                                    'unit': str(_o.get('unit') or '').strip().lower(),
+                                    'dv': _parse_nfp_amount(_o.get('dv'))})
+                out['other_vm'] = _vm
+                if isinstance(data.get('dv_header'), bool):
+                    out['dv_header'] = data['dv_header']
             return out
 
         def _score(d):
@@ -1738,6 +1978,41 @@ def _read_nfp_panel(img_path: str, bbox, diag: list = None) -> dict:
             diag.append('tightened crop read nothing — re-reading the untightened box')
             best, best_img = _read_all(_prep(_untightened), 'untightened ')
         best = _settle_serving_g(best, lambda: _read_crop(best_img, 're-read'), diag)
+        # The values the front rings are compared with must come from this
+        # crop (front_callout trusts nothing else). A full read that left one
+        # out gets one focused re-read of the same image (CI run 38808063967:
+        # the chocolate pancake's 4521x2907 panel read 22 fields, no protein).
+        # Whether the %DV column is empty is decided from the pixels, never by
+        # vision alone: a weak read returns no %DV and a count of 0 on a full
+        # column, and a read asked to list the column invents one on an empty
+        # one (CI runs 38814047567, 38818908500). Only when no %DV was read.
+        if best and not any(best.get(g) is not None for g in _NFP_CROP_FIELDS if g.endswith('_dv')):
+            _ink = _dv_column_ink(best_img)
+            best['dv_column_empty'] = bool(_ink and _ink[0] <= 4 and _ink[1] >= 10)
+            if not best['dv_column_empty']:
+                best['dv_blank'] = []      # blank cells the pixels do not bear out
+            diag.append('%DV column ink test: ' + (
+                f'{_ink[0]} of {_ink[1]} text lines print in the %DV strip -> '
+                + ('EMPTY' if best['dv_column_empty'] else 'populated' if _ink[0] >= 8 else 'inconclusive')
+                if _ink else 'panel rules not found -> inconclusive'))
+        # A printed %DV the declared amount cannot produce is re-read, row by
+        # row, before it is reported: a misread digit must not become a CRITICAL.
+        if best:
+            _mm = [r for r in _check_dv_recompute(best, best)[1] if r.get('result') == 'mismatch']
+            for _r in _mm:
+                _key = next(k for k, lbl, *_x in _dv_rows(best, best) if lbl == _r['nutrient'])
+                _again = _read_crop(best_img, f'{_r["nutrient"]} row re-read',
+                                    _NFP_ROW_PROMPT.replace('<ROW>', _r['nutrient']))
+                best.setdefault('dv_confirm', {})[_key] = {'amount': _again.get('row_amount'),
+                                                           'dv': _again.get('row_dv')}
+                diag.append(f'%DV recompute: {_r["nutrient"]} {_r["amount"]}{_r["unit"]} at '
+                            f'{_r["printed"]}% re-read as {best["dv_confirm"][_key]}')
+        _ring = [k for k in ('calories', 'protein_g', 'added_sugar_g') if best.get(k) is None]
+        if best and _ring:
+            _again = _read_crop(best_img, 'ring-field re-read', _NFP_RING_FIELDS_PROMPT)
+            _got = {k: _again[k] for k in _ring if _again.get(k) is not None}
+            best.update(_got)
+            diag.append(f'ring-field re-read for {_ring}: ' + (f'read {_got}' if _got else 'nothing'))
         best.pop('serving_size_text', None)
         return best
     except Exception as _e:
@@ -1788,7 +2063,32 @@ def _jpeg_tiles(img, overlap: float = 0.15) -> list:
     return out
 
 
-def _read_near_panel(img_path: str, bbox, prompt: str, accept, max_tokens: int = 300):
+def _jpeg_bands(img, max_long: int = 1400, overlap: float = 0.12) -> list:
+    """`img` as JPEG bytes in full-width horizontal bands, top to bottom, each
+    within the API's pixel budget. For copying text: a 2x2 grid splits every
+    printed line at the vertical seam and the read copies half of each (CI run
+    38814047567: "SteviaLe", "CocoaPow"); a band never cuts a line across."""
+    import io
+    if img.width > max_long:
+        s = max_long / float(img.width)
+        img = img.resize((max_long, max(1, int(img.height * s))))
+    w, h = img.size
+    band_h = max(1, min(h, int(_API_PIXELS / w)))
+    n = max(1, -(-h // band_h))
+    if n > 1:
+        n = max(1, -(-int(h * (1 + overlap)) // band_h))
+    out = []
+    for i in range(n):
+        y0 = max(0, int(i * h / n - overlap * band_h / 2))
+        y1 = min(h, y0 + band_h)
+        b = io.BytesIO()
+        img.crop((0, y0, w, y1)).save(b, format='JPEG', quality=92)
+        out.append(b.getvalue())
+    return out
+
+
+def _read_near_panel(img_path: str, bbox, prompt: str, accept, max_tokens: int = 300,
+                     bands: bool = False, pad_x: float = 0.6):
     """Ask about the text around the Nutrition Facts panel — a padded crop of
     the panel's box, turned upright, tried as is, rotated 180 and mirrored.
     `accept(data)` returns the answer to keep from the reply JSON, or None to
@@ -1800,7 +2100,7 @@ def _read_near_panel(img_path: str, bbox, prompt: str, accept, max_tokens: int =
         im = Image.open(img_path).convert('RGB')
         W, H = im.size
         x0, y0, x1, y1 = bbox
-        pw, ph = (x1 - x0) * 0.6, (y1 - y0) * 0.6
+        pw, ph = (x1 - x0) * pad_x, (y1 - y0) * 0.6
         box = (max(0, int((x0 - pw) * W)), max(0, int((y0 - ph) * H)),
                min(W, int((x1 + pw) * W)), min(H, int((y1 + ph) * H)))
         if box[2] - box[0] < 8 or box[3] - box[1] < 8:
@@ -1809,9 +2109,11 @@ def _read_near_panel(img_path: str, bbox, prompt: str, accept, max_tokens: int =
         _client = _anthropic.Anthropic(api_key=os.environ['ANTHROPIC_API_KEY'])
         for _t in (None, Image.ROTATE_180, Image.FLIP_LEFT_RIGHT):
             pim = crop if _t is None else crop.transpose(_t)
-            tiles = _jpeg_tiles(pim)
-            _lead = ([{'type': 'text', 'text': 'These images are overlapping tiles of one crop.'}]
-                     if len(tiles) > 1 else [])
+            tiles = _jpeg_bands(pim) if bands else _jpeg_tiles(pim)
+            _lead = ([{'type': 'text', 'text': (
+                'These images are overlapping horizontal bands of one crop, top to bottom; a line '
+                'in the overlap appears twice — copy it once.' if bands else
+                'These images are overlapping tiles of one crop.')}] if len(tiles) > 1 else [])
             _msg = _client.messages.create(
                 model='claude-sonnet-4-6', max_tokens=max_tokens, extra_body={'temperature': 0},
                 messages=[{'role': 'user', 'content': _lead + [
@@ -1870,6 +2172,40 @@ def _read_disclaimer_crop(img_path: str, bbox):
             return t.strip()
         return None
     return _read_near_panel(img_path, bbox, _DISCLAIMER_CROP_PROMPT, _accept)
+
+
+_INGREDIENTS_VERBATIM_PROMPT = (
+    'This image is a crop of a food package back panel around its Nutrition Facts table. It may be '
+    'upside down, rotated or MIRROR-REVERSED; read it correctly oriented. Find the ingredient '
+    'statement (it begins "Ingredients:"). Copy it CHARACTER FOR CHARACTER, ONE PRINTED LINE PER '
+    'ARRAY ENTRY, exactly as the lines break on the label: keep every space and every missing '
+    'space. If two words are printed with no space between them (e.g. "SteviaLeaf"), or a comma '
+    'has no space after it (e.g. "Powder,Salt"), copy them that way. Do NOT join lines, correct, '
+    'normalise or reflow anything. Return ONLY this JSON object:\n'
+    '{"lines": ["<first printed line of the statement, starting after Ingredients:>", '
+    '"<second line>", ...]} or {"lines": null} if no statement is visible in this image.')
+
+
+def _read_ingredients_verbatim(img_path: str, bbox):
+    """The ingredient statement copied character for character from the area
+    around the Nutrition Facts panel, line by line as printed, spacing kept.
+    The full-page transcription reflows text and silently repairs a missing
+    space, so it cannot show "SteviaLeaf" or "Powder,Himalayan" (run aa5b6042:
+    eight of sixteen files). Lines are kept apart: a line break is a space, and
+    a read that joined "Monk" / "Fruit" across one reported "MonkFruit" (CI run
+    38808063967). Returns the lines joined by newlines, or None. Never raises."""
+    def _accept(data):
+        lines = data.get('lines')
+        if isinstance(lines, list) and all(isinstance(x, str) for x in lines):
+            text = '\n'.join(x.strip() for x in lines if x.strip())
+            if text.count(',') >= 2:
+                return re.sub(r'(?i)^\s*ingredients?\s*:?\s*', '', text)
+        return None
+    # Bands, not a 2x2 grid, so no printed line is cut; the statement sits
+    # above or below the panel at about its width, so a narrow side margin
+    # keeps the text large.
+    return _read_near_panel(img_path, bbox, _INGREDIENTS_VERBATIM_PROMPT, _accept, max_tokens=1200,
+                            bands=True, pad_x=0.15)
 
 
 # Live-text path: on hold until live-text PDFs are confirmed available from the
@@ -2241,6 +2577,7 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
     vision_nfp_bbox = None
     vision_dshea = False
     nfp_read = {}
+    _dv_marks = {}
     _nfp_crop_diag = []
     _front_crop_diag = []
     _front_read, _full_front = None, {}
@@ -2280,6 +2617,9 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
         # Durable read: re-read the Nutrition Facts panel from an isolated crop so
         # its small digits are legible instead of squashed in the full-page pass.
         nfp_read = _read_nfp_panel(img_path, vision_nfp_bbox, diag=_nfp_crop_diag)
+        # %DV column marks are not panel values: keep them out of every value map.
+        _dv_marks = {k: nfp_read.pop(k) for k in ('dv_blank', 'dv_header', 'dv_column_empty',
+                                                       'other_vm', 'dv_confirm') if k in nfp_read}
         print(f'[nfp-crop] {fname} ' + ('OK ' if nfp_read else 'NOTHING READ ') + ' | '.join(_nfp_crop_diag))
         # Front call-out rings: only the isolated read (panel masked) may supply
         # them. The full-page values are kept as unconfirmed — reported, never
@@ -2528,13 +2868,18 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
 
     # Front call-out rings vs the NFP — its own check, on every file, so the
     # report always says whether it ran (run eccfd9c9 could not tell).
+    # Which reader supplied each NFP value: the crop overrides the full-page
+    # pass wherever it read the field, so a value the crop lacks is full-page.
+    _nfp_for_front = (vision_nutrition or {}).get('nfp') or {}
+    _nfp_sources = {f: ('nfp_crop' if nfp_read.get(f) is not None else 'vision_full_page')
+                    for f in _RING_FIELD_LABEL if _nfp_for_front.get(f) is not None}
     checks['front_callout'] = _check_front_callout(
-        _front_read, _full_front, (vision_nutrition or {}).get('nfp'),
-        vision_ran=_front_read is not None, diag=_front_crop_diag)
+        _front_read, _full_front, _nfp_for_front, vision_ran=_front_read is not None,
+        diag=_front_crop_diag, nfp_sources=_nfp_sources)
     for _r in checks['front_callout'].get('rings', []):
         print(f'[front-callout] {fname} ring {_r.get("position") or "?"}: "{_r.get("number")}" bound to '
-              f'"{_r.get("caption")}" -> {_r.get("field") or "not compared"}; NFP {_r.get("nfp_value")} '
-              f'-> {_r.get("verdict")}')
+              f'"{_r.get("caption")}" -> {_r.get("field") or "not compared"}; NFP {_r.get("nfp_value")}'
+              f'<{_r.get("nfp_reader") or "absent"}> -> {_r.get("verdict")}')
     if not checks['front_callout'].get('rings'):
         print(f'[front-callout] {fname} {checks["front_callout"]["status"]}: '
               + ' '.join(checks['front_callout'].get('notes', [])))
@@ -2554,7 +2899,18 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
             _regex_nfp_proteins = checks['nfp'].get('nfp_data', {}).get('proteins') or []
             if len(_regex_nfp_proteins) == 1:
                 _nfp_protein_ref = _regex_nfp_proteins[0]
-        extra = (_check_net_carbs(label_text, _panel.get('serving_size_g'), nfp_read)
+        _dvr_issues, _dvr_rows = _check_dv_recompute(nfp_read, _dv_marks)
+        checks['nfp']['dv_recompute'] = _dvr_rows
+        _dvr_ne = [f'{r["nutrient"]} ({r["why"]})' for r in _dvr_rows if r.get('result') == 'not_evaluated']
+        checks['nfp'].setdefault('notes', []).append(
+            '%DV recompute NOT EVALUATED — the panel crop read nothing.' if not nfp_read else
+            f'%DV recomputed from the declared amount on {sum(r.get("result") == "ok" for r in _dvr_rows)} '
+            f'row(s)' + (f'; NOT EVALUATED: {", ".join(_dvr_ne)}' if _dvr_ne else '') + '.')
+        print(f'[dv-recompute] {fname} ' + '; '.join(
+            f'{r["nutrient"]} {r["amount"]}{r["unit"]} @ {r["printed"]}% -> {r.get("result")}'
+            + (f' (legal {r.get("legal")})' if r.get('legal') else '') for r in _dvr_rows))
+        extra = (_dvr_issues + _check_dv_populated(nfp_read, _dv_marks)
+                 + _check_net_carbs(label_text, _panel.get('serving_size_g'), nfp_read)
                  + _check_superseded_nfp(_panel, matched_spec)
                  + _check_protein_claims(label_text, _nfp_protein_ref))
         if extra:
@@ -2582,8 +2938,23 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
         for _ai in _allergen_issues:
             _ai['kind'] = _FALCPA_ISSUE_KIND
         checks['fda'].setdefault('issues', []).extend(_allergen_issues)
+        # An allergen declared that no ingredient accounts for (run aa5b6042).
+        checks['fda']['issues'].extend(_check_declared_without_source(_allergen_profile(
+            _snapshot.get('ingredients_raw'), (vision_allergens or {}).get('contains_statement'))))
     else:
         _allergen_issues = None
+    # Ingredient-statement spacing, from a verbatim read of the back panel —
+    # the full-page transcription repairs exactly what this looks for.
+    if 'spelling' in checks and isinstance(checks['spelling'], dict) and brand_mode == 'prodough':
+        _verbatim = _read_ingredients_verbatim(img_path, vision_nfp_bbox) if vision_nfp_bbox else None
+        _snapshot['ingredients_verbatim'] = _verbatim
+        if _verbatim:
+            checks['spelling']['issues'].extend(_ingredient_whitespace_issues(_verbatim))
+        else:
+            checks['spelling'].setdefault('notes', []).append(
+                'Ingredient-statement spacing not checked — the verbatim back-panel read returned no '
+                'statement' + ('' if vision_nfp_bbox else ' (panel not located)') + '.')
+        print(f'[ingredients-verbatim] {fname} {_verbatim!r}')
     # A check this consequential never returns nothing without saying why.
     print(f'[allergen] {fname} record={"yes" if _approved_panel else "none"} '
           f'({_panel_fetch_reason}) declared={_allergen_declared} '
@@ -3808,7 +4179,7 @@ def _norm_ing(s: str) -> str:
     """Normalize an ingredient name for comparison: lowercase, drop parenthetical
     detail, collapse whitespace, strip a leading "less than 2% of" preamble."""
     s = re.sub(r'\([^)]*\)', '', s or '').lower()
-    s = re.sub(r'contains?\s+less\s+than\s+\d+\s*%?\s*(?:of)?\s*:?', '', s)
+    s = re.sub(r'contains?\s+less\s+than\s+\d+\s*(?:%|percent\b)?\s*(?:of)?\s*:?', '', s)
     return re.sub(r'[^a-z0-9 ]', ' ', s).strip()
 
 
@@ -3840,7 +4211,7 @@ def _build_label_snapshot(text: str, panel: dict, vision_nutrition: dict,
     _ings, _minor_from = [], None
     for x in _split_ingredients(stmt):
         if _norm_ing(x):
-            if _minor_from is None and re.search(r'less\s+than\s+\d+\s*%', x, re.I):
+            if _minor_from is None and re.search(r'less\s+than\s+\d+\s*(?:%|percent\b)', x, re.I):
                 _minor_from = len(_ings)
             _ings.append(_norm_ing(x))
     return {
@@ -3850,7 +4221,7 @@ def _build_label_snapshot(text: str, panel: dict, vision_nutrition: dict,
         # Index in `ingredients` where the "contains less than 2% of:" group
         # starts (None without one). Crossing that line is a formula change.
         'ingredients_minor_from': _minor_from,
-        'has_less_than_2pct': bool(re.search(r'less\s+than\s+\d+\s*%', stmt.lower())),
+        'has_less_than_2pct': bool(re.search(r'less\s+than\s+\d+\s*(?:%|percent\b)', stmt.lower())),
         'front_callout': vn.get('front_callout', {}) or {},
         'nfp': vn.get('nfp', {}) or {},
         'nfp_extra_columns': _detect_extra_nfp_columns(tl),
@@ -4189,6 +4560,229 @@ def _amounts_equal(a, b) -> bool:
         return a == b
 
 
+# ── %DV recomputed from the declared amount ──────────────────────────────────
+# Daily Values for adults and children 4 and over (21 CFR 101.9(c)(8)(iv),
+# (c)(9)); the unit is the one the panel declares the amount in.
+_DAILY_VALUES = {
+    'total_fat': (78, 'g'), 'saturated_fat': (20, 'g'), 'cholesterol': (300, 'mg'),
+    'sodium': (2300, 'mg'), 'total_carbohydrate': (275, 'g'), 'dietary_fiber': (28, 'g'),
+    'added_sugars': (50, 'g'), 'vitamin_d': (20, 'mcg'), 'calcium': (1300, 'mg'),
+    'iron': (18, 'mg'), 'potassium': (4700, 'mg'), 'magnesium': (420, 'mg'),
+    'zinc': (11, 'mg'), 'vitamin_c': (90, 'mg'), 'vitamin_a': (900, 'mcg'),
+    'vitamin_e': (15, 'mg'), 'vitamin_k': (120, 'mcg'), 'thiamin': (1.2, 'mg'),
+    'riboflavin': (1.3, 'mg'), 'niacin': (16, 'mg'), 'vitamin_b6': (1.7, 'mg'),
+    'folate': (400, 'mcg'), 'vitamin_b12': (2.4, 'mcg'), 'biotin': (30, 'mcg'),
+    'pantothenic_acid': (5, 'mg'), 'phosphorus': (1250, 'mg'), 'iodine': (150, 'mcg'),
+    'selenium': (55, 'mcg'), 'copper': (0.9, 'mg'), 'manganese': (2.3, 'mg'),
+    'chromium': (35, 'mcg'), 'molybdenum': (45, 'mcg'), 'chloride': (2300, 'mg'),
+    'choline': (550, 'mg'),
+}
+# Rounded to the nearest 1% of DV; vitamins and minerals by 101.9(c)(8).
+_DV_MACROS = ('total_fat', 'saturated_fat', 'cholesterol', 'sodium', 'total_carbohydrate',
+              'dietary_fiber', 'added_sugars')
+_DV_LABEL = {'total_fat': 'Total Fat', 'saturated_fat': 'Saturated Fat', 'cholesterol': 'Cholesterol',
+             'sodium': 'Sodium', 'total_carbohydrate': 'Total Carbohydrate', 'dietary_fiber': 'Dietary Fiber',
+             'added_sugars': 'Added Sugars', 'vitamin_d': 'Vitamin D'}
+
+
+def _half_up(x: float, step: float) -> float:
+    import math
+    return math.floor(x / step + 0.5 + 1e-9) * step
+
+
+def _declarations(key: str, x: float) -> set:
+    """Every declaration 21 CFR 101.9(c) permits for an actual amount `x`: the
+    nearest increment, plus the optional forms below a threshold ("0", "<1",
+    "<5") — optional, so the nearest increment stays legal too. Apple Pie
+    declares 1g Added Sugars at 1%: 0.5-1.5g rounds to 1g (nearest gram),
+    0.5g is 1% of 50g (CI run 39687608227)."""
+    if key in ('total_fat', 'saturated_fat'):           # (c)(2)
+        out = {_half_up(x, 0.5) if x < 5 else _half_up(x, 1)}
+        if x < 0.5:
+            out.add(0.0)
+    elif key == 'cholesterol':                          # (c)(3)
+        out = {_half_up(x, 5)}
+        if x < 2:
+            out.add(0.0)
+        elif x < 5:
+            out.add('<5')
+    elif key == 'sodium':                               # (c)(4)
+        out = {_half_up(x, 5) if x <= 140 else _half_up(x, 10)}
+        if x < 5:
+            out.add(0.0)
+    else:   # total carbohydrate, dietary fiber, added sugars: (c)(6)
+        out = {_half_up(x, 1)}
+        if x < 0.5:
+            out.add(0.0)
+        if x < 1:
+            out.add('<1')
+    return {round(v, 6) if not isinstance(v, str) else v for v in out}
+
+
+def _amount_band(key: str, amount):
+    """(low, high): the unrounded amounts that declare as `amount`, or None.
+    Macronutrients by every declaration their FDA rule permits; vitamins and minerals by the
+    precision printed (Iron 1.1mg -> 1.05-1.15), widened to the 10 mg step
+    for a calcium or potassium amount printed as a multiple of 10."""
+    from decimal import Decimal
+    if key in _DV_MACROS:
+        if isinstance(amount, str):
+            target = amount.replace(' ', '')
+            if target not in ('<1', '<5'):
+                return None
+        else:
+            target = float(amount)
+        hi_guess = (float(amount.strip('<')) if isinstance(amount, str) else float(amount)) * 1.5 + 12
+        n, xs = 24000, []
+        want = target if isinstance(target, str) else round(target, 6)
+        for i in range(n + 1):
+            x = hi_guess * i / n
+            if want in _declarations(key, x):
+                xs.append(x)
+        return (min(xs), max(xs)) if xs else None
+    if isinstance(amount, str):
+        return None
+    dec = Decimal(repr(float(amount))).normalize()
+    places = max(0, -dec.as_tuple().exponent)
+    half = 0.5 * 10 ** -places
+    if key in ('calcium', 'potassium') and places == 0 and amount >= 10 and amount % 10 == 0:
+        half = 5.0
+    return max(0.0, float(amount) - half), float(amount) + half - 1e-9
+
+
+def _dv_round(key: str, pct: float) -> int:
+    if key in _DV_MACROS:
+        return int(_half_up(pct, 1))
+    step = 2 if pct <= 10 else 5 if pct <= 50 else 10       # 101.9(c)(8)
+    return int(_half_up(pct, step))
+
+
+def _dv_legal(key: str, band) -> tuple:
+    """(legal printed %DVs, low %, high %) over the amount band. A vitamin or
+    mineral under 2% of its DV may also be declared 0%."""
+    dv = _DAILY_VALUES[key][0]
+    lo, hi = band
+    legal = set()
+    for i in range(401):
+        pct = (lo + (hi - lo) * i / 400) / dv * 100
+        legal.add(_dv_round(key, pct))
+        if key not in _DV_MACROS and pct < 2:
+            legal.add(0)
+    return sorted(legal), lo / dv * 100, hi / dv * 100
+
+
+def _vm_key(name: str):
+    n = re.sub(r'[^a-z0-9 ]', '', (name or '').lower()).strip()
+    n = {'vitamin b 6': 'vitamin b6', 'vitamin b 12': 'vitamin b12', 'folic acid': 'folate',
+         'pantothenate': 'pantothenic acid'}.get(n, n)
+    k = n.replace(' ', '_')
+    return k if k in _DAILY_VALUES else None
+
+
+def _dv_rows(panel_read: dict, marks: dict) -> list:
+    """The panel's rows with an established DV: (key, label, amount, unit, printed %DV)."""
+    rows = []
+    for a_amt, _p, a_dv, _pd, label, unit in _PANEL_DV_GROUPS:
+        key = a_dv[:-3]
+        printed = 'blank' if a_dv in set((marks or {}).get('dv_blank') or ()) else panel_read.get(a_dv)
+        rows.append((key, label, panel_read.get(a_amt), unit, printed))
+    for o in (marks or {}).get('other_vm') or []:
+        key = _vm_key(o.get('name'))
+        if key and key not in [r[0] for r in rows]:
+            unit = (o.get('unit') or '').replace('µ', 'mc').replace('μ', 'mc').replace('ug', 'mcg')
+            amt = o.get('amount') if unit == _DAILY_VALUES[key][1] else None
+            rows.append((key, o.get('name') or key, amt, _DAILY_VALUES[key][1], o.get('dv')))
+    return rows
+
+
+def _check_dv_recompute(panel_read: dict, marks: dict) -> tuple:
+    """(issues, rows): every printed %DV recomputed from its declared amount
+    (21 CFR 101.9(d)(7)(ii)). The amount is rounded, so it stands for a band of
+    actual amounts and a range of legal %DVs; a CRITICAL only when no amount in
+    the band yields the printed value. Chocolate Mousse (14 and 19 Oct) printed
+    Iron 1.1mg at 4%: 1.05-1.15mg is 5.83%-6.39% of 18mg, 6% everywhere.
+
+    A row whose amount or %DV was not read is NOT EVALUATED, never passed. A
+    mismatch is re-read from the panel crop first (marks['dv_confirm']); a
+    re-read that does not reproduce both numbers makes it NOT EVALUATED."""
+    marks = marks or {}
+    confirm = marks.get('dv_confirm') or {}
+    issues, rows = [], []
+    for key, label, amount, unit, printed in _dv_rows(panel_read, marks):
+        row = {'nutrient': label, 'amount': amount, 'unit': unit, 'printed': printed}
+        rows.append(row)
+        if amount is None:
+            if printed not in (None, 'blank'):
+                row.update(result='not_evaluated', why='amount not read')
+            else:
+                row.update(result='not_evaluated', why='row not read')
+            continue
+        if printed == 'blank':
+            row.update(result='not_evaluated', why='%DV printed empty (see the %DV column finding)')
+            continue
+        if printed is None or isinstance(printed, str):
+            row.update(result='not_evaluated', why='%DV not read' if printed is None else f'%DV printed as {printed}%')
+            continue
+        band = _amount_band(key, amount)
+        if band is None:
+            row.update(result='not_evaluated', why=f'amount {amount} has no rounding band')
+            continue
+        legal, lo, hi = _dv_legal(key, band)
+        row.update(low=round(lo, 2), high=round(hi, 2), legal=legal)
+        if int(round(float(printed))) in legal:
+            row['result'] = 'ok'
+            continue
+        c = confirm.get(key)
+        if c is not None and not (_amounts_equal(c.get('amount'), amount) and _amounts_equal(c.get('dv'), printed)):
+            row.update(result='not_evaluated', why=(
+                f'the panel read gave {_fmt_amt(amount)}{unit} / {_fmt_amt(printed)}%, a re-read gave '
+                f'{_fmt_amt(c.get("amount"))}{unit} / {_fmt_amt(c.get("dv"))}% — not trusted either way'))
+            continue
+        row['result'] = 'mismatch'
+        expected = ' or '.join(f'{v}%' for v in legal)
+        issues.append({'severity': 'critical', 'message': (
+            f'Panel declares {label} {_fmt_amt(amount)}{unit} with %DV {_fmt_amt(printed)}%. The declared '
+            f'amount yields {lo:.2f}%-{hi:.2f}%, which rounds to {expected}. No value in the rounding band '
+            f'produces {_fmt_amt(printed)}%.')})
+    return issues, rows
+
+
+def _check_dv_populated(panel_read: dict, marks: dict) -> list:
+    """The %DV column must be populated. Every nutrient row with an established
+    Daily Value that declares an amount must print its %DV (21 CFR 101.9(d)(7)).
+    Run aa5b6042: Blueberry Muffin printed the "% Daily Value*" header and every
+    amount, and not one percentage — the panel read cleanly and nothing fired.
+
+    marks: {'dv_blank': [*_dv fields the panel read saw printed EMPTY],
+    'dv_header': bool, 'dv_column_empty': the pixel test found no %DV
+    column ink (_dv_column_ink)}. Only a cell read as printed empty counts; an unreadable
+    cell is not evidence. A column whose header is printed and whose every row
+    is empty is ONE finding naming the column."""
+    marks = marks or {}
+    blank_keys = set(marks.get('dv_blank') or ())
+    # The pixels show an empty column and the read found no %DV value: the
+    # whole column is empty (Blueberry Muffin). Never when one value was read.
+    if marks.get('dv_column_empty') and not any(
+            panel_read.get(g[2]) is not None for g in _PANEL_DV_GROUPS):
+        blank_keys |= {g[2] for g in _PANEL_DV_GROUPS}
+    rows = [(label, panel_read.get(a_amt), unit, a_dv in blank_keys, panel_read.get(a_dv) is not None)
+            for a_amt, _p, a_dv, _pd, label, unit in _PANEL_DV_GROUPS
+            if panel_read.get(a_amt) is not None]
+    blank = [(label, amt, unit) for label, amt, unit, is_blank, _f in rows if is_blank]
+    if not blank:
+        return []
+    filled = [r for r in rows if r[4]]
+    if len(blank) >= 3 and not filled and marks.get('dv_header') is not False:
+        return [{'severity': 'critical', 'message': (
+            'Nutrition panel prints the % Daily Value column header but the column is empty — '
+            f'{", ".join(f"{label} {_fmt_amt(amt)}{unit}" for label, amt, unit in blank)} all '
+            'declare an amount with no % Daily Value. %DV is required for nutrients with an '
+            'established DV.')}]
+    return [{'severity': 'critical', 'message': (
+        f'Nutrition panel declares {label} {_fmt_amt(amt)}{unit} with no % Daily Value. %DV is '
+        'required for nutrients with an established DV.')} for label, amt, unit in blank]
+
+
 def _diff_panel_fields(artwork: dict, approved_panel: dict, version) -> tuple:
     """Field-level diff between the artwork's read nutrition values and the
     approved panel. Returns (issues, gap_notes):
@@ -4413,9 +5007,28 @@ def _diff_label_element(label: str, el: dict, approved_raw, version) -> tuple:
     return issues, element
 
 
+def _break_crossings(a: dict, p: dict) -> list:
+    """Ingredients on both statements that sit on opposite sides of the "less
+    than 2%" break: (name as printed on the artwork, side on the artwork). A
+    set comparison sees no difference; the order is the quantitative claim."""
+    side_p = {}
+    for side in ('major', 'minor'):
+        for x in p.get(side) or []:
+            side_p.setdefault(_norm_ing(x), side)
+    out = []
+    for side in ('major', 'minor'):
+        for x in a.get(side) or []:
+            other = side_p.get(_norm_ing(x))
+            if other and other != side:
+                out.append((re.sub(r'\s+', ' ', x).strip(' .'), side))
+    return out
+
+
 def _break_element(art_stmt, appr_stmt, path) -> tuple:
     """(element, message) for the "contains less than 2% of:" break: how many
-    ingredients precede it on the artwork vs the approved statement."""
+    ingredients precede it on the artwork vs the approved statement, and which
+    ingredients cross it. Run aa5b6042, Apple Pie: Natural Flavors before the
+    break on the artwork, after it on the approved panel — same ingredient set."""
     import live_text as _lt
     a, p = _lt.two_percent_break(art_stmt or ''), _lt.two_percent_break(appr_stmt or '')
     el = {'element': '2% break position', 'path': path, 'result': None, 'detail': ''}
@@ -4428,8 +5041,19 @@ def _break_element(art_stmt, appr_stmt, path) -> tuple:
         return el, ''
     if bool(a) != bool(p) or (a and p and (a['position'] != p['position']
                                              or _normalize_stmt(a['after']) != _normalize_stmt(p['after']))):
-        el.update(result='mismatch', detail=f'artwork {desc(a)}; approved {desc(p)}')
-        return el, f'The "less than 2%" break is {desc(a)} on the artwork, {desc(p)} on the approved panel.'
+        crossed = _break_crossings(a, p) if a and p else []
+        el.update(result='mismatch', detail=f'artwork {desc(a)}; approved {desc(p)}', crossed=[c[0] for c in crossed])
+        msg = f'The "less than 2%" break is {desc(a)} on the artwork, {desc(p)} on the approved panel.'
+        if crossed:
+            msg = ' '.join(
+                f'{name} is {"above" if side == "major" else "below"} the "less than 2%" break on the artwork '
+                f'({"2% or more" if side == "major" else "less than 2%"}) and '
+                f'{"below" if side == "major" else "above"} it on the approved panel '
+                f'({"less than 2%" if side == "major" else "2% or more"}).'
+                for name, side in crossed) + (
+                ' Ingredients are listed by predominance: crossing the break is a quantitative claim, '
+                f'not formatting. ({msg})')
+        return el, msg
     if a and p and a['wording'] != p['wording'] and path == 'live_text':
         el.update(result='format_diff', detail=f'wording "{a["wording"]}" vs approved "{p["wording"]}"')
         return el, ''
@@ -4919,6 +5543,111 @@ def _named_flavor_mismatches(ingredients: list, flavor_name: str) -> list:
                 out.append(ing)
                 break
     return out
+
+
+# Ingredients often mistaken for an allergen source: coconut for a tree nut
+# (removed from FDA's list, 2025), cocoa butter or coconut milk for milk.
+_ALLERGEN_LOOKALIKES = {
+    'tree nut': r'\b(?:coconut|nutmeg|shea|water\s+chestnut|butternut)\b',
+    'milk': r'\b(?:coconut\s+milk|cocoa\s+butter|lactic\s+acid|lactate|cream\s+of\s+tartar)\b',
+    'wheat': r'\bbuckwheat\b',
+    'egg': r'\beggplant\b',
+}
+
+
+_ALLERGEN_LABEL = {'tree nut': 'Tree Nuts', 'peanut': 'Peanuts', 'egg': 'Eggs'}
+
+
+def _allergen_label(a: str) -> str:
+    return _ALLERGEN_LABEL.get(a, a.title())
+
+
+def _allergen_profile(ingredients_raw: str, contains_statement) -> dict:
+    """What one file says about allergens: {'items': {ingredient: [allergens
+    its own name or sub-ingredients source]}, 'declared': [allergens on the
+    Contains line], 'unsourced': [declared, but no ingredient sources it]}.
+    None without an ingredient statement of at least three items."""
+    items = {}
+    for x in _split_ingredients(ingredients_raw or ''):
+        name = _norm_ing(x)
+        if name:
+            items.setdefault(name, sorted(_ingredient_allergens(
+                [p for p in re.split(r'[,;()\[\]]', x.lower()) if p.strip()])))
+    if len(items) < 3:
+        return None
+    declared = []
+    for part in re.split(r'[,;/&]|\band\b', re.sub(r'(?i)^\s*contains\s*:?', '', contains_statement or '')):
+        c = _canonical_allergen(part)
+        if c and c not in declared:
+            declared.append(c)
+    sourced = {a for v in items.values() for a in v}
+    return {'items': items, 'declared': declared, 'unsourced': [a for a in declared if a not in sourced]}
+
+
+def _check_declared_without_source(profile) -> list:
+    """An allergen the Contains line declares that no ingredient accounts for.
+    Run aa5b6042: Coconut Cream whey declares "Milk, Tree Nuts"; its only
+    candidate is Coconut Milk Powder, and coconut is not a tree nut (FDA food
+    allergen Q&A, 5th ed., 2025). A question, not a verdict: the statement may
+    have been read short, or the declaration may be wrong."""
+    if not profile:
+        return []
+    return [{'severity': 'warning', 'message': (
+        f'The Contains line declares {_allergen_label(a)}, but no ingredient in the statement is a '
+        f'{a} source. Confirm the declaration against the formula: either an ingredient is missing '
+        'from the statement or the allergen is declared in error.'
+        + (' (Coconut is not a tree nut under FDA\'s 2025 allergen guidance.)'
+           if a == 'tree nut' and any('coconut' in i for i in profile['items']) else ''))}
+        for a in profile['unsourced']]
+
+
+def _flag_allergen_consistency(results: list) -> None:
+    """Two files in one run carrying the same ingredient and treating it
+    differently on the Contains line -> a WARNING on each, naming the other
+    file and the ingredient. Either the ingredient maps to an allergen one
+    declares and the other does not, or one file declares an allergen that
+    only the shared ingredient could account for (run aa5b6042: Coconut Cream
+    whey declares Tree Nuts for Coconut Milk Powder; three beef files with the
+    same ingredient declare nothing). Which side is right is the question."""
+    prof = []
+    for res in results or []:
+        snap = res.get('snapshot') or {}
+        p = _allergen_profile(snap.get('ingredients_raw'),
+                              (res.get('vision_allergens') or {}).get('contains_statement'))
+        if p:
+            prof.append((res, p))
+    found = {}   # (filename, ingredient, allergen) -> [other filenames]
+    for i in range(len(prof)):
+        for j in range(i + 1, len(prof)):
+            (ra, pa), (rb, pb) = prof[i], prof[j]
+            if ra.get('filename') == rb.get('filename'):
+                continue
+            for ing in set(pa['items']) & set(pb['items']):
+                cand = set(pa['items'][ing]) | set(pb['items'][ing])
+                # An allergen a file declares with no source is attributed to
+                # the shared ingredient only when that ingredient is a known
+                # look-alike for it (coconut for tree nuts) — not to every
+                # shared "Natural Flavors".
+                for p_ in (pa, pb):
+                    cand |= {a for a in p_['unsourced']
+                             if re.search(_ALLERGEN_LOOKALIKES.get(a, r'(?!)'), ing)}
+                for a in cand:
+                    if (a in pa['declared']) != (a in pb['declared']):
+                        for r, o in ((ra, rb), (rb, ra)):
+                            found.setdefault((r.get('filename'), ing, a), []).append(o)
+    by_name = {r.get('filename'): r for r, _ in prof}
+    for (fname, ing, a), others in found.items():
+        res = by_name[fname]
+        mine = a in next(p for r, p in prof if r is res)['declared']
+        names = ', '.join(dict.fromkeys(o.get('filename') for o in others))
+        chk = res.setdefault('checks', {}).setdefault('fda', {'issues': [], 'notes': []})
+        chk.setdefault('issues', []).append({'severity': 'warning', 'message': (
+            f'Allergen declaration differs across this run for {ing.title()}: {fname} '
+            f'{"declares" if mine else "does not declare"} {_allergen_label(a)}, while {names} '
+            f'{"does not" if mine else "does"} — both carry {ing.title()}. A different declaration '
+            'for the same ingredient is a question whichever side is right; confirm against the '
+            'formula.')})
+        _recount_result(res)
 
 
 def _flag_duplicate_ingredients(results: list) -> None:
@@ -5417,6 +6146,45 @@ def _check_spelling(ocr_text: str, fname: str) -> dict:
     return {'issues': issues, 'notes': notes, 'brand_found': _brand_found}
 
 
+# Legitimate lower->upper inside a word: pH, McIntosh / MacX surnames.
+_CAMEL_OK = re.compile(r'^(?:pH|Mc[A-Z]\w*|Mac[A-Z]\w*)$')
+# Units a number legitimately runs into: 20mg, 5g, 1st.
+_NUM_UNIT_OK = re.compile(r'\d(?:mg|mcg|g|kg|iu|oz|ml|st|nd|rd|th)\b', re.I)
+_SPACING_RULES = (
+    (lambda t: re.search(r'[a-z][A-Z]', t) and not _CAMEL_OK.match(t.strip(',.;:()')),
+     'no space between words'),
+    (lambda t: re.search(r',(?=[A-Za-z(])', t), 'no space after the comma'),
+    (lambda t: re.search(r'\w&|&\w', t), 'no space at the "&"'),
+    (lambda t: re.search(r'[a-z]\d', t)
+     or (re.search(r'\d[A-Za-z]{2,}', t) and not _NUM_UNIT_OK.search(t)), 'no space between number and word'),
+    (lambda t: re.search(r'\)[A-Za-z]', t), 'no space after the bracket'),
+)
+
+
+def _ingredient_whitespace_issues(statement: str) -> list:
+    """Missing spaces in the ingredient statement, as printed: two words run
+    together ("SteviaLeaf"), a comma with no space after it ("Powder,Himalayan"),
+    a glued "&" ("A& Reb M"), a number run into a word ("Amylase300", "300DU",
+    "2percent"), a character straight after a bracket ("ALU)v"). One WARNING
+    listing every instance. `statement` must be a verbatim read, one printed
+    line per line: a token is never joined across a line break."""
+    if not statement:
+        return []
+    found = []
+    for line in statement.split('\n'):
+        for tok in line.split():
+            for test, why in _SPACING_RULES:
+                if test(tok):
+                    found.append(f'"{tok.rstrip(",.;")}" ({why})')
+                    break
+    if not found:
+        return []
+    return [{'severity': 'warning', 'message': (
+        'Ingredient statement spacing: ' + '; '.join(dict.fromkeys(found)) + '. Read from the '
+        'statement copied character for character from the back panel — confirm on the artwork '
+        'and correct before print.')}]
+
+
 # ── Generic brand spelling check ─────────────────────────────────────────────
 
 # Generic food misspellings — same as _MISSPELLINGS but without ProDough-specific patterns
@@ -5657,7 +6425,8 @@ def _ingredient_list(text: str) -> list:
     out = []
     for body in _ingredient_statements(text):
         for part in re.split(r'[,;()\[\]]|\band\b|&', body.lower()):
-            part = re.sub(r'^\s*(?:contains\s+)?(?:less\s+than|\d+%\s+or\s+less)[^:]*:\s*', '', part)
+            part = re.sub(r'^\s*(?:contains\s+)?(?:less\s+than\s+\d+\s*(?:%|percent\b)|\d+\s*(?:%|percent\b)'
+                          r'\s+or\s+less)(?:\s+of)?(?:\s+each\s+of)?(?:\s+the\s+following)?\s*:?\s*', '', part)
             part = re.sub(r'\s+', ' ', part).strip(' .:*-')
             if part:
                 out.append(part)

@@ -545,7 +545,7 @@
             <tr class="{% if ring.verdict == 'MISMATCH' %}table-danger{% elif ring.verdict == 'NOT EVALUATED' %}table-warning{% endif %}">
               <td>{{ ring.position or '—' }}</td><td><strong>{{ ring.number or '?' }}</strong></td>
               <td>{{ ring.caption or '?' }}</td>
-              <td>{% if ring.nfp_value is not none and ring.nfp_value != '' %}{{ ring.nfp_value }}{% else %}—{% endif %}</td>
+              <td>{% if ring.nfp_value is not none and ring.nfp_value != '' %}{{ ring.nfp_value }} <span class="text-muted">({{ ring.nfp_reader or 'reader not recorded' }})</span>{% else %}—{% endif %}</td>
               <td>{{ ring.verdict }}</td></tr>
           {% endfor %}
           </tbody>
@@ -1127,7 +1127,8 @@ function checkCard(num, title, icon, check, uid, filename, checkKey, alwaysOpen)
   if (checkKey === 'front_callout' && (check.rings || []).length) {
     const rows = check.rings.map(rg => {
       const cls = rg.verdict === 'MISMATCH' ? 'table-danger' : rg.verdict === 'NOT EVALUATED' ? 'table-warning' : '';
-      const nv = (rg.nfp_value === null || rg.nfp_value === undefined || rg.nfp_value === '') ? '—' : esc(rg.nfp_value);
+      const nv = (rg.nfp_value === null || rg.nfp_value === undefined || rg.nfp_value === '') ? '—'
+        : `${esc(rg.nfp_value)} <span class="text-muted">(${esc(rg.nfp_reader || 'reader not recorded')})</span>`;
       return `<tr class="${cls}"><td>${esc(rg.position || '—')}</td><td><strong>${esc(rg.number || '?')}</strong></td>
         <td>${esc(rg.caption || '?')}</td><td>${nv}</td><td>${esc(rg.verdict || '')}</td></tr>`;
     }).join('');

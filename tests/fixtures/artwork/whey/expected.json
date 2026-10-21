@@ -1,5 +1,5 @@
 {
-  "note": "30 whey protein bottle press proofs (converter proof sheets, runs 73096882 / 7f8ce432), verified against the master list: decoded barcode GTIN == master GTIN and the sheet's Cust. Item Ref == the SKU that GTIN resolves to, for all 30. Every file is fully outlined (no text layer). Expected: zero CRITICAL and zero WARNING with spot colour and trim disabled. Add serving_size_g / servings_per_container / declared_net_weight_g per file (hand-verified) to also assert the panel read and a CLEAN verdict \u2014 the harness builds the approved-panel record from them.",
+  "note": "30 whey protein bottle press proofs (converter proof sheets, runs 73096882 / 7f8ce432), verified against the master list: decoded barcode GTIN == master GTIN and the sheet's Cust. Item Ref == the SKU that GTIN resolves to, for all 30. Every file is fully outlined (no text layer). Expected: zero CRITICAL and zero WARNING with spot colour and trim disabled. Add serving_size_g / servings_per_container / declared_net_weight_g per file (hand-verified) to also assert the panel read and a CLEAN verdict — the harness builds the approved-panel record from them.",
   "files": [
     {
       "file": "Apple_Pie_.pdf",
@@ -20,8 +20,15 @@
         "fill_weight_g": 34.13623,
         "item_reference": "WHY-BTL-BF",
         "critical_count": 0,
-        "warning_count": 0
-      }
+        "warning_count": 1,
+        "expected_warnings": [
+          [
+            "Ingredient statement spacing",
+            "\"SteviaLeaf\""
+          ]
+        ]
+      },
+      "spacing_note": "Spacing verified by eye on the fixture (run aa5b6042 §F): SteviaLeaf"
     },
     {
       "file": "Birthday_Cake_.pdf",
@@ -31,30 +38,15 @@
         "fill_weight_g": 34.20123,
         "item_reference": "WHY-BTL-BDC",
         "critical_count": 0,
-        "warning_count": 0
-      }
-    },
-    {
-      "file": "Blueberry_Muffin.pdf",
-      "sku": "WHY-BTL-BLM",
-      "gtin": "850079939325",
-      "expect": {
-        "fill_weight_g": 34.03623,
-        "item_reference": "WHY-BTL-BLM",
-        "critical_count": 0,
-        "warning_count": 0
-      }
-    },
-    {
-      "file": "Chocolate_Mousse_.pdf",
-      "sku": "WHY-BTL-CM",
-      "gtin": "850079939349",
-      "expect": {
-        "fill_weight_g": 36.7,
-        "item_reference": "WHY-BTL-CM",
-        "critical_count": 0,
-        "warning_count": 0
-      }
+        "warning_count": 1,
+        "expected_warnings": [
+          [
+            "Ingredient statement spacing",
+            "\"SteviaLeaf\""
+          ]
+        ]
+      },
+      "spacing_note": "Spacing verified by eye on the fixture (run aa5b6042 §F): SteviaLeaf"
     },
     {
       "file": "Chocolate_Peanut_Butter_.pdf",
@@ -64,8 +56,15 @@
         "fill_weight_g": 36.73114,
         "item_reference": "WHY-BTL-CPB",
         "critical_count": 0,
-        "warning_count": 0
-      }
+        "warning_count": 1,
+        "expected_warnings": [
+          [
+            "Ingredient statement spacing",
+            "\"NaturalFlavors\""
+          ]
+        ]
+      },
+      "spacing_note": "Spacing verified by eye on the fixture (run aa5b6042 §F): NaturalFlavors"
     },
     {
       "file": "Cinnamon_Roll_.pdf",
@@ -75,8 +74,15 @@
         "fill_weight_g": 34.55623,
         "item_reference": "WHY-BTL-CRL",
         "critical_count": 0,
-        "warning_count": 0
-      }
+        "warning_count": 1,
+        "expected_warnings": [
+          [
+            "Ingredient statement spacing",
+            "\"Cinnamon,Stevia\""
+          ]
+        ]
+      },
+      "spacing_note": "Spacing verified by eye on the fixture (run aa5b6042 §F): Cinnamon,Stevia"
     },
     {
       "file": "Coconut_Cream_.pdf",
@@ -86,8 +92,17 @@
         "fill_weight_g": 35.13471,
         "item_reference": "WHY-BTL-CNC",
         "critical_count": 0,
-        "warning_count": 0
-      }
+        "warning_count": 2,
+        "expected_warnings": [
+          "declares Tree Nuts",
+          [
+            "Ingredient statement spacing",
+            "\"Powder,Himalayan\""
+          ]
+        ]
+      },
+      "note": "Prints 'Contains: Milk, Tree Nuts' with no tree-nut source (Coconut Milk Powder; coconut is not a tree nut, FDA 2025), and 'Non-Fat Milk Powder,Himalayan Pink Salt' with no space after the comma. Both verified by eye on the fixture (run aa5b6042 §C, §F).",
+      "spacing_note": "Spacing verified by eye on the fixture (run aa5b6042 §F): Powder,Himalayan"
     },
     {
       "file": "Cookie_Crumble_.pdf",
@@ -97,8 +112,15 @@
         "fill_weight_g": 34.58712,
         "item_reference": "WHY-BTL-CCR",
         "critical_count": 0,
-        "warning_count": 0
-      }
+        "warning_count": 1,
+        "expected_warnings": [
+          [
+            "Ingredient statement spacing",
+            "\"ALU)v\""
+          ]
+        ]
+      },
+      "spacing_note": "Spacing verified by eye on the fixture (run aa5b6042 §F): ALU)v"
     },
     {
       "file": "Double_Chocolate_.pdf",
@@ -119,8 +141,15 @@
         "fill_weight_g": 34.40624,
         "item_reference": "WHY-BTL-FC",
         "critical_count": 0,
-        "warning_count": 0
-      }
+        "warning_count": 1,
+        "expected_warnings": [
+          [
+            "Ingredient statement spacing",
+            "\"SteviaLeaf\""
+          ]
+        ]
+      },
+      "spacing_note": "Spacing verified by eye on the fixture (run aa5b6042 §F): SteviaLeaf"
     },
     {
       "file": "Glazed_Donut_.pdf",
@@ -130,8 +159,15 @@
         "fill_weight_g": 34.275,
         "item_reference": "WHY-BTL-GD",
         "critical_count": 0,
-        "warning_count": 0
-      }
+        "warning_count": 1,
+        "expected_warnings": [
+          [
+            "Ingredient statement spacing",
+            "\"A&\""
+          ]
+        ]
+      },
+      "spacing_note": "Spacing verified by eye on the fixture (run aa5b6042 §F): A&"
     },
     {
       "file": "Horchata_.pdf",
@@ -141,8 +177,16 @@
         "fill_weight_g": 34.91293,
         "item_reference": "WHY-BTL-HO",
         "critical_count": 0,
-        "warning_count": 0
-      }
+        "warning_count": 1,
+        "expected_warnings": [
+          [
+            "Ingredient statement spacing",
+            "\"Salt,Stevia\"",
+            "\"DU,Lactase\""
+          ]
+        ]
+      },
+      "spacing_note": "Spacing verified by eye on the fixture (run aa5b6042 §F): Salt,Stevia, DU,Lactase"
     },
     {
       "file": "Iced_Mocha_.pdf",
@@ -152,8 +196,15 @@
         "fill_weight_g": 34.48257,
         "item_reference": "WHY-BTL-IM",
         "critical_count": 0,
-        "warning_count": 0
-      }
+        "warning_count": 1,
+        "expected_warnings": [
+          [
+            "Ingredient statement spacing",
+            "\"CocoaPowder\""
+          ]
+        ]
+      },
+      "spacing_note": "Spacing verified by eye on the fixture (run aa5b6042 §F): CocoaPowder"
     },
     {
       "file": "Key_Lime_Pie_.pdf",
@@ -196,8 +247,15 @@
         "fill_weight_g": 35.63766,
         "item_reference": "WHY-BTL-MC",
         "critical_count": 0,
-        "warning_count": 0
-      }
+        "warning_count": 1,
+        "expected_warnings": [
+          [
+            "Ingredient statement spacing",
+            "\"2percent\""
+          ]
+        ]
+      },
+      "spacing_note": "Spacing verified by eye on the fixture (run aa5b6042 §F): 2percent"
     },
     {
       "file": "Neapolitan_.pdf",
@@ -229,8 +287,15 @@
         "fill_weight_g": 34.75,
         "item_reference": "WHY-BTL-PC",
         "critical_count": 0,
-        "warning_count": 0
-      }
+        "warning_count": 1,
+        "expected_warnings": [
+          [
+            "Ingredient statement spacing",
+            "\"SteviaLeaf\""
+          ]
+        ]
+      },
+      "spacing_note": "Spacing verified by eye on the fixture (run aa5b6042 §F): SteviaLeaf"
     },
     {
       "file": "Pomegranate_Acai_.pdf",
@@ -240,8 +305,16 @@
         "fill_weight_g": 37.13109,
         "item_reference": "WHY-BTL-PA",
         "critical_count": 0,
-        "warning_count": 0
-      }
+        "warning_count": 1,
+        "expected_warnings": [
+          [
+            "Ingredient statement spacing",
+            "\"SteviaLeaf\"",
+            "\"Amylase300\""
+          ]
+        ]
+      },
+      "spacing_note": "Spacing verified by eye on the fixture (run aa5b6042 §F): SteviaLeaf, Amylase300"
     },
     {
       "file": "Pumpkin_Spice_.pdf",
@@ -251,8 +324,16 @@
         "fill_weight_g": 34.35689,
         "item_reference": "WHY-BTL-PS",
         "critical_count": 0,
-        "warning_count": 0
-      }
+        "warning_count": 1,
+        "expected_warnings": [
+          [
+            "Ingredient statement spacing",
+            "\"SteviaLeaf\"",
+            "\"300DU\""
+          ]
+        ]
+      },
+      "spacing_note": "Spacing verified by eye on the fixture (run aa5b6042 §F): SteviaLeaf, 300DU"
     },
     {
       "file": "Raspberry_Cheesecake_.pdf",
@@ -262,8 +343,15 @@
         "fill_weight_g": 35.374,
         "item_reference": "WHY-BTL-RC",
         "critical_count": 0,
-        "warning_count": 0
-      }
+        "warning_count": 1,
+        "expected_warnings": [
+          [
+            "Ingredient statement spacing",
+            "\"Salt,Stevia\""
+          ]
+        ]
+      },
+      "spacing_note": "Spacing verified by eye on the fixture (run aa5b6042 §F): Salt,Stevia"
     },
     {
       "file": "Red_Velvet_.pdf",
@@ -273,8 +361,15 @@
         "fill_weight_g": 34.92623,
         "item_reference": "WHY-BTL-RDV",
         "critical_count": 0,
-        "warning_count": 0
-      }
+        "warning_count": 1,
+        "expected_warnings": [
+          [
+            "Ingredient statement spacing",
+            "\"SteviaLeaf\""
+          ]
+        ]
+      },
+      "spacing_note": "Spacing verified by eye on the fixture (run aa5b6042 §F): SteviaLeaf"
     },
     {
       "file": "Salted_Caramel_.pdf",
@@ -284,8 +379,15 @@
         "fill_weight_g": 34.92623,
         "item_reference": "WHY-BTL-SLC",
         "critical_count": 0,
-        "warning_count": 0
-      }
+        "warning_count": 1,
+        "expected_warnings": [
+          [
+            "Ingredient statement spacing",
+            "\"SteviaLeaf\""
+          ]
+        ]
+      },
+      "spacing_note": "Spacing verified by eye on the fixture (run aa5b6042 §F): SteviaLeaf"
     },
     {
       "file": "Snickerdoodle.pdf",
@@ -295,8 +397,15 @@
         "fill_weight_g": 34.64694,
         "item_reference": "WHY-BTL-SD",
         "critical_count": 0,
-        "warning_count": 0
-      }
+        "warning_count": 1,
+        "expected_warnings": [
+          [
+            "Ingredient statement spacing",
+            "\"Cinnamon,Cocoa\""
+          ]
+        ]
+      },
+      "spacing_note": "Spacing verified by eye on the fixture (run aa5b6042 §F): Cinnamon,Cocoa"
     },
     {
       "file": "Strawberry_Shortcake_.pdf",
@@ -306,8 +415,15 @@
         "fill_weight_g": 35.207,
         "item_reference": "WHY-BTL-SS",
         "critical_count": 0,
-        "warning_count": 0
-      }
+        "warning_count": 1,
+        "expected_warnings": [
+          [
+            "Ingredient statement spacing",
+            "\"Acid,Stevia\""
+          ]
+        ]
+      },
+      "spacing_note": "Spacing verified by eye on the fixture (run aa5b6042 §F): Acid,Stevia"
     },
     {
       "file": "Sugar_Cookie_.pdf",
@@ -317,8 +433,15 @@
         "fill_weight_g": 34.86117,
         "item_reference": "WHY-BTL-SC",
         "critical_count": 0,
-        "warning_count": 0
-      }
+        "warning_count": 1,
+        "expected_warnings": [
+          [
+            "Ingredient statement spacing",
+            "\"SteviaLeaf\""
+          ]
+        ]
+      },
+      "spacing_note": "Spacing verified by eye on the fixture (run aa5b6042 §F): SteviaLeaf"
     },
     {
       "file": "Vaniila_Bean.pdf",

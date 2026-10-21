@@ -276,7 +276,9 @@ def dv_column(lt: dict) -> dict:
 
 # ── The "less than 2%" break ─────────────────────────────────────────────────
 
-_BREAK_RE = re.compile(r'(?:contains\s+)?(?:less\s+than\s+\d+\s*%|\d+\s*%\s+or\s+less)\s+of\s*:?', re.I)
+# "less than 2% of", "less than 2 percent of" (Apple Pie, run aa5b6042), "2% or less of".
+_BREAK_RE = re.compile(r'(?:contains\s+)?(?:less\s+than\s+\d+\s*(?:%|percent\b)|\d+\s*(?:%|percent\b)\s+or\s+less)'
+                       r'\s+of\s*:?', re.I)
 
 
 def two_percent_break(statement: str) -> dict:
@@ -290,7 +292,8 @@ def two_percent_break(statement: str) -> dict:
         return None
     before = _top_level_items(statement[:m.start()])
     return {'wording': m.group(0).strip(), 'position': len(before),
-            'after': before[-1] if before else None}
+            'after': before[-1] if before else None,
+            'major': before, 'minor': _top_level_items(statement[m.end():])}
 
 
 def _top_level_items(text: str) -> list:

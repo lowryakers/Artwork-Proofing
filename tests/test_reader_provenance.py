@@ -196,7 +196,8 @@ def _run():
     from PIL import Image as _Img
     _tmp = os.path.join(tempfile.mkdtemp(), 'p.png')
     _Img.new('RGB', (1200, 1600), 'white').save(_tmp)
-    _full = {'servings_per_container': 1, 'calories': 130, 'protein_g': 26, 'total_carbohydrate_g': 5}
+    _full = {'servings_per_container': 1, 'calories': 130, 'protein_g': 26, 'total_carbohydrate_g': 5,
+             'added_sugar_g': 0}
     _replies = iter([json.dumps(dict(_full, serving_size_g=370, serving_size_text='1 bottle (37g)')),
                      json.dumps(dict(_full, serving_size_g=37, serving_size_text='1 bottle (37g)'))])
 
@@ -236,6 +237,75 @@ def _run():
               got.get('serving_size_g') == 37.0 and any('re-reading the untightened box' in x for x in d))
     finally:
         pe.ANTHROPIC_AVAILABLE, pe._anthropic = _prev
+
+    # ── 3b4. A ring field the full read left out gets one focused re-read ──
+    # CI run 38808063967: the chocolate pancake crop read 22 fields, no protein,
+    # so the protein ring could not be compared with a crop value.
+    _no_protein = {k: v for k, v in _full.items() if k != 'protein_g'}
+    _replies3 = iter([json.dumps(dict(_no_protein, serving_size_g=83, serving_size_text='3/4 Cup (83g)')),
+                      json.dumps({'calories': 290, 'protein_g': 19, 'added_sugar_g': None})])
+    _prompts = []
+
+    def _create3(**k):
+        _prompts.append(k['messages'][0]['content'][-1]['text'])
+        return _R(next(_replies3))
+    pe.ANTHROPIC_AVAILABLE = True
+    pe._anthropic = types.SimpleNamespace(Anthropic=lambda api_key=None: types.SimpleNamespace(
+        messages=types.SimpleNamespace(create=_create3)))
+    try:
+        d = []
+        got = pe._read_nfp_panel(_tmp, [0.2, 0.2, 0.8, 0.8], diag=d)
+        check(f'crop: protein missing from the full read -> focused re-read fills it, nothing else '
+              f'overwritten ({got.get("protein_g")}, calories {got.get("calories")})',
+              got.get('protein_g') == 19 and got.get('calories') == 130 and len(_prompts) == 2
+              and _prompts[1] is pe._NFP_RING_FIELDS_PROMPT
+              and any('ring-field re-read' in x and 'protein_g' in x for x in d))
+    finally:
+        pe.ANTHROPIC_AVAILABLE, pe._anthropic = _prev
+
+    # ── 3b5. A box short of the panel is widened to the panel's rules ──────
+    # CI run 38823321563: vision's box stopped above the chocolate pancake's
+    # Protein row; the rules ran into the crop's bottom edge.
+    from PIL import ImageDraw as _D2
+    _pg = _Img.new('RGB', (3000, 4000), (70, 40, 30))
+    _d = _D2.Draw(_pg)
+    _d.rectangle((900, 800, 1700, 2900), fill='white')
+    for _i, _y in enumerate(range(900, 2800, 95)):
+        _d.rectangle((940, _y, 1660, _y + (14 if _i % 5 == 0 else 3)), fill='black')
+        _d.rectangle((950, _y + 30, 1250, _y + 60), fill='black')
+        _d.rectangle((1580, _y + 30, 1650, _y + 60), fill='black')
+    _tmp3 = os.path.join(tempfile.mkdtemp(), 'r.png')
+    _pg.save(_tmp3)
+    _sent = []
+
+    def _create5(**k):
+        import base64 as _b64
+        for _part in k['messages'][0]['content']:
+            if _part.get('type') == 'image':
+                _sent.append(_Img.open(io.BytesIO(_b64.b64decode(_part['source']['data']))).size)
+        return _R(json.dumps(dict(_full, serving_size_g=37, serving_size_text='1 bottle (37g)')))
+    import io
+    pe.ANTHROPIC_AVAILABLE = True
+    pe._anthropic = types.SimpleNamespace(Anthropic=lambda api_key=None: types.SimpleNamespace(
+        messages=types.SimpleNamespace(create=_create5)))
+    try:
+        d = []
+        pe._read_nfp_panel(_tmp3, [0.30, 0.20, 0.57, 0.42], diag=d)   # top third of the panel only
+        check(f'panel crop: rules running into the crop edge -> widened, narrowed to the whole panel ({d})',
+              any('wider box' in x for x in d) and any('narrowed to the panel' in x for x in d)
+              and _sent and _sent[0][1] > 1.8 * _sent[0][0])
+    finally:
+        pe.ANTHROPIC_AVAILABLE, pe._anthropic = _prev
+
+    # Text bands: full width, top to bottom, overlapping, each within budget.
+    import io as _io
+    _tall = _Img.new('RGB', (1060, 4761), 'white')
+    _b = pe._jpeg_bands(_tall)
+    _sizes = [_Img.open(_io.BytesIO(x)).size for x in _b]
+    check(f'text bands: every band full width and within the pixel budget ({_sizes})',
+          len(_b) >= 4 and all(w == 1060 and w * h <= pe._API_PIXELS for w, h in _sizes)
+          and sum(h for _, h in _sizes) > 4761)
+    check('text bands: a small crop is one image', len(pe._jpeg_bands(_Img.new('RGB', (800, 600)))) == 1)
 
     # ── 3c. Master-list fetch retries transient failures with backoff ───────
     _orig_fetch, _orig_sleep = A._fetch_sheet_rows, A.time.sleep

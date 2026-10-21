@@ -1,5 +1,5 @@
 {
-  "note": "Planted in reference data, not the PDFs \u2014 see ../README.md.",
+  "note": "DEFECT_item_ref_mismatch is planted in reference data. DEFECT_dv_column_empty is the real, unmodified artwork (a file-level fixture). See ../README.md.",
   "defects": [
     {
       "id": "DEFECT_item_ref_mismatch",
@@ -14,7 +14,50 @@
         "check": "item_reference",
         "message_contains": "BEF-BTL-DCH"
       },
-      "why": "Master row SKU changed so the artwork's barcode (850079939387) resolves to BEF-BTL-DCH while the proof sheet's Cust. Item Ref reads WHY-BTL-DCH \u2014 right artwork, wrong product association, the class the 7 Oct proof exposed."
+      "why": "Master row SKU changed so the artwork's barcode (850079939387) resolves to BEF-BTL-DCH while the proof sheet's Cust. Item Ref reads WHY-BTL-DCH — right artwork, wrong product association, the class the 7 Oct proof exposed."
+    },
+    {
+      "id": "DEFECT_dv_column_empty",
+      "sku": "WHY-BTL-BLM",
+      "file": "Blueberry_Muffin.pdf",
+      "approved_panel": {},
+      "expect": {
+        "critical_count": 1,
+        "check": "nfp",
+        "message_contains": [
+          "% Daily Value",
+          "column"
+        ],
+        "other_findings_only": [
+          [
+            "Ingredient statement spacing",
+            "\"SteviaLeaf\""
+          ]
+        ]
+      },
+      "why": "Every % Daily Value cell on the Nutrition Facts panel is empty; the '% Daily Value*' header and footnote are present (verified at 800 dpi, run aa5b6042). %DV is mandatory for every nutrient with an established DV. One CRITICAL naming the whole column, not one per row. The file also prints 'SteviaLeaf' (missing space), verified by eye — the only other finding allowed."
+    },
+    {
+      "id": "DEFECT_dv_iron_chocolate_mousse",
+      "sku": "WHY-BTL-CM",
+      "file": "Chocolate_Mousse_.pdf",
+      "approved_panel": {},
+      "expect": {
+        "critical_count": 1,
+        "check": "nfp",
+        "message_contains": [
+          "Iron",
+          "4%",
+          "6%"
+        ],
+        "other_findings_only": [
+          [
+            "Ingredient statement spacing",
+            "\"GuarGum\""
+          ]
+        ]
+      },
+      "why": "The panel prints Iron 1.1mg at 4% DV. 1.1mg declares 1.05-1.15mg, 5.83%-6.39% of 18mg, which rounds to 6% across the whole band (21 CFR 101.9(c)(8)). Passed clean on three runs (14, 19, 21 Oct) and was caught by hand. Every other row on the panel is legal. The file also prints 'GuarGum', verified by eye — the only other finding allowed."
     }
   ]
 }

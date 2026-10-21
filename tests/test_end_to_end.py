@@ -8,8 +8,8 @@ each fixture set's expected.json and defects.json.
 Fixture sets (each a folder with expected.json, master_rows.csv and optional
 defects.json):
   * tests/fixtures/artwork/        — 4 pancake pouches (run 9ffb350f), 7 scenarios
-  * tests/fixtures/artwork/whey/   — 30 whey protein bottles (Git LFS), 1 scenario
-  * tests/fixtures/artwork/beef/   — 2 clean beef protein bottles + 1 defect file (Git LFS)
+  * tests/fixtures/artwork/whey/   — 30 whey protein bottles (Git LFS), 2 scenarios
+  * tests/fixtures/artwork/beef/   — 4 clean beef protein bottles + 1 defect file (Git LFS)
 
 No mocks of the reader, no pre-extracted values, no synthetic images. What IS
 stubbed, deliberately, is the reference data:
@@ -62,7 +62,7 @@ REQUIRED = bool(os.environ.get('ARTPROOF_E2E_REQUIRED'))
 BRAND = {'brand_mode': 'prodough', 'proof_type': 'press', 'wind_direction': ''}
 CHECK_KEY = {'gtin': 'gtin', 'net_weight': 'netwt', 'spot_color': 'specs',
              'fda_falcpa': 'fda', 'approved_panel': 'panel', 'item_reference': 'item_reference',
-             'front_callout': 'front_callout'}
+             'front_callout': 'front_callout', 'nfp': 'nfp'}
 NFP_FIELDS = ('serving_size_g', 'serving_size_cups', 'servings_per_container', 'serving_size_desc')
 
 
@@ -219,6 +219,7 @@ def _install_engine_stubs(pe):
     pe._read_nfp_panel = _memo(pe._read_nfp_panel, 'nfp_crop')
     pe._read_contains_crop = _memo(pe._read_contains_crop, 'contains_crop')
     pe._read_disclaimer_crop = _memo(pe._read_disclaimer_crop, 'disclaimer_crop')
+    pe._read_ingredients_verbatim = _memo(pe._read_ingredients_verbatim, 'ingredients_verbatim')
     pe._read_front_callouts = _memo(pe._read_front_callouts, 'front_crop')
     return local
 
@@ -411,10 +412,21 @@ def _run():
         exp = expected[key]['expect']
         vals, prov = res.get('panel_values') or {}, res.get('panel_provenance') or {}
         graded = _graded(res)
-        clean_fp[expected[key]['set']] = clean_fp.get(expected[key]['set'], 0) + len(graded)
+        clean_fp[expected[key]['set']] = (clean_fp.get(expected[key]['set'], 0) + len(graded)
+                                          - len(exp.get('expected_warnings', [])))
         S.check(f'{key}: zero CRITICAL', not _criticals(res))
-        S.check(f'{key}: zero WARNING / SUSPECT findings (got {[(k, i["message"][:50]) for k, i in graded]})',
-                not graded)
+        # A file can carry known, hand-verified warnings (expected_warnings:
+        # one entry per warning — a phrase, or a list of phrases that must all
+        # appear in it); every other graded finding is a stray.
+        want_w = exp.get('expected_warnings', [])
+        hits = [next((i for i, (_, f) in enumerate(graded) if f['severity'] == 'warning'
+                      and all(p.lower() in f['message'].lower() for p in _phrases(ph))), None)
+                for ph in want_w]
+        stray_w = [(k, f['message'][:70]) for i, (k, f) in enumerate(graded) if i not in hits]
+        S.check(f'{key}: ' + (f'exactly the expected WARNINGs {want_w}' if want_w else 'zero WARNING / SUSPECT findings')
+                + f' (got {[(k, f["message"][:70]) for k, f in graded]})',
+                None not in hits and len(set(hits)) == len(hits) and not stray_w,
+                needs_vision=bool(want_w))
         if 'item_reference' in exp:
             ir = (res.get('checks') or {}).get('item_reference') or {}
             S.check(f'{key}: item reference reads {exp["item_reference"]} and matches the barcode SKU '
@@ -447,10 +459,36 @@ def _run():
                     f'skipped {res.get("checks_skipped")})',
                     res.get('severity') == exp['overall_status'].lower() and not res.get('checks_skipped'),
                     needs_vision=True)
+        # The %DV recompute must actually have run: zero findings from zero
+        # rows checked proves nothing.
+        _dvr = ((res.get('checks') or {}).get('nfp') or {}).get('dv_recompute') or []
+        _dvr_ok = sum(1 for r in _dvr if r.get('result') == 'ok')
+        S.check(f'{key}: %DV recomputed from the declared amount on at least 6 rows (got {_dvr_ok}; '
+                f'not evaluated {[(r["nutrient"], r.get("why")) for r in _dvr if r.get("result") == "not_evaluated"]})',
+                _dvr_ok >= 6, needs_vision=True)
         if 'reviews_only_from' in exp:
             stray = [(k, i['message'][:60]) for k, i in _reviews(res) if k not in exp['reviews_only_from']]
             S.check(f'{key}: review findings only from {exp["reviews_only_from"]} (stray: {stray})', not stray,
                     needs_vision=True)
+
+    # ── Cross-run allergen consistency, on the real reads of the whole set ──
+    # Run aa5b6042: Coconut Cream whey declares Tree Nuts for Coconut Milk
+    # Powder; the beef bottles carry the same ingredient and declare nothing.
+    by_file = {r.get('filename'): r for r in clean_results}
+    cc = next((n for n in by_file if 'Coconut_Cream' in n), None)
+    beef = [n for n in by_file if n.startswith('PD_beef_bottle')]
+    if cc and beef:
+        cross = copy.deepcopy(clean_results)
+        pe._flag_allergen_consistency(cross)
+        xw = {r['filename']: [i['message'] for i in (r.get('checks', {}).get('fda') or {}).get('issues', [])
+                              if 'differs across this run' in i['message']] for r in cross}
+        S.check(f'cross-run: {cc} warned for Coconut Milk Powder / Tree Nuts against the beef files '
+                f'(got {xw.get(cc)})',
+                any('Coconut Milk Powder' in m and 'Tree Nuts' in m and any(b in m for b in beef)
+                    for m in xw.get(cc, [])), needs_vision=True)
+        S.check(f'cross-run: each beef file warned the other way (got {[(b, len(xw.get(b, []))) for b in beef]})',
+                all(any(cc in m for m in xw.get(b, [])) for b in beef), needs_vision=True)
+        print('[cross-run] ' + '; '.join(f'{n}: {m[:110]}' for n, ms in xw.items() for m in ms))
 
     # ── Score: defects ──────────────────────────────────────────────────────
     planted = caught = 0
@@ -484,7 +522,7 @@ def _run():
             continue
         (_, key, res, _), = runs
         crits = _criticals(res)
-        vision_dep = exp.get('check') in ('approved_panel', 'fda_falcpa', 'front_callout')
+        vision_dep = exp.get('check') in ('approved_panel', 'fda_falcpa', 'front_callout', 'nfp')
         if 'status' in exp:
             # A planted defect the tool must refuse to evaluate, not flag: the
             # check reports exp['status'] with the reason in its notes, and no
@@ -511,8 +549,12 @@ def _run():
         ck = CHECK_KEY[exp['check']]
         hit = (len(crits) == 1 and crits[0][0] == ck
                and all(m.lower() in crits[0][1]['message'].lower() for m in _phrases(exp['message_contains'])))
-        if exp.get('no_other_findings'):
-            others = [(k, i['message'][:70]) for k, i in _graded(res) if i['severity'] != 'critical']
+        if exp.get('no_other_findings') or 'other_findings_only' in exp:
+            # other_findings_only: hand-verified findings the file also
+            # carries (each a phrase list); anything else is a stray.
+            allowed = [_phrases(a) for a in exp.get('other_findings_only', [])]
+            others = [(k, i['message'][:70]) for k, i in _graded(res) if i['severity'] != 'critical'
+                      and not any(all(p.lower() in i['message'].lower() for p in a) for a in allowed)]
             hit = hit and not others
         else:
             others = None
