@@ -56,10 +56,18 @@ def _run():
     check('vitamin/mineral rounding: nearest 2% to 10%, 5% to 50%, 10% above',
           pe._dv_round('iron', 9.1) == 10 and pe._dv_round('iron', 10.0) == 10 and pe._dv_round('iron', 11.1) == 10
           and pe._dv_round('iron', 12.6) == 15 and pe._dv_round('iron', 56) == 60 and pe._dv_round('sodium', 11.4) == 11)
-    check('declared-amount rules: sodium 140 -> nearest 5 below, 10 above; fat 0.5g steps under 5g',
-          pe._declared_macro('sodium', 142) == 140 and pe._declared_macro('sodium', 137) == 135
-          and pe._declared_macro('total_fat', 4.8) == 5.0 and pe._declared_macro('total_fat', 0.4) == 0.0
-          and pe._declared_macro('cholesterol', 3) == '<5' and pe._declared_macro('dietary_fiber', 0.7) == '<1')
+    D = pe._declarations
+    check('declared-amount rules: sodium nearest 5 to 140, 10 above; fat 0.5g steps under 5g',
+          D('sodium', 142) == {140} and D('sodium', 137) == {135} and D('total_fat', 4.8) == {5.0}
+          and D('sodium', 3) == {5, 0})
+    check('optional forms stay optional: fat 0.4g -> 0.5g or 0; cholesterol 3mg -> 5mg or <5; '
+          'fiber 0.7g -> 1g or <1',
+          D('total_fat', 0.4) == {0.5, 0.0} and D('cholesterol', 3) == {5, '<5'}
+          and D('dietary_fiber', 0.7) == {1, '<1'} and D('added_sugars', 0.3) == {0, '<1'})
+    # Apple Pie (CI run 39687608227): Includes 1g Added Sugars, 1%. 0.5-1.5g -> 1%-3%.
+    l, lo, hi = legal('added_sugars', 1)
+    check(f'Added Sugars 1g at 1% is legal (0.5g is 1% of 50g) ({lo:.2f}-{hi:.2f}, {l})',
+          1 in l and round(lo, 2) == 1.0)
 
     # Acceptance 1: Chocolate Mousse -> exactly one CRITICAL, naming Iron, 4% and 6%.
     issues, rows = pe._check_dv_recompute(MOUSSE, {})

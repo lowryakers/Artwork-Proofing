@@ -4590,21 +4590,38 @@ def _half_up(x: float, step: float) -> float:
     return math.floor(x / step + 0.5 + 1e-9) * step
 
 
-def _declared_macro(key: str, x: float):
-    """How 21 CFR 101.9(c) has an actual amount `x` declared."""
+def _declarations(key: str, x: float) -> set:
+    """Every declaration 21 CFR 101.9(c) permits for an actual amount `x`: the
+    nearest increment, plus the optional forms below a threshold ("0", "<1",
+    "<5") — optional, so the nearest increment stays legal too. Apple Pie
+    declares 1g Added Sugars at 1%: 0.5-1.5g rounds to 1g (nearest gram),
+    0.5g is 1% of 50g (CI run 39687608227)."""
     if key in ('total_fat', 'saturated_fat'):           # (c)(2)
-        return 0.0 if x < 0.5 else _half_up(x, 0.5) if x < 5 else _half_up(x, 1)
-    if key == 'cholesterol':                            # (c)(3)
-        return 0.0 if x < 2 else '<5' if x < 5 else _half_up(x, 5)
-    if key == 'sodium':                                 # (c)(4)
-        return 0.0 if x < 5 else _half_up(x, 5) if x <= 140 else _half_up(x, 10)
-    # total carbohydrate, dietary fiber, added sugars: (c)(6)
-    return 0.0 if x < 0.5 else '<1' if x < 1 else _half_up(x, 1)
+        out = {_half_up(x, 0.5) if x < 5 else _half_up(x, 1)}
+        if x < 0.5:
+            out.add(0.0)
+    elif key == 'cholesterol':                          # (c)(3)
+        out = {_half_up(x, 5)}
+        if x < 2:
+            out.add(0.0)
+        elif x < 5:
+            out.add('<5')
+    elif key == 'sodium':                               # (c)(4)
+        out = {_half_up(x, 5) if x <= 140 else _half_up(x, 10)}
+        if x < 5:
+            out.add(0.0)
+    else:   # total carbohydrate, dietary fiber, added sugars: (c)(6)
+        out = {_half_up(x, 1)}
+        if x < 0.5:
+            out.add(0.0)
+        if x < 1:
+            out.add('<1')
+    return {round(v, 6) if not isinstance(v, str) else v for v in out}
 
 
 def _amount_band(key: str, amount):
     """(low, high): the unrounded amounts that declare as `amount`, or None.
-    Macronutrients by their FDA rounding rule; vitamins and minerals by the
+    Macronutrients by every declaration their FDA rule permits; vitamins and minerals by the
     precision printed (Iron 1.1mg -> 1.05-1.15), widened to the 10 mg step
     for a calcium or potassium amount printed as a multiple of 10."""
     from decimal import Decimal
@@ -4617,10 +4634,10 @@ def _amount_band(key: str, amount):
             target = float(amount)
         hi_guess = (float(amount.strip('<')) if isinstance(amount, str) else float(amount)) * 1.5 + 12
         n, xs = 24000, []
+        want = target if isinstance(target, str) else round(target, 6)
         for i in range(n + 1):
             x = hi_guess * i / n
-            d = _declared_macro(key, x)
-            if (d == target) if isinstance(target, str) else (not isinstance(d, str) and abs(d - target) < 1e-6):
+            if want in _declarations(key, x):
                 xs.append(x)
         return (min(xs), max(xs)) if xs else None
     if isinstance(amount, str):
