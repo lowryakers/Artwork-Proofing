@@ -459,6 +459,13 @@ def _run():
                     f'skipped {res.get("checks_skipped")})',
                     res.get('severity') == exp['overall_status'].lower() and not res.get('checks_skipped'),
                     needs_vision=True)
+        # The %DV recompute must actually have run: zero findings from zero
+        # rows checked proves nothing.
+        _dvr = ((res.get('checks') or {}).get('nfp') or {}).get('dv_recompute') or []
+        _dvr_ok = sum(1 for r in _dvr if r.get('result') == 'ok')
+        S.check(f'{key}: %DV recomputed from the declared amount on at least 6 rows (got {_dvr_ok}; '
+                f'not evaluated {[(r["nutrient"], r.get("why")) for r in _dvr if r.get("result") == "not_evaluated"]})',
+                _dvr_ok >= 6, needs_vision=True)
         if 'reviews_only_from' in exp:
             stray = [(k, i['message'][:60]) for k, i in _reviews(res) if k not in exp['reviews_only_from']]
             S.check(f'{key}: review findings only from {exp["reviews_only_from"]} (stray: {stray})', not stray,

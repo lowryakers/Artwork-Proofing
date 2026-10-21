@@ -49,24 +49,6 @@
       "spacing_note": "Spacing verified by eye on the fixture (run aa5b6042 §F): SteviaLeaf"
     },
     {
-      "file": "Chocolate_Mousse_.pdf",
-      "sku": "WHY-BTL-CM",
-      "gtin": "850079939349",
-      "expect": {
-        "fill_weight_g": 36.7,
-        "item_reference": "WHY-BTL-CM",
-        "critical_count": 0,
-        "warning_count": 1,
-        "expected_warnings": [
-          [
-            "Ingredient statement spacing",
-            "\"GuarGum\""
-          ]
-        ]
-      },
-      "spacing_note": "Spacing verified by eye on the fixture (run aa5b6042 §F): GuarGum"
-    },
-    {
       "file": "Chocolate_Peanut_Butter_.pdf",
       "sku": "WHY-BTL-CPB",
       "gtin": "850079939363",

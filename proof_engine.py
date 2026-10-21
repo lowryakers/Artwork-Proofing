@@ -1352,6 +1352,14 @@ def _read_front_callouts(img_path: str, nfp_bbox=None, diag: list = None) -> dic
         return {}
 
 
+_NFP_ROW_PROMPT = (
+    'This image is a crop of ONE Nutrition Facts panel. It may be MIRROR-REVERSED or rotated; '
+    'read it correctly oriented. Read ONLY the "<ROW>" row of the table. Return ONLY this JSON '
+    'object: {"row_amount": <the amount printed on that row, a number without its unit, or null>, '
+    '"row_dv": <the % Daily Value printed on that row, an integer, or null if that cell is empty or '
+    'you cannot read it>}. Copy what is printed; never correct it.')
+
+
 _NFP_RING_FIELDS_PROMPT = (
     'This image is a crop of ONE Nutrition Facts panel. It may be MIRROR-REVERSED or rotated; '
     'read it correctly oriented. Read ONLY these rows of the bordered Nutrition Facts table — '
@@ -1394,7 +1402,10 @@ _NFP_CROP_PROMPT = (
     '"vitamin_d_mcg": <number or null>, "vitamin_d_dv": <%DV integer, or null>, '
     '"calcium_mg": <number or null>, "calcium_dv": <%DV integer, or null>, '
     '"iron_mg": <number or null>, "iron_dv": <%DV integer, or null>, '
-    '"potassium_mg": <number or null>, "potassium_dv": <%DV integer, or null>}\n'
+    '"potassium_mg": <number or null>, "potassium_dv": <%DV integer, or null>, '
+    '"other_vitamins_minerals": [every other vitamin or mineral row the panel prints (e.g. '
+    'Magnesium, Zinc, Vitamin C), each {"name": "<as printed>", "amount": <number>, "unit": '
+    '"<mg, mcg or g as printed>", "dv": <%DV integer, or null>}; [] if none]}\n'
     'The % Daily Value column: every *_dv field is the integer printed in that row\'s % Daily '
     'Value cell; the string "blank" if the row prints an amount but its % Daily Value cell is '
     'EMPTY (nothing printed where the percentage would go); null only if you cannot read it. Also '
@@ -1909,7 +1920,7 @@ def _read_nfp_panel(img_path: str, bbox, diag: list = None) -> dict:
                 return {}
             data, _ = json.JSONDecoder().raw_decode(_txt[_start:])
             out, dv_blank = {}, []
-            for k in _NFP_CROP_FIELDS:
+            for k in _NFP_CROP_FIELDS + ('row_amount', 'row_dv'):
                 if k.endswith('_dv') and str(data.get(k)).strip().lower() == 'blank':
                     dv_blank.append(k)        # printed empty — not the same as unread
                     continue
@@ -1930,6 +1941,13 @@ def _read_nfp_panel(img_path: str, bbox, diag: list = None) -> dict:
             # stays falsy and still triggers the untightened fallback.
             if out:
                 out['dv_blank'] = dv_blank
+                _vm = []
+                for _o in data.get('other_vitamins_minerals') or []:
+                    if isinstance(_o, dict) and isinstance(_o.get('name'), str):
+                        _vm.append({'name': _o['name'].strip(), 'amount': _parse_nfp_amount(_o.get('amount')),
+                                    'unit': str(_o.get('unit') or '').strip().lower(),
+                                    'dv': _parse_nfp_amount(_o.get('dv'))})
+                out['other_vm'] = _vm
                 if isinstance(data.get('dv_header'), bool):
                     out['dv_header'] = data['dv_header']
             return out
@@ -1977,6 +1995,18 @@ def _read_nfp_panel(img_path: str, bbox, diag: list = None) -> dict:
                 f'{_ink[0]} of {_ink[1]} text lines print in the %DV strip -> '
                 + ('EMPTY' if best['dv_column_empty'] else 'populated' if _ink[0] >= 8 else 'inconclusive')
                 if _ink else 'panel rules not found -> inconclusive'))
+        # A printed %DV the declared amount cannot produce is re-read, row by
+        # row, before it is reported: a misread digit must not become a CRITICAL.
+        if best:
+            _mm = [r for r in _check_dv_recompute(best, best)[1] if r.get('result') == 'mismatch']
+            for _r in _mm:
+                _key = next(k for k, lbl, *_x in _dv_rows(best, best) if lbl == _r['nutrient'])
+                _again = _read_crop(best_img, f'{_r["nutrient"]} row re-read',
+                                    _NFP_ROW_PROMPT.replace('<ROW>', _r['nutrient']))
+                best.setdefault('dv_confirm', {})[_key] = {'amount': _again.get('row_amount'),
+                                                           'dv': _again.get('row_dv')}
+                diag.append(f'%DV recompute: {_r["nutrient"]} {_r["amount"]}{_r["unit"]} at '
+                            f'{_r["printed"]}% re-read as {best["dv_confirm"][_key]}')
         _ring = [k for k in ('calories', 'protein_g', 'added_sugar_g') if best.get(k) is None]
         if best and _ring:
             _again = _read_crop(best_img, 'ring-field re-read', _NFP_RING_FIELDS_PROMPT)
@@ -2588,8 +2618,8 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
         # its small digits are legible instead of squashed in the full-page pass.
         nfp_read = _read_nfp_panel(img_path, vision_nfp_bbox, diag=_nfp_crop_diag)
         # %DV column marks are not panel values: keep them out of every value map.
-        _dv_marks = {k: nfp_read.pop(k) for k in ('dv_blank', 'dv_header', 'dv_column_empty')
-                     if k in nfp_read}
+        _dv_marks = {k: nfp_read.pop(k) for k in ('dv_blank', 'dv_header', 'dv_column_empty',
+                                                       'other_vm', 'dv_confirm') if k in nfp_read}
         print(f'[nfp-crop] {fname} ' + ('OK ' if nfp_read else 'NOTHING READ ') + ' | '.join(_nfp_crop_diag))
         # Front call-out rings: only the isolated read (panel masked) may supply
         # them. The full-page values are kept as unconfirmed — reported, never
@@ -2869,7 +2899,17 @@ def _proof_single(pdf_path: str, gtin_rows: list, work_dir: str,
             _regex_nfp_proteins = checks['nfp'].get('nfp_data', {}).get('proteins') or []
             if len(_regex_nfp_proteins) == 1:
                 _nfp_protein_ref = _regex_nfp_proteins[0]
-        extra = (_check_dv_populated(nfp_read, _dv_marks)
+        _dvr_issues, _dvr_rows = _check_dv_recompute(nfp_read, _dv_marks)
+        checks['nfp']['dv_recompute'] = _dvr_rows
+        _dvr_ne = [f'{r["nutrient"]} ({r["why"]})' for r in _dvr_rows if r.get('result') == 'not_evaluated']
+        checks['nfp'].setdefault('notes', []).append(
+            '%DV recompute NOT EVALUATED — the panel crop read nothing.' if not nfp_read else
+            f'%DV recomputed from the declared amount on {sum(r.get("result") == "ok" for r in _dvr_rows)} '
+            f'row(s)' + (f'; NOT EVALUATED: {", ".join(_dvr_ne)}' if _dvr_ne else '') + '.')
+        print(f'[dv-recompute] {fname} ' + '; '.join(
+            f'{r["nutrient"]} {r["amount"]}{r["unit"]} @ {r["printed"]}% -> {r.get("result")}'
+            + (f' (legal {r.get("legal")})' if r.get('legal') else '') for r in _dvr_rows))
+        extra = (_dvr_issues + _check_dv_populated(nfp_read, _dv_marks)
                  + _check_net_carbs(label_text, _panel.get('serving_size_g'), nfp_read)
                  + _check_superseded_nfp(_panel, matched_spec)
                  + _check_protein_claims(label_text, _nfp_protein_ref))
@@ -4518,6 +4558,176 @@ def _amounts_equal(a, b) -> bool:
         return abs(float(a) - float(b)) < 1e-9
     except (TypeError, ValueError):
         return a == b
+
+
+# ── %DV recomputed from the declared amount ──────────────────────────────────
+# Daily Values for adults and children 4 and over (21 CFR 101.9(c)(8)(iv),
+# (c)(9)); the unit is the one the panel declares the amount in.
+_DAILY_VALUES = {
+    'total_fat': (78, 'g'), 'saturated_fat': (20, 'g'), 'cholesterol': (300, 'mg'),
+    'sodium': (2300, 'mg'), 'total_carbohydrate': (275, 'g'), 'dietary_fiber': (28, 'g'),
+    'added_sugars': (50, 'g'), 'vitamin_d': (20, 'mcg'), 'calcium': (1300, 'mg'),
+    'iron': (18, 'mg'), 'potassium': (4700, 'mg'), 'magnesium': (420, 'mg'),
+    'zinc': (11, 'mg'), 'vitamin_c': (90, 'mg'), 'vitamin_a': (900, 'mcg'),
+    'vitamin_e': (15, 'mg'), 'vitamin_k': (120, 'mcg'), 'thiamin': (1.2, 'mg'),
+    'riboflavin': (1.3, 'mg'), 'niacin': (16, 'mg'), 'vitamin_b6': (1.7, 'mg'),
+    'folate': (400, 'mcg'), 'vitamin_b12': (2.4, 'mcg'), 'biotin': (30, 'mcg'),
+    'pantothenic_acid': (5, 'mg'), 'phosphorus': (1250, 'mg'), 'iodine': (150, 'mcg'),
+    'selenium': (55, 'mcg'), 'copper': (0.9, 'mg'), 'manganese': (2.3, 'mg'),
+    'chromium': (35, 'mcg'), 'molybdenum': (45, 'mcg'), 'chloride': (2300, 'mg'),
+    'choline': (550, 'mg'),
+}
+# Rounded to the nearest 1% of DV; vitamins and minerals by 101.9(c)(8).
+_DV_MACROS = ('total_fat', 'saturated_fat', 'cholesterol', 'sodium', 'total_carbohydrate',
+              'dietary_fiber', 'added_sugars')
+_DV_LABEL = {'total_fat': 'Total Fat', 'saturated_fat': 'Saturated Fat', 'cholesterol': 'Cholesterol',
+             'sodium': 'Sodium', 'total_carbohydrate': 'Total Carbohydrate', 'dietary_fiber': 'Dietary Fiber',
+             'added_sugars': 'Added Sugars', 'vitamin_d': 'Vitamin D'}
+
+
+def _half_up(x: float, step: float) -> float:
+    import math
+    return math.floor(x / step + 0.5 + 1e-9) * step
+
+
+def _declared_macro(key: str, x: float):
+    """How 21 CFR 101.9(c) has an actual amount `x` declared."""
+    if key in ('total_fat', 'saturated_fat'):           # (c)(2)
+        return 0.0 if x < 0.5 else _half_up(x, 0.5) if x < 5 else _half_up(x, 1)
+    if key == 'cholesterol':                            # (c)(3)
+        return 0.0 if x < 2 else '<5' if x < 5 else _half_up(x, 5)
+    if key == 'sodium':                                 # (c)(4)
+        return 0.0 if x < 5 else _half_up(x, 5) if x <= 140 else _half_up(x, 10)
+    # total carbohydrate, dietary fiber, added sugars: (c)(6)
+    return 0.0 if x < 0.5 else '<1' if x < 1 else _half_up(x, 1)
+
+
+def _amount_band(key: str, amount):
+    """(low, high): the unrounded amounts that declare as `amount`, or None.
+    Macronutrients by their FDA rounding rule; vitamins and minerals by the
+    precision printed (Iron 1.1mg -> 1.05-1.15), widened to the 10 mg step
+    for a calcium or potassium amount printed as a multiple of 10."""
+    from decimal import Decimal
+    if key in _DV_MACROS:
+        if isinstance(amount, str):
+            target = amount.replace(' ', '')
+            if target not in ('<1', '<5'):
+                return None
+        else:
+            target = float(amount)
+        hi_guess = (float(amount.strip('<')) if isinstance(amount, str) else float(amount)) * 1.5 + 12
+        n, xs = 24000, []
+        for i in range(n + 1):
+            x = hi_guess * i / n
+            d = _declared_macro(key, x)
+            if (d == target) if isinstance(target, str) else (not isinstance(d, str) and abs(d - target) < 1e-6):
+                xs.append(x)
+        return (min(xs), max(xs)) if xs else None
+    if isinstance(amount, str):
+        return None
+    dec = Decimal(repr(float(amount))).normalize()
+    places = max(0, -dec.as_tuple().exponent)
+    half = 0.5 * 10 ** -places
+    if key in ('calcium', 'potassium') and places == 0 and amount >= 10 and amount % 10 == 0:
+        half = 5.0
+    return max(0.0, float(amount) - half), float(amount) + half - 1e-9
+
+
+def _dv_round(key: str, pct: float) -> int:
+    if key in _DV_MACROS:
+        return int(_half_up(pct, 1))
+    step = 2 if pct <= 10 else 5 if pct <= 50 else 10       # 101.9(c)(8)
+    return int(_half_up(pct, step))
+
+
+def _dv_legal(key: str, band) -> tuple:
+    """(legal printed %DVs, low %, high %) over the amount band. A vitamin or
+    mineral under 2% of its DV may also be declared 0%."""
+    dv = _DAILY_VALUES[key][0]
+    lo, hi = band
+    legal = set()
+    for i in range(401):
+        pct = (lo + (hi - lo) * i / 400) / dv * 100
+        legal.add(_dv_round(key, pct))
+        if key not in _DV_MACROS and pct < 2:
+            legal.add(0)
+    return sorted(legal), lo / dv * 100, hi / dv * 100
+
+
+def _vm_key(name: str):
+    n = re.sub(r'[^a-z0-9 ]', '', (name or '').lower()).strip()
+    n = {'vitamin b 6': 'vitamin b6', 'vitamin b 12': 'vitamin b12', 'folic acid': 'folate',
+         'pantothenate': 'pantothenic acid'}.get(n, n)
+    k = n.replace(' ', '_')
+    return k if k in _DAILY_VALUES else None
+
+
+def _dv_rows(panel_read: dict, marks: dict) -> list:
+    """The panel's rows with an established DV: (key, label, amount, unit, printed %DV)."""
+    rows = []
+    for a_amt, _p, a_dv, _pd, label, unit in _PANEL_DV_GROUPS:
+        key = a_dv[:-3]
+        printed = 'blank' if a_dv in set((marks or {}).get('dv_blank') or ()) else panel_read.get(a_dv)
+        rows.append((key, label, panel_read.get(a_amt), unit, printed))
+    for o in (marks or {}).get('other_vm') or []:
+        key = _vm_key(o.get('name'))
+        if key and key not in [r[0] for r in rows]:
+            unit = (o.get('unit') or '').replace('µ', 'mc').replace('μ', 'mc').replace('ug', 'mcg')
+            amt = o.get('amount') if unit == _DAILY_VALUES[key][1] else None
+            rows.append((key, o.get('name') or key, amt, _DAILY_VALUES[key][1], o.get('dv')))
+    return rows
+
+
+def _check_dv_recompute(panel_read: dict, marks: dict) -> tuple:
+    """(issues, rows): every printed %DV recomputed from its declared amount
+    (21 CFR 101.9(d)(7)(ii)). The amount is rounded, so it stands for a band of
+    actual amounts and a range of legal %DVs; a CRITICAL only when no amount in
+    the band yields the printed value. Chocolate Mousse (14 and 19 Oct) printed
+    Iron 1.1mg at 4%: 1.05-1.15mg is 5.83%-6.39% of 18mg, 6% everywhere.
+
+    A row whose amount or %DV was not read is NOT EVALUATED, never passed. A
+    mismatch is re-read from the panel crop first (marks['dv_confirm']); a
+    re-read that does not reproduce both numbers makes it NOT EVALUATED."""
+    marks = marks or {}
+    confirm = marks.get('dv_confirm') or {}
+    issues, rows = [], []
+    for key, label, amount, unit, printed in _dv_rows(panel_read, marks):
+        row = {'nutrient': label, 'amount': amount, 'unit': unit, 'printed': printed}
+        rows.append(row)
+        if amount is None:
+            if printed not in (None, 'blank'):
+                row.update(result='not_evaluated', why='amount not read')
+            else:
+                row.update(result='not_evaluated', why='row not read')
+            continue
+        if printed == 'blank':
+            row.update(result='not_evaluated', why='%DV printed empty (see the %DV column finding)')
+            continue
+        if printed is None or isinstance(printed, str):
+            row.update(result='not_evaluated', why='%DV not read' if printed is None else f'%DV printed as {printed}%')
+            continue
+        band = _amount_band(key, amount)
+        if band is None:
+            row.update(result='not_evaluated', why=f'amount {amount} has no rounding band')
+            continue
+        legal, lo, hi = _dv_legal(key, band)
+        row.update(low=round(lo, 2), high=round(hi, 2), legal=legal)
+        if int(round(float(printed))) in legal:
+            row['result'] = 'ok'
+            continue
+        c = confirm.get(key)
+        if c is not None and not (_amounts_equal(c.get('amount'), amount) and _amounts_equal(c.get('dv'), printed)):
+            row.update(result='not_evaluated', why=(
+                f'the panel read gave {_fmt_amt(amount)}{unit} / {_fmt_amt(printed)}%, a re-read gave '
+                f'{_fmt_amt(c.get("amount"))}{unit} / {_fmt_amt(c.get("dv"))}% — not trusted either way'))
+            continue
+        row['result'] = 'mismatch'
+        expected = ' or '.join(f'{v}%' for v in legal)
+        issues.append({'severity': 'critical', 'message': (
+            f'Panel declares {label} {_fmt_amt(amount)}{unit} with %DV {_fmt_amt(printed)}%. The declared '
+            f'amount yields {lo:.2f}%-{hi:.2f}%, which rounds to {expected}. No value in the rounding band '
+            f'produces {_fmt_amt(printed)}%.')})
+    return issues, rows
 
 
 def _check_dv_populated(panel_read: dict, marks: dict) -> list:
